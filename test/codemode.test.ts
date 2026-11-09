@@ -983,3 +983,46 @@ test('close to compaction, a long run is nudged before it grew twice the thresho
     }
   }
 });
+
+test('near compaction, the incoming prompt counts toward the room left', async () => {
+  // About 2,400 tokens of foldable work: over a quarter of the threshold, under the threshold.
+  // The prompt's 25,000 tokens move the context past the window less reserve and threshold.
+  for (const prompt of ['second', 'y'.repeat(100_000)]) {
+    const harness = await createSession(
+      'off',
+      [
+        () =>
+          fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(4800)}` }), {
+            stopReason: 'toolUse'
+          }),
+        () => fauxAssistantMessage('one'),
+        () => fauxAssistantMessage('two')
+      ],
+      [],
+      { foldNudgeTokens: 4000 },
+      { reserveTokens: 104_000 }
+    );
+    try {
+      await harness.run('first', prompt);
+      const branch = harness.session.sessionManager.getBranch();
+      assert.equal(episodeStats(branch, harness.dir).nudges, prompt.length > 100 ? 1 : 0);
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+test('the start of a user message, which a fold keeps, is not counted as growth', async () => {
+  const prompts = Array.from({ length: 10 }, () => 'p'.repeat(3900));
+  const harness = await createSession(
+    'off',
+    prompts.map(() => () => fauxAssistantMessage('ok'))
+  );
+  try {
+    await harness.run(...prompts);
+    const entries = harness.session.sessionManager.buildSessionProjection().entries;
+    assert.ok(nudgeGrowth(entries) < 100);
+  } finally {
+    await harness.cleanup();
+  }
+});
