@@ -117,21 +117,38 @@ export function foldBoundary(entries: readonly ProjectedSessionEntry[]): number 
 }
 
 /**
- * Whether a span can start at this message. A span starting at a tool result starts at the
- * response that made the call, which can be behind the boundary: a call made next to a fold
- * call has its result after the note.
+ * Index of the entry a span starting at this message starts at. A span starting at a tool
+ * result starts at the response that made the call, which can be behind the boundary: a call
+ * made next to a fold call has its result after the note.
  */
-function opensSpan(
+function spanStart(
   entries: readonly ProjectedSessionEntry[],
   index: number,
-  message: AgentMessage,
-  boundary: number
-): boolean {
-  if (message.role !== 'toolResult') return true;
+  message: AgentMessage
+): number {
+  if (message.role !== 'toolResult') return index;
   const caller = entries.findLastIndex(
     (entry, at) => at < index && callsTool(entry, message.toolCallId)
   );
-  return caller < 0 || caller > boundary;
+  return caller < 0 ? index : caller;
+}
+
+/** The earliest stamp a fold can start from now, and the index of the entry its span starts at. */
+export function foldStart(
+  entries: readonly ProjectedSessionEntry[]
+): { stamp: number; index: number } | undefined {
+  const boundary = foldBoundary(entries);
+  for (let index = boundary + 1; index < entries.length; index++) {
+    for (const message of entries[index]!.messages) {
+      const stamp = readStamp(message);
+      if (stamp === undefined || (message.role !== 'user' && message.role !== 'toolResult')) {
+        continue;
+      }
+      const start = spanStart(entries, index, message);
+      if (start > boundary) return { stamp, index: start };
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -147,7 +164,7 @@ export function foldableTurns(entries: readonly ProjectedSessionEntry[]): Foldab
       if (stamp === undefined || (message.role !== 'user' && message.role !== 'toolResult')) {
         continue;
       }
-      if (!opensSpan(entries, index, message, boundary)) continue;
+      if (spanStart(entries, index, message) <= boundary) continue;
       const who = message.role === 'user' ? 'you' : message.toolName;
       const line =
         unstampedText(message.content)
@@ -228,8 +245,8 @@ export function planFold(
   const boundary = Math.max(lastNote, compaction, floorIndex);
   let earliest: number | undefined;
   for (let index = boundary + 1; index < foldIndex && earliest === undefined; index++) {
-    earliest = entries[index]!.messages.filter((message) =>
-      opensSpan(entries, index, message, boundary)
+    earliest = entries[index]!.messages.filter(
+      (message) => spanStart(entries, index, message) > boundary
     )
       .map(readStamp)
       .find((stamp) => stamp !== undefined);

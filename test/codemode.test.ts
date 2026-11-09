@@ -30,7 +30,7 @@ import {
 import { cacheAnchor } from '../src/cache.js';
 import { foldableTurns } from '../src/fold.js';
 import episodes from '../src/index.js';
-import { nudgeThreshold } from '../src/nudge.js';
+import { nudgeGrowth, nudgeThreshold } from '../src/nudge.js';
 import { episodeStats } from '../src/stats.js';
 
 type Step = (context: TranscriptContext) => AssistantMessage | Promise<AssistantMessage>;
@@ -67,7 +67,8 @@ async function createSession(
   steps: Step[],
   extensions: ExtensionFactory[] = [],
   /** The `episodes` settings. */
-  settings: Record<string, unknown> = {}
+  settings: Record<string, unknown> = {},
+  compaction: Record<string, unknown> = {}
 ) {
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-codemode-'));
   const faux = fauxProvider();
@@ -116,7 +117,7 @@ async function createSession(
     ],
     sessionManager: SessionManager.inMemory(dir),
     settingsManager: SettingsManager.inMemory({
-      compaction: { enabled: false },
+      compaction: { enabled: false, ...compaction },
       // Pi's settings type has no slot for extension keys.
       ...({ episodes: settings } as object),
       ...(mode === 'off' ? {} : { codemode: { mode } })
@@ -823,14 +824,15 @@ test('a call made next to a fold call is not offered as a start', async () => {
       fauxAssistantMessage(
         [
           fauxToolCall('codemode', { code: 'text(await tools.fold({ since: "t1", note: "n" }));' }),
-          fauxToolCall('bash', { command: 'echo sibling' })
+          fauxToolCall('bash', { command: `echo sibling ${'y'.repeat(2000)}` })
         ],
         { stopReason: 'toolUse' }
       ),
-    () => fauxAssistantMessage('done')
+    () => fauxAssistantMessage('done'),
+    () => fauxAssistantMessage('ok')
   ]);
   try {
-    await harness.run('go');
+    await harness.run('go', 'next');
     const entries = harness.session.sessionManager.buildSessionProjection().entries;
     assert.equal(threadRecords(harness.session.sessionManager.getBranch()).length, 1);
     // The sibling's result sits after the note, but a span from it would start before it.
@@ -844,9 +846,11 @@ test('a call made next to a fold call is not offered as a start', async () => {
       );
     assert.ok(sibling);
     assert.deepEqual(
-      foldableTurns(entries).map((turn) => turn.stamp),
-      []
+      foldableTurns(entries).map((turn) => turn.label.replace(/^t\d+ +/, '')),
+      ['you: next']
     );
+    // Nor is its result counted as work a fold could remove.
+    assert.ok(nudgeGrowth(entries) < 100);
   } finally {
     await harness.cleanup();
   }
@@ -869,5 +873,113 @@ test('the nudge can be turned off', async () => {
     assert.equal(episodeStats(branch, harness.dir).nudges, 0);
   } finally {
     await harness.cleanup();
+  }
+});
+
+test('a nudge the agent ignored is where growth is counted from', async () => {
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(800)}` }), {
+          stopReason: 'toolUse'
+        }),
+      () => fauxAssistantMessage('one'),
+      () => fauxAssistantMessage('two'),
+      () => fauxAssistantMessage('three')
+    ],
+    [],
+    { foldNudgeTokens: 300 }
+  );
+  try {
+    await harness.run('first', 'second', 'third');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(episodeStats(branch, harness.dir).nudges, 1);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a fold in a long run is not followed by a nudge in the same run', async () => {
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(800)}` }), {
+          stopReason: 'toolUse'
+        }),
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /tokens of work built up/);
+        return fauxAssistantMessage(
+          fauxToolCall('fold', { since: 't1', note: 'Printed a line.' }),
+          {
+            stopReason: 'toolUse'
+          }
+        );
+      },
+      (context) => {
+        assert.equal(conversation(context).at(-1)!.role, 'toolResult');
+        return fauxAssistantMessage('done');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 100 }
+  );
+  try {
+    await harness.run('go');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(threadRecords(branch).length, 1);
+    assert.equal(episodeStats(branch, harness.dir).nudges, 1);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a response cut off by the length limit inside a tool call is nudged too', async () => {
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(800)}` }), {
+          stopReason: 'length'
+        }),
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /tokens of work built up/);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 50 }
+  );
+  try {
+    await harness.run('go');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('close to compaction, a long run is nudged before it grew twice the threshold', async () => {
+  // About 400 tokens build up: under twice the threshold, over a quarter of it.
+  for (const reserveTokens of [16_384, 127_000]) {
+    const harness = await createSession(
+      'off',
+      [
+        () =>
+          fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(1600)}` }), {
+            stopReason: 'toolUse'
+          }),
+        () => fauxAssistantMessage('done')
+      ],
+      [],
+      { foldNudgeTokens: 1000 },
+      { reserveTokens }
+    );
+    try {
+      await harness.run('go');
+      const branch = harness.session.sessionManager.getBranch();
+      assert.equal(episodeStats(branch, harness.dir).nudges, reserveTokens > 100_000 ? 1 : 0);
+    } finally {
+      await harness.cleanup();
+    }
   }
 });
