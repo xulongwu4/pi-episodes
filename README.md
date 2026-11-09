@@ -79,6 +79,12 @@ A fold happens when the main goal of an episode is met, which is when trailing s
 { "episodes": { "openReminder": false, "openReminderMaxTokens": 300 } }
 ```
 
+Left alone, the model folds late or not at all: the prompt is its only reason to. So once the context has grown by 50k tokens since the last fold or compaction, the next prompt you send gets one short message asking the agent to fold first, from the earliest stamp it can fold from. Naming that stamp matters: a fold that starts later leaves the finished work before it stuck behind the new note, since no fold reaches past a note. If the agent does not fold, the message comes back only after as much growth again. Over three runs of a 97-turn benchmark session, it cut the mean cost from $0.39 to $0.25 and the peak context from 255k to 101k tokens, with no compaction. Turn it off or change the threshold:
+
+```json
+{ "episodes": { "foldNudge": false, "foldNudgeTokens": 50000 } }
+```
+
 <br />
 
 ## Tools

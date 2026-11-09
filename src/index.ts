@@ -10,6 +10,7 @@ import { registerFold } from './fold.js';
 import { registerFork } from './fork.js';
 import { ForkRegistry, registerForksView } from './forks-view.js';
 import { FILE_TOOLS } from './messages.js';
+import { registerNudge } from './nudge.js';
 import { EPISODES_SECTION } from './prompt.js';
 import { registerRecall } from './recall.js';
 import { registerReminder } from './reminder.js';
@@ -188,6 +189,7 @@ export default function episodes(pi: ExtensionAPI): void {
   registerFork(pi, state, forks);
   registerForksView(pi, forks);
   registerReminder(pi);
+  registerNudge(pi);
   registerStampDisplay(pi);
   registerCompactionNotice(pi);
 }

@@ -13,6 +13,12 @@ export interface EpisodesSettings {
   compactionNotice: boolean;
   /** Keep a cache breakpoint where the next fold can start. Off only to measure what it saves. */
   cacheAnchor: boolean;
+  /**
+   * Ask the agent to fold once its context grew by `foldNudgeTokens` since the last fold or
+   * compaction, naming the earliest stamp it can fold from.
+   */
+  foldNudge: boolean;
+  foldNudgeTokens: number;
 }
 
 const DEFAULTS: EpisodesSettings = {
@@ -20,7 +26,9 @@ const DEFAULTS: EpisodesSettings = {
   openReminder: true,
   openReminderMaxTokens: 300,
   compactionNotice: true,
-  cacheAnchor: true
+  cacheAnchor: true,
+  foldNudge: true,
+  foldNudgeTokens: 50_000
 };
 
 function flag(value: unknown, fallback: boolean): boolean {
@@ -38,6 +46,8 @@ export function episodesSettings(settings: object): EpisodesSettings {
     openReminder: flag(raw.openReminder, DEFAULTS.openReminder),
     openReminderMaxTokens: positive(raw.openReminderMaxTokens, DEFAULTS.openReminderMaxTokens),
     compactionNotice: flag(raw.compactionNotice, DEFAULTS.compactionNotice),
-    cacheAnchor: flag(raw.cacheAnchor, DEFAULTS.cacheAnchor)
+    cacheAnchor: flag(raw.cacheAnchor, DEFAULTS.cacheAnchor),
+    foldNudge: flag(raw.foldNudge, DEFAULTS.foldNudge),
+    foldNudgeTokens: positive(raw.foldNudgeTokens, DEFAULTS.foldNudgeTokens)
   };
 }

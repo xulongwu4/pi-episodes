@@ -11,6 +11,7 @@ import {
 } from './archive.js';
 import { COMPACTION_NOTICE_TYPE } from './compaction.js';
 import { type EpisodeEvent, EVENT_TYPE } from './events.js';
+import { NUDGE_TYPE } from './nudge.js';
 import { EPISODES_SECTION } from './prompt.js';
 import { REMINDER_TYPE } from './reminder.js';
 import { isStampBlock } from './stamps.js';
@@ -77,6 +78,7 @@ export interface EpisodeStats {
   };
   compactions: number;
   reminders: number;
+  nudges: number;
   /** Estimated tokens the extension added to the transcript, and its prompt section. */
   overhead: { stamps: number; cues: number; notices: number; prompt: number };
 }
@@ -164,6 +166,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
     forks: { count: 0, turns: 0, folds: 0, failed: 0, refused: 0, cost: 0 },
     compactions: 0,
     reminders: 0,
+    nudges: 0,
     overhead: { stamps: 0, cues: 0, notices: 0, prompt: tokensOf(EPISODES_SECTION.length) }
   };
 
@@ -246,7 +249,12 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
     }
     if (entry.type === 'custom_message') {
       if (entry.customType === REMINDER_TYPE) stats.reminders++;
-      if (entry.customType === REMINDER_TYPE || entry.customType === COMPACTION_NOTICE_TYPE) {
+      if (entry.customType === NUDGE_TYPE) stats.nudges++;
+      if (
+        entry.customType === REMINDER_TYPE ||
+        entry.customType === NUDGE_TYPE ||
+        entry.customType === COMPACTION_NOTICE_TYPE
+      ) {
         const content = entry.content;
         stats.overhead.notices += tokensOf(
           typeof content === 'string'
@@ -459,6 +467,7 @@ export function statsLines(stats: EpisodeStats): string[] {
     );
   }
   if (stats.reminders > 0) lines.push(`open-item reminders ${stats.reminders}`);
+  if (stats.nudges > 0) lines.push(`fold nudges ${stats.nudges}`);
 
   const overhead = stats.overhead;
   lines.push(

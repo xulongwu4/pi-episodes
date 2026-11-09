@@ -419,6 +419,12 @@ const FoldParams = Type.Object({
   })
 });
 
+/** How to ask for a fold call. Under codemode "only" fold is not declared; scripts reach it. */
+export function foldInstruction(pi: ExtensionAPI): string {
+  return pi.getSettings().codemode?.mode === 'only' && pi.getActiveTools().includes('codemode')
+    ? 'make one codemode call whose script calls only fold and prints its result'
+    : 'call only fold in this response';
+}
 export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
   pi.registerTool({
     name: FOLD_TOOL,
@@ -701,11 +707,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         if (since === undefined) return;
       }
       state.manualFold = since === undefined ? 'request' : 'since';
-      // Under codemode "only" fold is not declared; the model reaches it from a script.
-      const how =
-        pi.getSettings().codemode?.mode === 'only' && pi.getActiveTools().includes('codemode')
-          ? 'make one codemode call whose script calls only fold and prints its result'
-          : 'call only fold in this response';
+      const how = foldInstruction(pi);
       const target =
         since === undefined ? 'Pick the span that is done' : `Use since "${stampLabel(since)}"`;
       pi.sendMessage(

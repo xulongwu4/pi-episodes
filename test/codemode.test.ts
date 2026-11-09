@@ -60,7 +60,13 @@ function script(code: string, id?: string): AssistantMessage {
   });
 }
 
-async function createSession(mode: Mode, steps: Step[], extensions: ExtensionFactory[] = []) {
+async function createSession(
+  mode: Mode,
+  steps: Step[],
+  extensions: ExtensionFactory[] = [],
+  /** The `episodes` settings. */
+  settings: Record<string, unknown> = {}
+) {
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-codemode-'));
   const faux = fauxProvider();
   const requests: TranscriptContext[] = [];
@@ -109,6 +115,8 @@ async function createSession(mode: Mode, steps: Step[], extensions: ExtensionFac
     sessionManager: SessionManager.inMemory(dir),
     settingsManager: SettingsManager.inMemory({
       compaction: { enabled: false },
+      // Pi's settings type has no slot for extension keys.
+      ...({ episodes: settings } as object),
       ...(mode === 'off' ? {} : { codemode: { mode } })
     })
   });
@@ -719,5 +727,69 @@ test('a fold whose text a result hook emptied does not take effect', async () =>
     } finally {
       await harness.cleanup();
     }
+  }
+});
+test('a nudge asks for a fold from the earliest foldable stamp once the context grew', async () => {
+  for (const mode of ['off', 'only'] as const) {
+    const seen: string[] = [];
+    const work = (n: string) => (context: TranscriptContext) => {
+      seen.push(conversation(context).map(text).join('\n'));
+      return mode === 'only'
+        ? script(`text(await tools.bash({ command: "echo ${n}" }));`)
+        : fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${n}` }), {
+            stopReason: 'toolUse'
+          });
+    };
+    const done = () => fauxAssistantMessage('done');
+    const harness = await createSession(
+      mode,
+      [work('one'), done, work('two'), done, work('three'), done],
+      [],
+      { foldNudgeTokens: 1000 }
+    );
+    try {
+      await harness.run('first', 'second', 'third');
+      const branch = harness.session.sessionManager.getBranch();
+      const nudges = branch.flatMap((entry) =>
+        entry.type === 'custom_message' && entry.customType === 'episodes-nudge'
+          ? [String(entry.content)]
+          : []
+      );
+      // The first request grows the context by a few thousand tokens; the second adds less than
+      // the threshold again, so the nudge is not repeated.
+      assert.equal(nudges.length, 1, mode);
+      assert.match(nudges[0]!, /with since "t1", the earliest stamp you can fold from/);
+      assert.match(
+        nudges[0]!,
+        mode === 'only'
+          ? /make one codemode call whose script calls only fold/
+          : /call only fold in this response/
+      );
+      // The model sees it with the second prompt, after the user's message.
+      assert.match(seen[1]!, /second\n\[t\d+\]\nYour context grew by about \d+k tokens/);
+      assert.equal(episodeStats(branch, harness.dir).nudges, 1);
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+test('the nudge can be turned off', async () => {
+  const harness = await createSession(
+    'off',
+    [
+      () => fauxAssistantMessage('one'),
+      () => fauxAssistantMessage('two'),
+      () => fauxAssistantMessage('three')
+    ],
+    [],
+    { foldNudge: false, foldNudgeTokens: 1 }
+  );
+  try {
+    await harness.run('first', 'second', 'third');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(episodeStats(branch, harness.dir).nudges, 0);
+  } finally {
+    await harness.cleanup();
   }
 });
