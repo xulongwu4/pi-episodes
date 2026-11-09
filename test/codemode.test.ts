@@ -22,6 +22,7 @@ import {
   SettingsManager
 } from '@earendil-works/pi-coding-agent';
 import { FOLD_APPLIED_TYPE, FOLD_DETAILS_KEY, threadRecords } from '../src/archive.js';
+import { cacheAnchor } from '../src/cache.js';
 import episodes from '../src/index.js';
 import { episodeStats } from '../src/stats.js';
 
@@ -421,6 +422,8 @@ test('a fold is not applied when a later hook drops the note from the script res
       () => script('text(await tools.bash({ command: "echo kept" }));'),
       () => script('text(await tools.fold({ since: "t1", note: "n" }));'),
       (context) => {
+        // The rewritten result does not stand for the fold, so it is not the cache anchor.
+        assert.deepEqual(cacheAnchor(conversation(context)), { stamp: '[t1]' });
         // The span stays: both responses and both results are still sent.
         assert.equal(conversation(context).length, 5);
         return fauxAssistantMessage('ok');
@@ -521,6 +524,42 @@ test('a fork under "only" can fold its own work with a direct fold call', async 
   ]);
   try {
     await harness.run('go');
+  } finally {
+    await harness.cleanup();
+  }
+});
+test('a fold that a result hook failed does not take effect, even if the script catches it', async () => {
+  const harness = await createSession(
+    'only',
+    [
+      () => script('text(await tools.bash({ command: "echo kept" }));'),
+      () =>
+        script(
+          'let r; try { r = await tools.fold({ since: "t1", note: "n" }); } catch (e) { r = String(e); } text(r);'
+        ),
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /Denied by result hook/);
+        assert.equal(conversation(context).length, 5);
+        return fauxAssistantMessage('ok');
+      }
+    ],
+    [
+      (pi) => {
+        pi.on('tool_result', (event) =>
+          event.toolName === 'fold'
+            ? { content: [{ type: 'text', text: 'Denied by result hook' }], isError: true }
+            : undefined
+        );
+      }
+    ]
+  );
+  try {
+    await harness.run('go');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(threadRecords(branch).length, 0);
+    assert.ok(
+      !branch.some((entry) => entry.type === 'custom' && entry.customType === FOLD_APPLIED_TYPE)
+    );
   } finally {
     await harness.cleanup();
   }

@@ -434,7 +434,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     renderCall: foldRenderers.renderCall,
     renderResult: foldRenderers.renderResult,
 
-    async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
       // A /fold request is used up by this call, whether it succeeds or not.
       const manual = state.manualFold;
       state.manualFold = undefined;
@@ -445,6 +445,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       // script made it.
       const root = state.rootCall(toolCallId);
       const scriptCall = root === toolCallId ? undefined : root;
+      const run = state.run;
       try {
         since = parseStamp(params.since);
         if (since === undefined) {
@@ -549,6 +550,8 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         keptUserTurns: plan.keptUserTurns,
         cwd: state.cwd
       });
+      // Snapshots take time; a run aborted meanwhile, or already settled, must not get edits.
+      if (signal?.aborted || run !== state.run) throw new Error('The fold was cancelled.');
       // A fold from a script takes effect with the script's result, which then stands as the
       // note; the edits wait under the script's call, the one the turn reports.
       state.pendingFolds.set(scriptCall ?? toolCallId, {
@@ -556,7 +559,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         messages: plan.omitted.length,
         tokens,
         edits: plan.edits,
-        ...(scriptCall ? { script: { note: text, details } } : {})
+        ...(scriptCall ? { script: { foldCallId: toolCallId, note: text, details } } : {})
       });
 
       // A /fold request ends the run here; an autonomous fold continues the task. Codemode
@@ -573,6 +576,14 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     if (event.parentToolCallId) state.parentCalls.set(event.toolCallId, event.parentToolCallId);
   });
 
+  // A result hook can still fail the fold after it ran, and the script can catch that.
+  pi.on('tool_execution_end', (event) => {
+    if (!event.isError || !event.parentToolCallId) return;
+    const root = state.rootCall(event.toolCallId);
+    if (state.pendingFolds.get(root)?.script?.foldCallId === event.toolCallId) {
+      state.pendingFolds.delete(root);
+    }
+  });
   // A fold from a script takes effect only if the script succeeds. Its result then carries the
   // fold's details, and the note too when the script did not print it, written once with the
   // result rather than edited in later.
@@ -644,6 +655,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     state.pendingFolds.clear();
     state.foldResponses.clear();
     state.parentCalls.clear();
+    state.run++;
     state.manualFold = undefined;
     refreshStatus(ctx, state);
   });

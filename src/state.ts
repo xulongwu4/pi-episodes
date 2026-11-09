@@ -15,7 +15,7 @@ export interface PendingFold {
    * call instead, and its result carries the details and, if the script did not print it, the
    * note.
    */
-  script?: { note: string; details: FoldDetails };
+  script?: { foldCallId: string; note: string; details: FoldDetails };
 }
 
 /** Per-session runtime state. Everything durable lives in the session file instead. */
@@ -33,6 +33,8 @@ export class EpisodeState {
   readonly foldResponses = new Map<string, string>();
   /** The calling tool of each nested call seen in the current run, from `tool_call` events. */
   readonly parentCalls = new Map<string, string>();
+  /** Counts settled runs, so a fold that finishes after its run ended can tell. */
+  run = 0;
   /** `handle:path` pairs already surfaced, so a folded thread is pointed at once per file. */
   readonly surfaced = new Set<string>();
   /** Fork transcripts for sessions that have no file to write them next to. */
@@ -56,6 +58,7 @@ export class EpisodeState {
     this.pendingFolds.clear();
     this.foldResponses.clear();
     this.parentCalls.clear();
+    this.run++;
     this.surfaced.clear();
     this.forkArchives.clear();
     this.manualFold = undefined;
