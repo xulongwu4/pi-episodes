@@ -106,6 +106,9 @@ export default function episodes(pi: ExtensionAPI): void {
   // codemode script made has a result the model may never see, so its cue waits for the
   // script's own result.
   const scriptCues = new Map<string, Cue[]>();
+  // A script that never returned, for example when the run was aborted, leaves its cues.
+  pi.on('agent_settled', () => scriptCues.clear());
+  pi.on('session_start', () => scriptCues.clear());
   pi.on('tool_result', (event, ctx) => {
     const cues = event.parentToolCallId ? [] : (scriptCues.get(event.toolCallId) ?? []);
     scriptCues.delete(event.toolCallId);

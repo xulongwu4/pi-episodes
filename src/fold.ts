@@ -604,7 +604,12 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       .filter((result) => !result.isError)
       .flatMap((result) => {
         const pending = state.pendingFolds.get(result.toolCallId);
-        const stands = pending?.script ? foldNoteDetails(result) : result.toolName === FOLD_TOOL;
+        // A later hook may have rewritten the script's result; without the note in it, the
+        // span would leave with nothing in its place.
+        const stands = pending?.script
+          ? foldNoteDetails(result)?.handle === pending.handle &&
+            textOf(result.content).includes(pending.script.note)
+          : result.toolName === FOLD_TOOL;
         if (!pending || !stands) return [];
         state.pendingFolds.delete(result.toolCallId);
         return [pending];

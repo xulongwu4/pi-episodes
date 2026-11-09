@@ -16,6 +16,7 @@ import {
   createAgentSession,
   createCodemodeExtension,
   DefaultResourceLoader,
+  type ExtensionFactory,
   ModelRuntime,
   SessionManager,
   SettingsManager
@@ -53,7 +54,7 @@ function script(code: string, id?: string): AssistantMessage {
   });
 }
 
-async function createSession(mode: Mode, steps: Step[]) {
+async function createSession(mode: Mode, steps: Step[], extensions: ExtensionFactory[] = []) {
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-codemode-'));
   const faux = fauxProvider();
   const requests: TranscriptContext[] = [];
@@ -77,7 +78,8 @@ async function createSession(mode: Mode, steps: Step[]) {
     extensionFactories: [
       (pi) => pi.registerProvider(faux.provider),
       ...(mode === 'off' ? [] : [createCodemodeExtension({ models: false })]),
-      episodes
+      episodes,
+      ...extensions
     ]
   });
   await resourceLoader.reload();
@@ -374,6 +376,151 @@ test('/fold under "only" asks for a fold from a script', async () => {
     const [record] = threadRecords(harness.session.sessionManager.getBranch());
     assert.ok(record?.kind === 'fold');
     assert.equal(record.manual, 'since');
+  } finally {
+    await harness.cleanup();
+  }
+});
+test('two scripts in one response: only the first fold takes effect', async () => {
+  const fold = (note: string) =>
+    `let r; try { r = await tools.fold({ since: "t1", note: "${note}" }); } catch (e) { r = String(e); } text(r);`;
+  const harness = await createSession('only', [
+    () => script('text(await tools.bash({ command: "echo one" }));'),
+    () =>
+      fauxAssistantMessage(
+        [
+          fauxToolCall('codemode', { code: fold('first') }, { id: 'cm-a' }),
+          fauxToolCall('codemode', { code: fold('second') }, { id: 'cm-b' })
+        ],
+        { stopReason: 'toolUse' }
+      ),
+    (context) => {
+      const all = conversation(context).map(text).join('\n');
+      assert.match(all, /Only one fold per response/);
+      assert.equal(all.match(/\[fold ep-/g)?.length, 1);
+      return fauxAssistantMessage('ok');
+    }
+  ]);
+  try {
+    await harness.run('go');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(threadRecords(branch).length, 1);
+    assert.equal(
+      branch.filter((entry) => entry.type === 'custom' && entry.customType === FOLD_APPLIED_TYPE)
+        .length,
+      1
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a fold is not applied when a later hook drops the note from the script result', async () => {
+  const harness = await createSession(
+    'only',
+    [
+      () => script('text(await tools.bash({ command: "echo kept" }));'),
+      () => script('text(await tools.fold({ since: "t1", note: "n" }));'),
+      (context) => {
+        // The span stays: both responses and both results are still sent.
+        assert.equal(conversation(context).length, 5);
+        return fauxAssistantMessage('ok');
+      }
+    ],
+    [
+      (pi) => {
+        pi.on('tool_result', (event) =>
+          event.toolName === 'codemode' && !event.parentToolCallId
+            ? { content: [{ type: 'text', text: 'redacted' }] }
+            : undefined
+        );
+      }
+    ]
+  );
+  try {
+    await harness.run('go');
+    assert.equal(threadRecords(harness.session.sessionManager.getBranch()).length, 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('with codemode "on", a top-level fold still works', async () => {
+  const harness = await createSession('on', [
+    () => script('text(await tools.bash({ command: "echo one" }));'),
+    () =>
+      fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'Ran one.' }), {
+        stopReason: 'toolUse'
+      }),
+    (context) => {
+      const messages = conversation(context);
+      assert.equal(messages.length, 3);
+      assert.match(text(messages[2]!), /\[fold ep-[0-9a-f]{8}: 2 messages/);
+      return fauxAssistantMessage('ok');
+    }
+  ]);
+  try {
+    await harness.run('go');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('ask reaches a span folded from a script, from a script', async () => {
+  let handle = '';
+  const harness = await createSession('only', [
+    () => script('text(await tools.bash({ command: "echo error TS2322" }));'),
+    () => script('text(await tools.fold({ since: "t1", note: "Build failed." }));'),
+    (context) => {
+      handle = /ep-[0-9a-f]{8}/.exec(text(conversation(context).at(-1)!))![0];
+      return fauxAssistantMessage('Folded.');
+    },
+    () =>
+      script(`text(await tools.ask({ handle: "${handle}", question: "Which error was it?" }));`),
+    (context) => {
+      // The ask request resumes the archived thread.
+      assert.match(text(conversation(context).at(-1)!), /Which error was it\?/);
+      assert.ok(conversation(context).some((message) => /error TS2322/.test(text(message))));
+      return fauxAssistantMessage('TS2322.');
+    },
+    (context) => {
+      assert.match(text(conversation(context).at(-1)!), /answers\]\nTS2322\./);
+      return fauxAssistantMessage('ok');
+    }
+  ]);
+  try {
+    await harness.run('go', 'which error?');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a fork under "only" can fold its own work with a direct fold call', async () => {
+  const harness = await createSession('only', [
+    () =>
+      fauxAssistantMessage(fauxToolCall('fork', { task: 'Check it.' }), { stopReason: 'toolUse' }),
+    () =>
+      fauxAssistantMessage(fauxToolCall('bash', { command: 'echo noisy' }), {
+        stopReason: 'toolUse'
+      }),
+    (context) => {
+      const stamp = /\[(t\d+)\]$/.exec(text(conversation(context).at(-1)!))![1]!;
+      return fauxAssistantMessage(fauxToolCall('fold', { since: stamp, note: 'Ran it.' }), {
+        stopReason: 'toolUse'
+      });
+    },
+    (context) => {
+      const last = text(conversation(context).at(-1)!);
+      assert.match(last, /\[fold ep-[0-9a-f]{8}:/);
+      assert.ok(!conversation(context).some((message) => /^noisy/m.test(text(message))));
+      return fauxAssistantMessage('Changed: nothing. Learned: it works.');
+    },
+    (context) => {
+      assert.match(text(conversation(context).at(-1)!), /^\[fork fk-[0-9a-f]{8} finished/);
+      return fauxAssistantMessage('done');
+    }
+  ]);
+  try {
+    await harness.run('go');
   } finally {
     await harness.cleanup();
   }
