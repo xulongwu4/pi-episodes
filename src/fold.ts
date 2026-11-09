@@ -5,6 +5,7 @@ import type { ImageContent, TextContent } from '@earendil-works/pi-ai';
 import type {
   ContextEditEntryDraft,
   ExtensionAPI,
+  MessageRenderer,
   ProjectedSessionEntry
 } from '@earendil-works/pi-coding-agent';
 import { Text } from '@earendil-works/pi-tui';
@@ -107,22 +108,46 @@ export interface FoldableTurn {
 
 const PREVIEW_WIDTH = 72;
 
+/** Index of the latest applied fold note or compaction; no fold reaches back past it. */
+export function foldBoundary(entries: readonly ProjectedSessionEntry[]): number {
+  const applied = appliedFolds(entries.map((entry) => entry.sourceEntry));
+  return entries.findLastIndex(
+    (entry) => entry.sourceEntry.type === 'compaction' || isFoldNote(entry, applied)
+  );
+}
+
+/**
+ * Whether a span can start at this message. A span starting at a tool result starts at the
+ * response that made the call, which can be behind the boundary: a call made next to a fold
+ * call has its result after the note.
+ */
+function opensSpan(
+  entries: readonly ProjectedSessionEntry[],
+  index: number,
+  message: AgentMessage,
+  boundary: number
+): boolean {
+  if (message.role !== 'toolResult') return true;
+  const caller = entries.findLastIndex(
+    (entry, at) => at < index && callsTool(entry, message.toolCallId)
+  );
+  return caller < 0 || caller > boundary;
+}
+
 /**
  * Stamped turns a fold can start from, newest first: those after the latest applied note or
  * compaction summary, with a one-line preview to recognize them by.
  */
 export function foldableTurns(entries: readonly ProjectedSessionEntry[]): FoldableTurn[] {
-  const applied = appliedFolds(entries.map((entry) => entry.sourceEntry));
-  const boundary = entries.findLastIndex(
-    (entry) => entry.sourceEntry.type === 'compaction' || isFoldNote(entry, applied)
-  );
+  const boundary = foldBoundary(entries);
   const turns: FoldableTurn[] = [];
-  for (const entry of entries.slice(boundary + 1)) {
-    for (const message of entry.messages) {
+  for (let index = boundary + 1; index < entries.length; index++) {
+    for (const message of entries[index]!.messages) {
       const stamp = readStamp(message);
       if (stamp === undefined || (message.role !== 'user' && message.role !== 'toolResult')) {
         continue;
       }
+      if (!opensSpan(entries, index, message, boundary)) continue;
       const who = message.role === 'user' ? 'you' : message.toolName;
       const line =
         unstampedText(message.content)
@@ -201,10 +226,14 @@ export function planFold(
     (entry, index) => index < foldIndex && entry.sourceEntry.type === 'compaction'
   );
   const boundary = Math.max(lastNote, compaction, floorIndex);
-  const earliest = entries
-    .slice(boundary + 1, foldIndex)
-    .flatMap((entry) => entry.messages.map(readStamp))
-    .find((stamp) => stamp !== undefined);
+  let earliest: number | undefined;
+  for (let index = boundary + 1; index < foldIndex && earliest === undefined; index++) {
+    earliest = entries[index]!.messages.filter((message) =>
+      opensSpan(entries, index, message, boundary)
+    )
+      .map(readStamp)
+      .find((stamp) => stamp !== undefined);
+  }
   const pick =
     earliest === undefined
       ? 'Nothing before this call can be folded yet.'
@@ -419,6 +448,16 @@ const FoldParams = Type.Object({
   })
 });
 
+/** One dim line for a message that asks the agent to fold, from /fold or a nudge. */
+export const renderFoldAsk: MessageRenderer = (message, _options, theme) => {
+  const text = typeof message.content === 'string' ? message.content : '';
+  const since = /since "(t\d+)"/.exec(text)?.[1];
+  return new Text(
+    theme.fg('dim', `episodes: asked the agent to fold${since ? ` from ${since}` : ''}`),
+    0,
+    0
+  );
+};
 /** How to ask for a fold call. Under codemode "only" fold is not declared; scripts reach it. */
 export function foldInstruction(pi: ExtensionAPI): string {
   return pi.getSettings().codemode?.mode === 'only' && pi.getActiveTools().includes('codemode')
@@ -721,15 +760,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     }
   });
 
-  pi.registerMessageRenderer(FOLD_REQUEST_TYPE, (message, _options, theme) => {
-    const text = typeof message.content === 'string' ? message.content : '';
-    const since = /since "(t\d+)"/.exec(text)?.[1];
-    return new Text(
-      theme.fg('dim', `episodes: asked the agent to fold${since ? ` from ${since}` : ''}`),
-      0,
-      0
-    );
-  });
+  pi.registerMessageRenderer(FOLD_REQUEST_TYPE, renderFoldAsk);
 
   pi.registerCommand('episodes', {
     description:

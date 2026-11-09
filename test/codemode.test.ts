@@ -28,7 +28,9 @@ import {
   threadRecords
 } from '../src/archive.js';
 import { cacheAnchor } from '../src/cache.js';
+import { foldableTurns } from '../src/fold.js';
 import episodes from '../src/index.js';
+import { nudgeThreshold } from '../src/nudge.js';
 import { episodeStats } from '../src/stats.js';
 
 type Step = (context: TranscriptContext) => AssistantMessage | Promise<AssistantMessage>;
@@ -729,48 +731,124 @@ test('a fold whose text a result hook emptied does not take effect', async () =>
     }
   }
 });
-test('a nudge asks for a fold from the earliest foldable stamp once the context grew', async () => {
+test('a nudge on the next prompt leads to a fold from the earliest stamp', async () => {
   for (const mode of ['off', 'only'] as const) {
-    const seen: string[] = [];
-    const work = (n: string) => (context: TranscriptContext) => {
-      seen.push(conversation(context).map(text).join('\n'));
-      return mode === 'only'
-        ? script(`text(await tools.bash({ command: "echo ${n}" }));`)
-        : fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${n}` }), {
-            stopReason: 'toolUse'
-          });
-    };
+    const big = 'x'.repeat(800);
+    const call = (tool: string, args: Record<string, string>) =>
+      mode === 'only'
+        ? script(`text(await tools.${tool}(${JSON.stringify(args)}));`)
+        : fauxAssistantMessage(fauxToolCall(tool, args), { stopReason: 'toolUse' });
     const done = () => fauxAssistantMessage('done');
     const harness = await createSession(
       mode,
-      [work('one'), done, work('two'), done, work('three'), done],
+      [
+        () => call('bash', { command: `echo ${big}` }),
+        done,
+        (context) => {
+          const nudge = text(conversation(context).at(-1)!);
+          assert.match(nudge, /tokens of work built up/, mode);
+          assert.match(
+            nudge,
+            mode === 'only'
+              ? /make one codemode call whose script calls only fold/
+              : /call only fold in this response/
+          );
+          const since = /since "(t\d+)"/.exec(nudge)![1]!;
+          assert.equal(since, 't1');
+          return call('fold', { since, note: 'Printed a long line.' });
+        },
+        (context) => {
+          // The first request is folded; the user messages and the nudge's request remain.
+          assert.doesNotMatch(conversation(context).map(text).join('\n'), /xxxx/);
+          return done();
+        },
+        done
+      ],
       [],
-      { foldNudgeTokens: 1000 }
+      // About 400 tokens build up in the first request: over the threshold, under twice it.
+      { foldNudgeTokens: 300 }
     );
     try {
       await harness.run('first', 'second', 'third');
       const branch = harness.session.sessionManager.getBranch();
-      const nudges = branch.flatMap((entry) =>
-        entry.type === 'custom_message' && entry.customType === 'episodes-nudge'
-          ? [String(entry.content)]
-          : []
-      );
-      // The first request grows the context by a few thousand tokens; the second adds less than
-      // the threshold again, so the nudge is not repeated.
-      assert.equal(nudges.length, 1, mode);
-      assert.match(nudges[0]!, /with since "t1", the earliest stamp you can fold from/);
-      assert.match(
-        nudges[0]!,
-        mode === 'only'
-          ? /make one codemode call whose script calls only fold/
-          : /call only fold in this response/
-      );
-      // The model sees it with the second prompt, after the user's message.
-      assert.match(seen[1]!, /second\n\[t\d+\]\nYour context grew by about \d+k tokens/);
-      assert.equal(episodeStats(branch, harness.dir).nudges, 1);
+      assert.equal(threadRecords(branch).length, 1, mode);
+      // After the fold, too little built up for a second nudge.
+      assert.equal(episodeStats(branch, harness.dir).nudges, 1, mode);
     } finally {
       await harness.cleanup();
     }
+  }
+});
+
+test('a long run is nudged at a turn boundary once it grew twice the threshold', async () => {
+  const big = 'x'.repeat(800);
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${big}` }), {
+          stopReason: 'toolUse'
+        }),
+      (context) => {
+        assert.match(
+          text(conversation(context).at(-1)!),
+          /If the work since t1 is finished and the task/
+        );
+        return fauxAssistantMessage('done');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 100 }
+  );
+  try {
+    await harness.run('go');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('the nudge threshold is at most a quarter of the context window', () => {
+  assert.equal(nudgeThreshold(50_000, 64_000), 16_000);
+  assert.equal(nudgeThreshold(50_000, 1_000_000), 50_000);
+  assert.equal(nudgeThreshold(50_000, undefined), 50_000);
+});
+
+test('a call made next to a fold call is not offered as a start', async () => {
+  const harness = await createSession('on', [
+    () =>
+      fauxAssistantMessage(fauxToolCall('bash', { command: 'echo one' }), {
+        stopReason: 'toolUse'
+      }),
+    () =>
+      fauxAssistantMessage(
+        [
+          fauxToolCall('codemode', { code: 'text(await tools.fold({ since: "t1", note: "n" }));' }),
+          fauxToolCall('bash', { command: 'echo sibling' })
+        ],
+        { stopReason: 'toolUse' }
+      ),
+    () => fauxAssistantMessage('done')
+  ]);
+  try {
+    await harness.run('go');
+    const entries = harness.session.sessionManager.buildSessionProjection().entries;
+    assert.equal(threadRecords(harness.session.sessionManager.getBranch()).length, 1);
+    // The sibling's result sits after the note, but a span from it would start before it.
+    const sibling = entries
+      .flatMap((entry) => entry.messages)
+      .find(
+        (message) =>
+          message.role === 'toolResult' &&
+          message.toolName === 'bash' &&
+          /sibling/.test(text(message as Message))
+      );
+    assert.ok(sibling);
+    assert.deepEqual(
+      foldableTurns(entries).map((turn) => turn.stamp),
+      []
+    );
+  } finally {
+    await harness.cleanup();
   }
 });
 

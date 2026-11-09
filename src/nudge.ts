@@ -1,68 +1,86 @@
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import { Text } from '@earendil-works/pi-tui';
-import { foldableTurns, foldInstruction } from './fold.js';
+import type { ExtensionAPI, ProjectedSessionEntry } from '@earendil-works/pi-coding-agent';
+import { foldableTurns, foldBoundary, foldInstruction, renderFoldAsk } from './fold.js';
+import { estimateTokens } from './messages.js';
 import { episodesSettings } from './settings.js';
 import { stampLabel } from './stamps.js';
 
 export const NUDGE_TYPE = 'episodes-nudge';
 
+/** At most a quarter of the window, so small windows are nudged well before pi compacts. */
+export function nudgeThreshold(tokens: number, contextWindow: number | undefined): number {
+  return contextWindow ? Math.min(tokens, Math.floor(contextWindow / 4)) : tokens;
+}
+
+/**
+ * Tokens a fold could remove that built up since the latest fold note, compaction or nudge,
+ * read from the entries rather than kept in memory, so a resumed session or another branch is
+ * measured the same way. The system prompt and tool declarations are not counted.
+ */
+export function nudgeGrowth(entries: readonly ProjectedSessionEntry[]): number {
+  const nudged = entries.findLastIndex(
+    (entry) =>
+      entry.sourceEntry.type === 'custom_message' && entry.sourceEntry.customType === NUDGE_TYPE
+  );
+  const from = Math.max(foldBoundary(entries), nudged) + 1;
+  return estimateTokens(entries.slice(from).flatMap((entry) => entry.messages));
+}
+
 /**
  * The prompt leaves folding to the model, and in long sessions it rarely folds on its own.
- * Once the context grew by `foldNudgeTokens` since it last shrank, the next user prompt gets one
- * short message asking for a fold. It names the earliest stamp a fold can start from: a fold
- * from a later stamp leaves the work before it behind the new note for good. It is appended at
- * the start of a request, where the prompt already says to fold the request before, never
+ * Once `foldNudgeTokens` built up since the last fold, compaction or nudge, the next user prompt
+ * gets one short message asking for a fold, and so does the next request of a run that grew by
+ * twice as much on its own. It names the earliest stamp a fold can start from: a fold from a
+ * later stamp leaves the work before it behind the new note for good. It is appended, never
  * edited in, so the cached prefix is untouched.
  */
 export function registerNudge(pi: ExtensionAPI): void {
-  /** Context size the growth is measured from, and the size at the previous prompt. */
-  let floor: number | undefined;
-  let last: number | undefined;
-
-  pi.on('session_start', () => {
-    floor = undefined;
-    last = undefined;
-  });
-
-  pi.on('before_agent_start', (event, ctx) => {
-    const messageType = (event as { messageType?: string }).messageType;
-    if (messageType !== undefined && messageType !== 'user') return undefined;
+  const nudge = (
+    entries: readonly ProjectedSessionEntry[],
+    contextWindow: number | undefined,
+    factor: number,
+    when: string
+  ): string | undefined => {
     const settings = episodesSettings(pi.getSettings());
     if (!settings.foldNudge || !pi.getActiveTools().includes('fold')) return undefined;
-    const tokens = ctx.getContextUsage()?.tokens;
-    if (tokens == null) return undefined;
-
-    // A smaller context means a fold or compaction; growth counts from there.
-    if (floor === undefined || (last !== undefined && tokens < last)) floor = tokens;
-    last = tokens;
-    const growth = tokens - floor;
-    if (growth < settings.foldNudgeTokens) return undefined;
-    // Ignored, it comes back only after as much growth again.
-    floor = tokens;
-
-    const earliest = foldableTurns(ctx.sessionManager.buildSessionProjection().entries).at(-1);
+    const growth = nudgeGrowth(entries);
+    if (growth < factor * nudgeThreshold(settings.foldNudgeTokens, contextWindow)) return undefined;
+    const earliest = foldableTurns(entries).at(-1);
     if (!earliest) return undefined;
-    const k = (n: number) => `${Math.round(n / 1000)}k`;
+    const since = stampLabel(earliest.stamp);
+    return (
+      `About ${Math.round(growth / 1000)}k tokens of work built up since the last fold, compaction or message like this one. ` +
+      `If the work since ${since} is finished and ${when} does not need its raw output, fold it first: ${foldInstruction(pi)}, with since "${since}", the earliest stamp you can fold from, and a note covering everything from there; then continue. ` +
+      'Do not fold from a later stamp instead: the work before it would stay in your context for good. If that work is still needed, fold once it is done.'
+    );
+  };
+
+  pi.on('before_agent_start', (event, ctx) => {
+    // Extension messages, such as the /fold request, are not the user coming back to the task.
+    const messageType = (event as { messageType?: string }).messageType;
+    if (messageType !== undefined && messageType !== 'user') return undefined;
+    const content = nudge(
+      ctx.sessionManager.buildSessionProjection().entries,
+      ctx.model?.contextWindow,
+      1,
+      'this request'
+    );
+    return content ? { message: { customType: NUDGE_TYPE, content, display: true } } : undefined;
+  });
+
+  // A long run gets no user prompt to nudge on. The preview already holds this turn's folds.
+  pi.on('turn_end', (event, ctx) => {
+    if (event.message.role !== 'assistant' || event.message.stopReason !== 'toolUse') {
+      return undefined;
+    }
+    const content = nudge(event.context.contextEntries, ctx.model?.contextWindow, 2, 'the task');
+    if (!content) return undefined;
     return {
-      message: {
-        customType: NUDGE_TYPE,
-        display: true,
-        content:
-          `Your context grew by about ${k(growth)} tokens since the last fold or compaction (now ${k(tokens)}). ` +
-          `Before working on this request, fold the finished episodes: ${foldInstruction(pi)}, ` +
-          `with since "${stampLabel(earliest.stamp)}", the earliest stamp you can fold from, so no finished work is left behind, and a note covering everything from there. ` +
-          'Skip this only if nothing finished is worth more than about 2k tokens.'
-      }
+      entries: [
+        ...event.entries,
+        { type: 'custom_message' as const, customType: NUDGE_TYPE, content, display: true }
+      ]
     };
   });
 
-  pi.registerMessageRenderer(NUDGE_TYPE, (message, _options, theme) => {
-    const text = typeof message.content === 'string' ? message.content : '';
-    const since = /since "(t\d+)"/.exec(text)?.[1];
-    return new Text(
-      theme.fg('dim', `episodes: asked the agent to fold${since ? ` from ${since}` : ''}`),
-      0,
-      0
-    );
-  });
+  pi.registerMessageRenderer(NUDGE_TYPE, renderFoldAsk);
 }

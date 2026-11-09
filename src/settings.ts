@@ -14,8 +14,8 @@ export interface EpisodesSettings {
   /** Keep a cache breakpoint where the next fold can start. Off only to measure what it saves. */
   cacheAnchor: boolean;
   /**
-   * Ask the agent to fold once its context grew by `foldNudgeTokens` since the last fold or
-   * compaction, naming the earliest stamp it can fold from.
+   * Ask the agent to fold once `foldNudgeTokens` (at most a quarter of the context window)
+   * built up since the last fold, compaction or nudge, naming the earliest stamp it can fold from.
    */
   foldNudge: boolean;
   foldNudgeTokens: number;
