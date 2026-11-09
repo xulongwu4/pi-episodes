@@ -211,11 +211,7 @@ export function foldNoteDetails(message: AgentMessage | undefined): FoldDetails 
     return isFoldDetails(message.details) ? message.details : undefined;
   }
   const nested = isRecord(message.details) ? message.details[FOLD_DETAILS_KEY] : undefined;
-  // A hook can rewrite the script's result after the fold was attached; without the note in
-  // its text the result does not stand for the fold.
-  if (!isFoldDetails(nested)) return undefined;
-  const text = message.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
-  return text.includes(`[fold ${nested.handle}:`) ? nested : undefined;
+  return isFoldDetails(nested) ? nested : undefined;
 }
 
 function toolDetails(entry: SessionEntry, toolName: string): unknown {

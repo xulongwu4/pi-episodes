@@ -21,7 +21,12 @@ import {
   SessionManager,
   SettingsManager
 } from '@earendil-works/pi-coding-agent';
-import { FOLD_APPLIED_TYPE, FOLD_DETAILS_KEY, threadRecords } from '../src/archive.js';
+import {
+  appliedFolds,
+  FOLD_APPLIED_TYPE,
+  FOLD_DETAILS_KEY,
+  threadRecords
+} from '../src/archive.js';
 import { cacheAnchor } from '../src/cache.js';
 import episodes from '../src/index.js';
 import { episodeStats } from '../src/stats.js';
@@ -415,17 +420,19 @@ test('two scripts in one response: only the first fold takes effect', async () =
   }
 });
 
-test('a fold is not applied when a later hook drops the note from the script result', async () => {
+test('a fold is not applied when a later hook rewrites its note in the script result', async () => {
   const harness = await createSession(
     'only',
     [
       () => script('text(await tools.bash({ command: "echo kept" }));'),
-      () => script('text(await tools.fold({ since: "t1", note: "n" }));'),
+      () => script('text(await tools.fold({ since: "t1", note: "Secret body." }));'),
       (context) => {
-        // The rewritten result does not stand for the fold, so it is not the cache anchor.
-        assert.deepEqual(cacheAnchor(conversation(context)), { stamp: '[t1]' });
-        // The span stays: both responses and both results are still sent.
+        // The header survives the rewrite but the note does not, so the span stays and the
+        // result is no anchor.
+        assert.match(text(conversation(context).at(-1)!), /\[fold ep-[0-9a-f]{8}:[\s\S]*redacted/);
         assert.equal(conversation(context).length, 5);
+        const applied = appliedFolds(harness.session.sessionManager.getBranch());
+        assert.deepEqual(cacheAnchor(conversation(context), applied), { stamp: '[t1]' });
         return fauxAssistantMessage('ok');
       }
     ],
@@ -433,7 +440,13 @@ test('a fold is not applied when a later hook drops the note from the script res
       (pi) => {
         pi.on('tool_result', (event) =>
           event.toolName === 'codemode' && !event.parentToolCallId
-            ? { content: [{ type: 'text', text: 'redacted' }] }
+            ? {
+                content: event.content.map((block) =>
+                  block.type === 'text'
+                    ? { ...block, text: block.text.replace('Secret body.', 'redacted') }
+                    : block
+                )
+              }
             : undefined
         );
       }

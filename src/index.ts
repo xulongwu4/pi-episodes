@@ -1,6 +1,6 @@
 import { relative, resolve } from 'node:path';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import { type ThreadRecord, threadRecords } from './archive.js';
+import { appliedFolds, type ThreadRecord, threadRecords } from './archive.js';
 import { registerAsk } from './ask.js';
 import { cacheAnchor, placeAnchor } from './cache.js';
 import { registerCompactionNotice } from './compaction.js';
@@ -89,7 +89,10 @@ export default function episodes(pi: ExtensionAPI): void {
   // newest stamped user message may only exist in the summary.
   pi.on('before_provider_request', (event, ctx) => {
     const anchor = episodesSettings(pi.getSettings()).cacheAnchor
-      ? cacheAnchor(ctx.sessionManager.buildSessionProjection().messages)
+      ? cacheAnchor(
+          ctx.sessionManager.buildSessionProjection().messages,
+          appliedFolds(ctx.sessionManager.getBranch())
+        )
       : undefined;
     const placed = placeAnchor(event.payload, anchor);
     state.anchorPlaced = placed.placed;

@@ -532,7 +532,11 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       if (readOnly.length > 0) details.readOnly = readOnly;
       details.noteTokens = Math.ceil(note.length / 4);
       if (manual) details.manual = manual;
-      const gapTokens = anchorGapTokens(plan.sent, plan.before);
+      const gapTokens = anchorGapTokens(
+        plan.sent,
+        plan.before,
+        appliedFolds(ctx.sessionManager.getBranch())
+      );
       details.anchor = {
         ...(anchorPlaced === undefined ? {} : { placed: anchorPlaced }),
         ...(gapTokens === undefined ? {} : { gapTokens })

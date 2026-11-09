@@ -22,22 +22,28 @@ export type CacheAnchor = { toolUseId: string } | { stamp: string };
 /**
  * The newest fold note or user message. A fold cannot start before the latest note, and
  * episodes usually start after a user message, so whichever is newer is the closest point
- * before the next fold that is already known.
+ * before the next fold that is already known. A codemode script's result counts as a note
+ * only once its fold is among `applied`: until then the span it names is still in context.
  */
-/** A fold result, or the result of a codemode script whose fold it stands for. */
-function isNote(message: AgentMessage & { role: 'toolResult' }): boolean {
-  return message.toolName === FOLD_TOOL || foldNoteDetails(message) !== undefined;
-}
-export function cacheAnchor(messages: readonly AgentMessage[]): CacheAnchor | undefined {
+export function cacheAnchor(
+  messages: readonly AgentMessage[],
+  applied: ReadonlySet<string> = new Set()
+): CacheAnchor | undefined {
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index]!;
-    if (message.role === 'toolResult' && !message.isError && isNote(message)) {
+    if (message.role === 'toolResult' && !message.isError && isNote(message, applied)) {
       return { toolUseId: message.toolCallId };
     }
     const stamp = message.role === 'user' ? readStamp(message) : undefined;
     if (stamp !== undefined) return { stamp: `[${stampLabel(stamp)}]` };
   }
   return undefined;
+}
+
+function isNote(message: AgentMessage & { role: 'toolResult' }, applied: ReadonlySet<string>) {
+  if (message.toolName === FOLD_TOOL) return true;
+  const fold = foldNoteDetails(message);
+  return fold !== undefined && applied.has(fold.handle);
 }
 
 function isAnchor(message: AgentMessage, anchor: CacheAnchor): boolean {
@@ -56,9 +62,10 @@ function isAnchor(message: AgentMessage, anchor: CacheAnchor): boolean {
  */
 export function anchorGapTokens(
   sent: readonly AgentMessage[],
-  before: readonly AgentMessage[]
+  before: readonly AgentMessage[],
+  applied?: ReadonlySet<string>
 ): number | undefined {
-  const anchor = cacheAnchor(sent);
+  const anchor = cacheAnchor(sent, applied);
   if (!anchor) return undefined;
   const at = before.findLastIndex((message) => isAnchor(message, anchor));
   return at < 0 ? undefined : estimateTokens(before.slice(at + 1));

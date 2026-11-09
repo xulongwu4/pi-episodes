@@ -1,6 +1,7 @@
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ModelsSimpleStreamOptions, Usage } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { appliedFolds } from './archive.js';
 import { anchorBreakpoint, cacheAnchor } from './cache.js';
 import { episodesSettings } from './settings.js';
 
@@ -20,7 +21,11 @@ export function requestOptions(
   const options: ModelsSimpleStreamOptions = { sessionId: ctx.sessionManager.getSessionId() };
   const settings = pi.getSettings();
   if (episodesSettings(settings).cacheAnchor) {
-    options.onPayload = (payload) => anchorBreakpoint(payload, cacheAnchor(current()));
+    options.onPayload = (payload) =>
+      anchorBreakpoint(
+        payload,
+        cacheAnchor(current(), appliedFolds(ctx.sessionManager.getBranch()))
+      );
   }
   const level = ctx.thinkingLevel ?? pi.getThinkingLevel();
   if (level !== 'off') options.reasoning = level;

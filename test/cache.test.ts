@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import type { Message } from '@earendil-works/pi-ai';
 import { anchorBreakpoint, anchorGapTokens, cacheAnchor, placeAnchor } from '../src/cache.js';
 import { episodesSettings } from '../src/settings.js';
 import { assistant, call, result, user } from './helpers.js';
@@ -98,6 +99,15 @@ test('the anchor is the newest note or stamped user message', () => {
   assert.equal(cacheAnchor([user('unstamped')]), undefined);
 });
 
+test('a codemode result is an anchor only once the fold it carries took effect', () => {
+  const note = {
+    ...result('c1', 'codemode', '[fold ep-1: 2 messages, t1-t2, ~0 tokens, archived]', 3),
+    details: { episodesFold: { kind: 'fold', handle: 'ep-1' } }
+  } as Message;
+  const messages = [user('go', 1), assistant(call('c1', 'codemode')), note];
+  assert.deepEqual(cacheAnchor(messages), { stamp: '[t1]' });
+  assert.deepEqual(cacheAnchor(messages, new Set(['ep-1'])), { toolUseId: 'c1' });
+});
 test('takes the TTL of the conversation breakpoint and matches rewritten tool ids', () => {
   const value = payload(false);
   const tail = { type: 'ephemeral', ttl: '5m' };
