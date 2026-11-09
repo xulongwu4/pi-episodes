@@ -38,8 +38,6 @@ export interface FoldPlan {
   anchorStamp: number | undefined;
   /** Stamps inside the span before its first response, in order. */
   laterStamps: number[];
-  /** Entry of the response that made the fold call. */
-  callerEntryId: string;
   firstEntryId: string;
   lastEntryId: string;
   /** Messages leaving the context. */
@@ -312,7 +310,6 @@ export function planFold(
     handle,
     anchorStamp,
     laterStamps,
-    callerEntryId: entries[foldIndex]!.sourceEntry.id,
     firstEntryId: first.sourceEntry.id,
     lastEntryId: last.sourceEntry.id,
     omitted,
@@ -446,7 +443,22 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       const root = state.rootCall(toolCallId);
       const scriptCall = root === toolCallId ? undefined : root;
       const run = state.run;
+      const entries = ctx.sessionManager.buildSessionProjection().entries;
       try {
+        // The first fold of a response holds it, whether or not it succeeds, as for folds the
+        // response calls itself. Reserved before anything is awaited, so a second fold from the
+        // same response, in the same script or another one, sees it.
+        const caller = entries.find((entry) => callsTool(entry, scriptCall ?? toolCallId));
+        if (caller) {
+          const reserved = state.foldResponses.get(caller.sourceEntry.id);
+          if (reserved !== undefined && reserved !== toolCallId) {
+            throw new FoldError(
+              'one-per-response',
+              'Only one fold per response; this one was ignored.'
+            );
+          }
+          state.foldResponses.set(caller.sourceEntry.id, toolCallId);
+        }
         since = parseStamp(params.since);
         if (since === undefined) {
           throw new FoldError(
@@ -460,20 +472,10 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
             'The note is empty. Write what the rest of the task needs from the span.'
           );
         }
-        plan = planFold(ctx.sessionManager.buildSessionProjection().entries, toolCallId, since, {
+        plan = planFold(entries, toolCallId, since, {
           latestStamp: state.nextStamp - 1,
           callerId: scriptCall ?? toolCallId
         });
-        // Reserved before anything is awaited, so a second fold from the same response, in
-        // the same script or another one, sees it.
-        const reserved = state.foldResponses.get(plan.callerEntryId);
-        if (reserved !== undefined && reserved !== toolCallId) {
-          throw new FoldError(
-            'one-per-response',
-            'Only one fold per response; this one was ignored.'
-          );
-        }
-        state.foldResponses.set(plan.callerEntryId, toolCallId);
       } catch (error) {
         if (error instanceof FoldError) {
           recordEvent(pi, { kind: 'fold-rejected', toolCallId, reason: error.reason });
@@ -580,13 +582,19 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     if (event.parentToolCallId) state.parentCalls.set(event.toolCallId, event.parentToolCallId);
   });
 
-  // A result hook can still fail the fold after it ran, and the script can catch that.
+  // A result hook can still fail the fold after it ran, and the script can catch that; or
+  // change its text, which is then what the script printed.
   pi.on('tool_execution_end', (event) => {
-    if (!event.isError || !event.parentToolCallId) return;
+    if (!event.parentToolCallId) return;
     const root = state.rootCall(event.toolCallId);
-    if (state.pendingFolds.get(root)?.script?.foldCallId === event.toolCallId) {
+    const pending = state.pendingFolds.get(root);
+    if (pending?.script?.foldCallId !== event.toolCallId) return;
+    if (event.isError) {
       state.pendingFolds.delete(root);
+      return;
     }
+    const content = (event.result as { content?: unknown } | undefined)?.content;
+    if (Array.isArray(content)) pending.script.note = textOf(content);
   });
   // A fold from a script takes effect only if the script succeeds. Its result then carries the
   // fold's details, and the note too when the script did not print it, written once with the

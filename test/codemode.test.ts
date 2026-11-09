@@ -582,3 +582,112 @@ test('a fold that a result hook failed does not take effect, even if the script 
     await harness.cleanup();
   }
 });
+test('a fold that a result hook rewrote is not added again next to what the script printed', async () => {
+  const harness = await createSession(
+    'only',
+    [
+      () => script('text(await tools.bash({ command: "echo one" }));'),
+      () => script('text(await tools.fold({ since: "t1", note: "Ran one." }));'),
+      (context) => {
+        const note = text(conversation(context).at(-1)!);
+        assert.equal(conversation(context).length, 3);
+        assert.match(note, /Ran one, checked\./);
+        assert.equal(note.match(/\[fold ep-/g)?.length, 1);
+        return fauxAssistantMessage('ok');
+      }
+    ],
+    [
+      (pi) => {
+        pi.on('tool_result', (event) =>
+          event.toolName === 'fold' && !event.isError
+            ? {
+                content: event.content.map((block) =>
+                  block.type === 'text'
+                    ? { ...block, text: block.text.replace('Ran one.', 'Ran one, checked.') }
+                    : block
+                )
+              }
+            : undefined
+        );
+      }
+    ]
+  );
+  try {
+    await harness.run('go');
+    assert.equal(threadRecords(harness.session.sessionManager.getBranch()).length, 1);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('the first fold of a script holds the response even when it is rejected', async () => {
+  const harness = await createSession('only', [
+    () => script('text(await tools.bash({ command: "echo one" }));'),
+    () =>
+      script(
+        [
+          'let a; try { a = await tools.fold({ since: "t99", note: "x" }); } catch (e) { a = String(e); }',
+          'let b; try { b = await tools.fold({ since: "t1", note: "y" }); } catch (e) { b = String(e); }',
+          'text(a); text(b);'
+        ].join('\n')
+      ),
+    (context) => {
+      const result = text(conversation(context).at(-1)!);
+      assert.match(result, /t99/);
+      assert.match(result, /Only one fold per response/);
+      assert.equal(conversation(context).length, 5);
+      return fauxAssistantMessage('ok');
+    }
+  ]);
+  try {
+    await harness.run('go');
+    assert.equal(threadRecords(harness.session.sessionManager.getBranch()).length, 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a retry counts once, after rejections from scripts in a row', async () => {
+  const reject =
+    'let r; try { r = await tools.fold({ since: "t99", note: "x" }); } catch (e) { r = String(e); } text(r);';
+  const harness = await createSession('only', [
+    () => script('text(await tools.bash({ command: "echo one" }));'),
+    () => script(reject),
+    () => script(reject),
+    () => script('text(await tools.fold({ since: "t1", note: "Ran one." }));'),
+    () => fauxAssistantMessage('ok')
+  ]);
+  try {
+    await harness.run('go');
+    const folds = episodeStats(harness.session.sessionManager.getBranch(), harness.dir).folds;
+    assert.equal(folds.count, 1);
+    assert.equal(folds.rejected, 2);
+    assert.equal(folds.retriedOk, 1);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a fork child reading a folded file does not use up the parent cue', async () => {
+  const harness = await createSession('only', [
+    () => script('text(await tools.read({ path: "api.ts" }));'),
+    () => script('text(await tools.fold({ since: "t1", note: "Read api.ts." }));'),
+    () => fauxAssistantMessage(fauxToolCall('fork', { task: 'Look.' }), { stopReason: 'toolUse' }),
+    () => fauxAssistantMessage(fauxToolCall('read', { path: 'api.ts' }), { stopReason: 'toolUse' }),
+    () => fauxAssistantMessage('Changed: nothing. Learned: fine.'),
+    (context) => {
+      assert.doesNotMatch(text(conversation(context).at(-1)!), /\[episodes\]/);
+      return script('text(await tools.read({ path: "api.ts" }));');
+    },
+    (context) => {
+      assert.match(text(conversation(context).at(-1)!), /\[episodes\] api\.ts was also touched/);
+      return fauxAssistantMessage('ok');
+    }
+  ]);
+  await writeFile(join(harness.dir, 'api.ts'), 'export {};\n');
+  try {
+    await harness.run('go');
+  } finally {
+    await harness.cleanup();
+  }
+});

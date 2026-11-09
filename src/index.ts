@@ -1,6 +1,6 @@
 import { relative, resolve } from 'node:path';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import { appliedFolds, type ThreadRecord, threadRecords } from './archive.js';
+import { appliedFolds, FORK_TOOL, type ThreadRecord, threadRecords } from './archive.js';
 import { registerAsk } from './ask.js';
 import { cacheAnchor, placeAnchor } from './cache.js';
 import { registerCompactionNotice } from './compaction.js';
@@ -113,7 +113,11 @@ export default function episodes(pi: ExtensionAPI): void {
   pi.on('agent_settled', () => scriptCues.clear());
   pi.on('session_start', () => scriptCues.clear());
   pi.on('tool_result', (event, ctx) => {
-    const cues = event.parentToolCallId ? [] : (scriptCues.get(event.toolCallId) ?? []);
+    // A fork's child calls tools under the fork's call too; its reads are not the parent's.
+    const cues =
+      event.parentToolCallId || event.toolName === FORK_TOOL
+        ? []
+        : (scriptCues.get(event.toolCallId) ?? []);
     scriptCues.delete(event.toolCallId);
     const path = event.input.path;
     if (FILE_TOOLS.has(event.toolName) && typeof path === 'string' && path) {

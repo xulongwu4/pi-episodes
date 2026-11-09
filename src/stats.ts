@@ -222,6 +222,10 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
         // so only a later call's result counts.
         const next = entries.slice(index + 1).find((later) => {
           const found = message(later);
+          // A later rejection is the next attempt, and it failed.
+          if (later.type === 'custom' && later.customType === EVENT_TYPE) {
+            return (later.data as EpisodeEvent).kind === 'fold-rejected';
+          }
           if (found?.role !== 'toolResult' || found.toolCallId === event.toolCallId) return false;
           if (found.toolName === FOLD_TOOL) return true;
           const fold = foldNoteDetails(found);
