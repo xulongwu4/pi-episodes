@@ -217,13 +217,18 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       const event = entry.data as EpisodeEvent;
       if (event.kind === 'fold-rejected') {
         stats.folds.rejected++;
-        // The event is written before the rejected call's own error result.
+        // The event is written before the rejected call's own error result. A rejected fold
+        // from a script has none; the script's own result answers for an earlier fold in it,
+        // so only a later call's result counts.
         const next = entries.slice(index + 1).find((later) => {
           const found = message(later);
+          if (found?.role !== 'toolResult' || found.toolCallId === event.toolCallId) return false;
+          if (found.toolName === FOLD_TOOL) return true;
+          const fold = foldNoteDetails(found);
           return (
-            found?.role === 'toolResult' &&
-            (found.toolName === FOLD_TOOL || foldNoteDetails(found) !== undefined) &&
-            found.toolCallId !== event.toolCallId
+            fold !== undefined &&
+            applied.has(fold.handle) &&
+            !event.toolCallId.startsWith(`${found.toolCallId}/`)
           );
         });
         const result = message(next);

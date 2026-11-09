@@ -268,7 +268,12 @@ test('one fold per response, across the folds of a script', async () => {
   ]);
   try {
     await harness.run('go');
-    assert.equal(threadRecords(harness.session.sessionManager.getBranch()).length, 1);
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(threadRecords(branch).length, 1);
+    // The script's result stands for the first fold, not a retry of the rejected one.
+    const folds = episodeStats(branch, harness.dir).folds;
+    assert.equal(folds.rejected, 1);
+    assert.equal(folds.retriedOk, 0);
   } finally {
     await harness.cleanup();
   }
