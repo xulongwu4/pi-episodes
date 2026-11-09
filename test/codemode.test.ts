@@ -9,6 +9,7 @@ import {
   fauxProvider,
   fauxToolCall,
   getCurrentTools,
+  type ImageContent,
   type Message,
   type TranscriptContext
 } from '@earendil-works/pi-ai';
@@ -129,9 +130,10 @@ async function createSession(
     dir,
     session,
     requests,
-    async run(...prompts: string[]) {
+    async run(...prompts: (string | { text: string; images: ImageContent[] })[]) {
       for (const prompt of prompts) {
-        await session.prompt(prompt);
+        if (typeof prompt === 'string') await session.prompt(prompt);
+        else await session.prompt(prompt.text, { images: prompt.images });
         // A command such as /fold starts its run without waiting for it.
         await session.waitForIdle();
       }
@@ -986,8 +988,18 @@ test('close to compaction, a long run is nudged before it grew twice the thresho
 
 test('near compaction, the incoming prompt counts toward the room left', async () => {
   // About 2,400 tokens of foldable work: over a quarter of the threshold, under the threshold.
-  // The prompt's 25,000 tokens move the context past the window less reserve and threshold.
-  for (const prompt of ['second', 'y'.repeat(100_000)]) {
+  // The prompt's 25,000 tokens, or its 21 images at 1,200 each, move the context past the
+  // window less reserve and threshold.
+  const image: ImageContent = {
+    type: 'image',
+    mimeType: 'image/png',
+    data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
+  };
+  for (const [prompt, nudges] of [
+    ['second', 0],
+    ['y'.repeat(100_000), 1],
+    [{ text: 'second', images: Array.from({ length: 21 }, () => image) }, 1]
+  ] as const) {
     const harness = await createSession(
       'off',
       [
@@ -1005,7 +1017,7 @@ test('near compaction, the incoming prompt counts toward the room left', async (
     try {
       await harness.run('first', prompt);
       const branch = harness.session.sessionManager.getBranch();
-      assert.equal(episodeStats(branch, harness.dir).nudges, prompt.length > 100 ? 1 : 0);
+      assert.equal(episodeStats(branch, harness.dir).nudges, nudges);
     } finally {
       await harness.cleanup();
     }

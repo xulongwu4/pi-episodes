@@ -1,8 +1,9 @@
-import type { AssistantMessage } from '@earendil-works/pi-ai';
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-  ProjectedSessionEntry
+import type { AssistantMessage, ImageContent } from '@earendil-works/pi-ai';
+import {
+  type ExtensionAPI,
+  type ExtensionContext,
+  estimateTokens as estimateMessageTokens,
+  type ProjectedSessionEntry
 } from '@earendil-works/pi-coding-agent';
 import { foldInstruction, foldStart, renderFoldAsk, USER_TEXT_CAP } from './fold.js';
 import { estimateTokens } from './messages.js';
@@ -105,13 +106,17 @@ export function registerNudge(pi: ExtensionAPI): void {
     const messageType = (event as { messageType?: string }).messageType;
     if (messageType !== undefined && messageType !== 'user') return undefined;
     // The prompt is not in the session yet: it adds to the context, but not to what can be folded.
-    const prompt = (event as { prompt?: string }).prompt ?? '';
+    const { prompt = '', images = [] } = event as { prompt?: string; images?: ImageContent[] };
     const content = nudge(
       ctx.sessionManager.buildSessionProjection().entries,
       ctx,
       1,
       'this request',
-      Math.ceil(prompt.length / 4)
+      estimateMessageTokens({
+        role: 'user',
+        content: [{ type: 'text', text: prompt }, ...images],
+        timestamp: Date.now()
+      })
     );
     return content ? { message: { customType: NUDGE_TYPE, content, display: true } } : undefined;
   });
