@@ -589,12 +589,14 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     const root = state.rootCall(event.toolCallId);
     const pending = state.pendingFolds.get(root);
     if (pending?.script?.foldCallId !== event.toolCallId) return;
-    if (event.isError) {
+    const content = (event.result as { content?: unknown } | undefined)?.content;
+    const note = Array.isArray(content) ? textOf(content).trim() : '';
+    // A fold whose text a hook emptied would leave the span with nothing in its place.
+    if (event.isError || !note) {
       state.pendingFolds.delete(root);
       return;
     }
-    const content = (event.result as { content?: unknown } | undefined)?.content;
-    if (Array.isArray(content)) pending.script.note = textOf(content);
+    pending.script.note = note;
   });
   // A fold from a script takes effect only if the script succeeds. Its result then carries the
   // fold's details, and the note too when the script did not print it, written once with the

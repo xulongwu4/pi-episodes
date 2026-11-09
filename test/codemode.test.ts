@@ -691,3 +691,31 @@ test('a fork child reading a folded file does not use up the parent cue', async 
     await harness.cleanup();
   }
 });
+test('a fold whose text a result hook emptied does not take effect', async () => {
+  for (const replacement of [[], [{ type: 'text' as const, text: ' ' }]]) {
+    const harness = await createSession(
+      'only',
+      [
+        () => script('text(await tools.bash({ command: "echo kept" }));'),
+        () => script('text(await tools.fold({ since: "t1", note: "n" }));'),
+        (context) => {
+          assert.equal(conversation(context).length, 5);
+          return fauxAssistantMessage('ok');
+        }
+      ],
+      [
+        (pi) => {
+          pi.on('tool_result', (event) =>
+            event.toolName === 'fold' ? { content: replacement } : undefined
+          );
+        }
+      ]
+    );
+    try {
+      await harness.run('go');
+      assert.equal(threadRecords(harness.session.sessionManager.getBranch()).length, 0);
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
