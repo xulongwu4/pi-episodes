@@ -217,23 +217,20 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       const event = entry.data as EpisodeEvent;
       if (event.kind === 'fold-rejected') {
         stats.folds.rejected++;
-        // The event is written before the rejected call's own error result. A rejected fold
-        // from a script has none; the script's own result answers for an earlier fold in it,
-        // so only a later call's result counts.
+        // Only one fold per response, so a retry is a fold in a later response; results of
+        // this one, the rejected call's own or a script's that folded first, do not count.
+        let laterResponse = false;
         const next = entries.slice(index + 1).find((later) => {
           const found = message(later);
           // A later rejection is the next attempt, and it failed.
           if (later.type === 'custom' && later.customType === EVENT_TYPE) {
             return (later.data as EpisodeEvent).kind === 'fold-rejected';
           }
-          if (found?.role !== 'toolResult' || found.toolCallId === event.toolCallId) return false;
+          if (found?.role === 'assistant') laterResponse = true;
+          if (!laterResponse || found?.role !== 'toolResult') return false;
           if (found.toolName === FOLD_TOOL) return true;
           const fold = foldNoteDetails(found);
-          return (
-            fold !== undefined &&
-            applied.has(fold.handle) &&
-            !event.toolCallId.startsWith(`${found.toolCallId}/`)
-          );
+          return fold !== undefined && applied.has(fold.handle);
         });
         const result = message(next);
         if (result?.role === 'toolResult' && !result.isError) stats.folds.retriedOk++;

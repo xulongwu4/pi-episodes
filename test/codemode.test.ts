@@ -415,6 +415,8 @@ test('two scripts in one response: only the first fold takes effect', async () =
     await harness.run('go');
     const branch = harness.session.sessionManager.getBranch();
     assert.equal(threadRecords(branch).length, 1);
+    // The sibling script's fold is in the same response, not a retry.
+    assert.equal(episodeStats(branch, harness.dir).folds.retriedOk, 0);
     assert.equal(
       branch.filter((entry) => entry.type === 'custom' && entry.customType === FOLD_APPLIED_TYPE)
         .length,
