@@ -51,19 +51,29 @@ export function estimateTokens(messages: readonly AgentMessage[]): number {
   return Math.ceil(chars / 4);
 }
 
-/** Absolute paths that file tools read or wrote in these messages. */
+/**
+ * Absolute paths that file tools read or wrote in these messages, including calls a codemode
+ * script made. Pi records those on the script's result with bounded arguments, so a call whose
+ * arguments were dropped for size is missed.
+ */
 export function touchedPaths(
   messages: readonly AgentMessage[],
   cwd: string,
   tools: ReadonlySet<string> = FILE_TOOLS
 ): string[] {
   const paths = new Set<string>();
+  const add = (name: string, args: Record<string, unknown> | undefined) => {
+    const path = args?.path;
+    if (tools.has(name) && typeof path === 'string' && path) paths.add(resolve(cwd, path));
+  };
   for (const message of messages) {
+    if (message.role === 'toolResult') {
+      for (const call of message.nestedCalls?.calls ?? []) add(call.name, call.arguments);
+      continue;
+    }
     if (message.role !== 'assistant') continue;
     for (const block of message.content) {
-      if (block.type !== 'toolCall' || !tools.has(block.name)) continue;
-      const path = block.arguments.path;
-      if (typeof path === 'string' && path) paths.add(resolve(cwd, path));
+      if (block.type === 'toolCall') add(block.name, block.arguments);
     }
   }
   return [...paths];

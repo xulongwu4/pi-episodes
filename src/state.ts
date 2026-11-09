@@ -1,6 +1,6 @@
 import { realpathSync } from 'node:fs';
 import type { ContextEditEntryDraft, ExtensionContext } from '@earendil-works/pi-coding-agent';
-import type { ForkArchive } from './archive.js';
+import type { FoldDetails, ForkArchive } from './archive.js';
 import type { RecallIndex } from './search.js';
 import { Snapshots } from './snapshots.js';
 import { readStamp } from './stamps.js';
@@ -10,6 +10,12 @@ export interface PendingFold {
   messages: number;
   tokens: number;
   edits: ContextEditEntryDraft[];
+  /**
+   * Set when a codemode script made the fold call: the pending fold is keyed by the script's
+   * call instead, and its result carries the details and, if the script did not print it, the
+   * note.
+   */
+  script?: { note: string; details: FoldDetails };
 }
 
 /** Per-session runtime state. Everything durable lives in the session file instead. */
@@ -23,6 +29,10 @@ export class EpisodeState {
   snapshots: Snapshots | undefined;
   /** Context edits computed by a fold call, emitted at the end of its turn. */
   readonly pendingFolds = new Map<string, PendingFold>();
+  /** Response entry ids that already made a fold call in the current run, with that call. */
+  readonly foldResponses = new Map<string, string>();
+  /** The calling tool of each nested call seen in the current run, from `tool_call` events. */
+  readonly parentCalls = new Map<string, string>();
   /** `handle:path` pairs already surfaced, so a folded thread is pointed at once per file. */
   readonly surfaced = new Set<string>();
   /** Fork transcripts for sessions that have no file to write them next to. */
@@ -44,6 +54,8 @@ export class EpisodeState {
     this.cwd = realpathOr(ctx.cwd);
     this.snapshots = new Snapshots(this.cwd, ctx.sessionManager.getSessionId());
     this.pendingFolds.clear();
+    this.foldResponses.clear();
+    this.parentCalls.clear();
     this.surfaced.clear();
     this.forkArchives.clear();
     this.manualFold = undefined;
@@ -61,6 +73,14 @@ export class EpisodeState {
     this.nextStamp = max + 1;
   }
 
+  /** The call in the transcript that a nested call descends from; the call itself otherwise. */
+  rootCall(toolCallId: string): string {
+    let id = toolCallId;
+    for (let parent = this.parentCalls.get(id); parent; parent = this.parentCalls.get(id)) {
+      id = parent;
+    }
+    return id;
+  }
   async dispose(): Promise<void> {
     await this.snapshots?.dispose();
     this.snapshots = undefined;

@@ -23,6 +23,12 @@ export const FOLD_REQUEST_TYPE = 'episodes-fold-request';
  * can land between the result and the turn end.
  */
 export const FOLD_APPLIED_TYPE = 'episodes-fold-applied';
+/**
+ * Key under which a fold called from a codemode script stores its FoldDetails on the script's
+ * tool result. That result stays in context as the fold's note, as a fold result does for a
+ * top-level call; the script's own details stay alongside.
+ */
+export const FOLD_DETAILS_KEY = 'episodesFold';
 
 /** Handles of folds whose edits are among these entries. */
 export function appliedFolds(entries: readonly SessionEntry[]): Set<string> {
@@ -194,20 +200,36 @@ export function isForkDetails(value: unknown): value is ForkDetails {
   return isRecord(value) && value.kind === 'fork' && typeof value.handle === 'string';
 }
 
+/**
+ * The fold a tool result stands for: a successful fold result, or the result of a codemode
+ * script whose fold call was applied there. Whether the fold took effect is a separate
+ * question, answered by {@link appliedFolds}.
+ */
+export function foldNoteDetails(message: AgentMessage | undefined): FoldDetails | undefined {
+  if (message?.role !== 'toolResult' || message.isError) return undefined;
+  if (message.toolName === FOLD_TOOL) {
+    return isFoldDetails(message.details) ? message.details : undefined;
+  }
+  const nested = isRecord(message.details) ? message.details[FOLD_DETAILS_KEY] : undefined;
+  return isFoldDetails(nested) ? nested : undefined;
+}
+
 function toolDetails(entry: SessionEntry, toolName: string): unknown {
   if (entry.type !== 'message' || entry.message.role !== 'toolResult') return undefined;
   if (entry.message.toolName !== toolName) return undefined;
-  // A failed fold changed nothing, but a failed fork still did work worth recalling.
-  if (entry.message.isError && toolName === FOLD_TOOL) return undefined;
+  // A failed fork still did work worth recalling.
   return entry.message.details;
+}
+
+function foldEntryDetails(entry: SessionEntry): FoldDetails | undefined {
+  return entry.type === 'message' ? foldNoteDetails(entry.message) : undefined;
 }
 
 export function foldRecords(entries: readonly SessionEntry[]): FoldDetails[] {
   const applied = appliedFolds(entries);
   return entries
-    .map((entry) => toolDetails(entry, FOLD_TOOL))
-    .filter(isFoldDetails)
-    .filter((record) => applied.has(record.handle));
+    .map(foldEntryDetails)
+    .filter((record): record is FoldDetails => record !== undefined && applied.has(record.handle));
 }
 
 export function forkRecords(entries: readonly SessionEntry[]): ForkDetails[] {
@@ -219,8 +241,9 @@ export function threadRecords(entries: readonly SessionEntry[]): ThreadRecord[] 
   const applied = appliedFolds(entries);
   return entries.flatMap((entry): ThreadRecord[] => {
     if (entry.type === 'compaction') return [compactionRecord(entry)];
-    const record = toolDetails(entry, FOLD_TOOL) ?? toolDetails(entry, FORK_TOOL);
-    if (isFoldDetails(record)) return applied.has(record.handle) ? [record] : [];
+    const fold = foldEntryDetails(entry);
+    if (fold) return applied.has(fold.handle) ? [fold] : [];
+    const record = toolDetails(entry, FORK_TOOL);
     return isForkDetails(record) ? [record] : [];
   });
 }

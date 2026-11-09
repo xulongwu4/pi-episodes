@@ -6,7 +6,7 @@ import {
   FOLD_APPLIED_TYPE,
   FOLD_TOOL,
   FORK_TOOL,
-  isFoldDetails,
+  foldNoteDetails,
   isForkDetails
 } from './archive.js';
 import { COMPACTION_NOTICE_TYPE } from './compaction.js';
@@ -222,7 +222,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
           const found = message(later);
           return (
             found?.role === 'toolResult' &&
-            found.toolName === FOLD_TOOL &&
+            (found.toolName === FOLD_TOOL || foldNoteDetails(found) !== undefined) &&
             found.toolCallId !== event.toolCallId
           );
         });
@@ -277,20 +277,21 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
     stats.overhead.cues += tokensOf(textChars(found, (text) => text.startsWith('[episodes] ')));
 
     const details = found.details;
-    if (found.toolName === FOLD_TOOL && isFoldDetails(details) && applied.has(details.handle)) {
+    const fold = foldNoteDetails(found);
+    if (fold && applied.has(fold.handle)) {
       const folds = stats.folds;
       folds.count++;
-      if (details.manual === 'since') folds.pickedByUser++;
-      if (details.manual === 'request') folds.requestedByUser++;
-      folds.tokens += details.tokens;
-      folds.spanTokens.push(details.tokens);
-      if (details.tokens < SMALL_SPAN_TOKENS) folds.small++;
-      folds.noteTokens += details.noteTokens ?? 0;
-      foldNet.set(details.handle, Math.max(0, details.tokens - (details.noteTokens ?? 0)));
-      if (details.anchor?.placed !== undefined) {
+      if (fold.manual === 'since') folds.pickedByUser++;
+      if (fold.manual === 'request') folds.requestedByUser++;
+      folds.tokens += fold.tokens;
+      folds.spanTokens.push(fold.tokens);
+      if (fold.tokens < SMALL_SPAN_TOKENS) folds.small++;
+      folds.noteTokens += fold.noteTokens ?? 0;
+      foldNet.set(fold.handle, Math.max(0, fold.tokens - (fold.noteTokens ?? 0)));
+      if (fold.anchor?.placed !== undefined) {
         folds.anchorKnown++;
-        if (details.anchor.placed) folds.anchored++;
-        if (details.anchor.gapTokens !== undefined) folds.gapTokens.push(details.anchor.gapTokens);
+        if (fold.anchor.placed) folds.anchored++;
+        if (fold.anchor.gapTokens !== undefined) folds.gapTokens.push(fold.anchor.gapTokens);
       }
 
       const caller = entries
@@ -302,7 +303,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
         entries.slice(index + 1).find((later) => message(later)?.role === 'assistant')
       );
       if (
-        !details.manual &&
+        !fold.manual &&
         next?.role === 'assistant' &&
         next.stopReason === 'stop' &&
         !next.content.some((block) => block.type === 'toolCall')

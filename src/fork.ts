@@ -132,6 +132,9 @@ export function registerFork(pi: ExtensionAPI, state: EpisodeState, registry: Fo
   pi.registerTool<typeof ForkParams, ForkDetails | undefined>({
     name: FORK_TOOL,
     label: 'Fork',
+    // Declared to the model, never callable from codemode scripts or other tools: the fork
+    // finds the response that called it by its exact call id, which a nested call lacks.
+    exposure: 'model-only',
     description:
       'Run a copy of yourself on a long, self-contained task that continues your own work, such as making the build pass. The fork starts with your full current context, so there is no prompt to write, and every fork turn re-reads that context: do not fork short lookups. It runs to completion and returns its final note; its transcript is archived for recall and ask. Forks in the same response run in parallel and share your working tree, so give them parts that do not edit the same files. Not for reviews or second opinions, where independence matters.',
     promptSnippet: 'Run a copy of yourself, with your context, on a self-contained task',

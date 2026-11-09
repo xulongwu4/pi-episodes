@@ -1,5 +1,5 @@
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
-import { FOLD_TOOL } from './archive.js';
+import { FOLD_TOOL, foldNoteDetails } from './archive.js';
 import { estimateTokens } from './messages.js';
 import { readStamp, stampLabel } from './stamps.js';
 
@@ -24,10 +24,14 @@ export type CacheAnchor = { toolUseId: string } | { stamp: string };
  * episodes usually start after a user message, so whichever is newer is the closest point
  * before the next fold that is already known.
  */
+/** A fold result, or the result of a codemode script whose fold it stands for. */
+function isNote(message: AgentMessage & { role: 'toolResult' }): boolean {
+  return message.toolName === FOLD_TOOL || foldNoteDetails(message) !== undefined;
+}
 export function cacheAnchor(messages: readonly AgentMessage[]): CacheAnchor | undefined {
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index]!;
-    if (message.role === 'toolResult' && message.toolName === FOLD_TOOL && !message.isError) {
+    if (message.role === 'toolResult' && !message.isError && isNote(message)) {
       return { toolUseId: message.toolCallId };
     }
     const stamp = message.role === 'user' ? readStamp(message) : undefined;

@@ -1,6 +1,6 @@
 import { relative, resolve } from 'node:path';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import { threadRecords } from './archive.js';
+import { type ThreadRecord, threadRecords } from './archive.js';
 import { registerAsk } from './ask.js';
 import { cacheAnchor, placeAnchor } from './cache.js';
 import { registerCompactionNotice } from './compaction.js';
@@ -20,6 +20,13 @@ import { refreshStatus } from './ui.js';
 
 const STALE_STAMP = /\s*\[t\d+\]\s*$/;
 const MAX_SURFACED_THREADS = 2;
+
+/** Threads to point at from a tool result that touched one of their files. */
+interface Cue {
+  absolute: string;
+  records: ThreadRecord[];
+  matched: number;
+}
 
 export default function episodes(pi: ExtensionAPI): void {
   const state = new EpisodeState();
@@ -95,14 +102,35 @@ export default function episodes(pi: ExtensionAPI): void {
   });
 
   // The cue for a folded thread is attached to the tool result that touches one of its
-  // files again, so it is written once with that result instead of edited in later.
+  // files again, so it is written once with that result instead of edited in later. A call a
+  // codemode script made has a result the model may never see, so its cue waits for the
+  // script's own result.
+  const scriptCues = new Map<string, Cue[]>();
   pi.on('tool_result', (event, ctx) => {
-    if (event.parentToolCallId || !FILE_TOOLS.has(event.toolName)) return undefined;
+    const cues = event.parentToolCallId ? [] : (scriptCues.get(event.toolCallId) ?? []);
+    scriptCues.delete(event.toolCallId);
     const path = event.input.path;
-    if (typeof path !== 'string' || !path) return undefined;
+    if (FILE_TOOLS.has(event.toolName) && typeof path === 'string' && path) {
+      const cue = cueFor(resolve(state.cwd, path), threadRecords(ctx.sessionManager.getBranch()));
+      if (cue && event.parentToolCallId) {
+        const root = state.rootCall(event.toolCallId);
+        scriptCues.set(root, [...(scriptCues.get(root) ?? []), cue]);
+        return undefined;
+      }
+      if (cue) cues.push(cue);
+    }
 
-    const absolute = resolve(state.cwd, path);
-    const matched = threadRecords(ctx.sessionManager.getBranch()).filter(
+    const lines = cues.flatMap((cue) => surface(cue, event.toolCallId));
+    if (lines.length === 0) return undefined;
+    const content = [...event.content, { type: 'text' as const, text: lines.join('\n') }];
+    // Replacing content alone would drop structured output for programmatic callers.
+    return event.structuredContent === undefined
+      ? { content }
+      : { content, structuredContent: event.structuredContent };
+  });
+
+  function cueFor(absolute: string, threads: readonly ThreadRecord[]): Cue | undefined {
+    const matched = threads.filter(
       (record) =>
         // Compactions record paths as the tools received them, possibly relative.
         record.files.some((file) => resolve(state.cwd, file) === absolute) &&
@@ -111,21 +139,28 @@ export default function episodes(pi: ExtensionAPI): void {
     // A cue that points at many threads primes none of them; the newest ones are the likely
     // ones, and the rest stay one recall away.
     const records = matched.slice(-MAX_SURFACED_THREADS);
-    if (records.length === 0) return undefined;
+    return records.length === 0 ? undefined : { absolute, records, matched: matched.length };
+  }
 
-    const shown = relative(state.cwd, absolute);
+  /** The cue's lines, marking its threads surfaced; none for threads a sibling cue already showed. */
+  function surface(cue: Cue, toolCallId: string): string[] {
+    const records = cue.records.filter(
+      (record) => !state.surfaced.has(`${record.handle}:${cue.absolute}`)
+    );
+    if (records.length === 0) return [];
+    const shown = relative(state.cwd, cue.absolute);
     recordEvent(pi, {
       kind: 'cue',
-      toolCallId: event.toolCallId,
+      toolCallId,
       file: shown,
       threads: records.map((record) => ({
         handle: record.handle,
-        readOnly: record.kind !== 'compaction' && (record.readOnly?.includes(absolute) ?? false)
+        readOnly: record.kind !== 'compaction' && (record.readOnly?.includes(cue.absolute) ?? false)
       })),
-      matched: matched.length
+      matched: cue.matched
     });
-    const lines = records.map((record) => {
-      state.surfaced.add(`${record.handle}:${absolute}`);
+    return records.map((record) => {
+      state.surfaced.add(`${record.handle}:${cue.absolute}`);
       const kind = { fold: 'folded span', fork: 'fork', compaction: 'compacted turns' }[
         record.kind
       ];
@@ -135,12 +170,7 @@ export default function episodes(pi: ExtensionAPI): void {
           : `recall, or ask("${record.handle}", "<question>")`;
       return `[episodes] ${shown} was also touched in ${kind} ${record.handle} (${record.headline}). If what happened there matters now: ${back}.`;
     });
-    const content = [...event.content, { type: 'text' as const, text: lines.join('\n') }];
-    // Replacing content alone would drop structured output for programmatic callers.
-    return event.structuredContent === undefined
-      ? { content }
-      : { content, structuredContent: event.structuredContent };
-  });
+  }
 
   registerFold(pi, state);
   registerRecall(pi, state);

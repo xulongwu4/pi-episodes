@@ -12,15 +12,16 @@ import { Type } from 'typebox';
 import {
   appliedFolds,
   FOLD_APPLIED_TYPE,
+  FOLD_DETAILS_KEY,
   FOLD_REQUEST_TYPE,
   FOLD_TOOL,
   type FoldDetails,
-  isFoldDetails,
+  foldNoteDetails,
   ThreadIndex
 } from './archive.js';
 import { anchorGapTokens } from './cache.js';
 import { type FoldRejection, recordEvent } from './events.js';
-import { estimateTokens, readOnlyPaths, touchedPaths } from './messages.js';
+import { estimateTokens, readOnlyPaths, textOf, touchedPaths } from './messages.js';
 import type { DiskChange } from './snapshots.js';
 import { parseStamp, readStamp, stampLabel, unstampedText } from './stamps.js';
 import type { EpisodeState } from './state.js';
@@ -37,6 +38,8 @@ export interface FoldPlan {
   anchorStamp: number | undefined;
   /** Stamps inside the span before its first response, in order. */
   laterStamps: number[];
+  /** Entry of the response that made the fold call. */
+  callerEntryId: string;
   firstEntryId: string;
   lastEntryId: string;
   /** Messages leaving the context. */
@@ -63,11 +66,10 @@ function callsTool(entry: ProjectedSessionEntry, toolCallId: string): boolean {
 }
 
 function isFoldNote(entry: ProjectedSessionEntry, applied: ReadonlySet<string>): boolean {
-  const message = entryMessage(entry);
-  if (entry.messages.length === 0 || message?.role !== 'toolResult') return false;
-  if (message.toolName !== FOLD_TOOL || message.isError) return false;
+  if (entry.messages.length === 0) return false;
+  const details = foldNoteDetails(entryMessage(entry));
   // A note whose edits never landed left its span in context; it is not a boundary.
-  return isFoldDetails(message.details) && applied.has(message.details.handle);
+  return details !== undefined && applied.has(details.handle);
 }
 
 function capUserContent(
@@ -143,6 +145,11 @@ export interface FoldOptions {
   floorIndex?: number;
   /** Handles of folds that took effect, when they are not recorded as session entries. */
   applied?: ReadonlySet<string>;
+  /**
+   * The call in the transcript whose response made this fold: the codemode call when a script
+   * called fold. Defaults to the fold call itself.
+   */
+  callerId?: string;
 }
 
 /** A fold the tool refused, with why, so rejections can be counted by cause. */
@@ -168,8 +175,8 @@ export function planFold(
   since: number,
   options: FoldOptions = {}
 ): FoldPlan {
-  const { latestStamp, floorIndex = -1 } = options;
-  const foldIndex = entries.findIndex((entry) => callsTool(entry, foldCallId));
+  const { latestStamp, floorIndex = -1, callerId = foldCallId } = options;
+  const foldIndex = entries.findIndex((entry) => callsTool(entry, callerId));
   if (foldIndex < 0) {
     throw new FoldError(
       'not-in-context',
@@ -305,6 +312,7 @@ export function planFold(
     handle,
     anchorStamp,
     laterStamps,
+    callerEntryId: entries[foldIndex]!.sourceEntry.id,
     firstEntryId: first.sourceEntry.id,
     lastEntryId: last.sourceEntry.id,
     omitted,
@@ -419,7 +427,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     name: FOLD_TOOL,
     label: 'Fold',
     description:
-      'Fold a finished episode: remove the span starting at `since` from your context, archive it, and keep `note` in its place. User messages from the span stay. Call it as the only tool in the response, once the next step no longer depends on the span beyond the note, and not right before your final reply.',
+      'Fold a finished episode: remove the span starting at `since` from your context, archive it, and keep `note` in its place. User messages from the span stay. Call it as the only tool in the response, once the next step no longer depends on the span beyond the note, and not right before your final reply. From a codemode script, call only fold in that script and print its result.',
     promptSnippet: 'Fold a finished episode into a note; the span is archived and stays reachable',
     parameters: FoldParams,
     executionMode: 'sequential',
@@ -433,6 +441,10 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       let plan: FoldPlan;
       let since: number | undefined;
       const note = params.note.trim();
+      // A call from a codemode script is not in the transcript; the response that called the
+      // script made it.
+      const root = state.rootCall(toolCallId);
+      const scriptCall = root === toolCallId ? undefined : root;
       try {
         since = parseStamp(params.since);
         if (since === undefined) {
@@ -448,8 +460,19 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
           );
         }
         plan = planFold(ctx.sessionManager.buildSessionProjection().entries, toolCallId, since, {
-          latestStamp: state.nextStamp - 1
+          latestStamp: state.nextStamp - 1,
+          callerId: scriptCall ?? toolCallId
         });
+        // Reserved before anything is awaited, so a second fold from the same response, in
+        // the same script or another one, sees it.
+        const reserved = state.foldResponses.get(plan.callerEntryId);
+        if (reserved !== undefined && reserved !== toolCallId) {
+          throw new FoldError(
+            'one-per-response',
+            'Only one fold per response; this one was ignored.'
+          );
+        }
+        state.foldResponses.set(plan.callerEntryId, toolCallId);
       } catch (error) {
         if (error instanceof FoldError) {
           recordEvent(pi, { kind: 'fold-rejected', toolCallId, reason: error.reason });
@@ -483,12 +506,6 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       }
 
       const tokens = estimateTokens(plan.omitted);
-      state.pendingFolds.set(toolCallId, {
-        handle: plan.handle,
-        messages: plan.omitted.length,
-        tokens,
-        edits: plan.edits
-      });
 
       const details: FoldDetails = {
         kind: 'fold',
@@ -520,42 +537,77 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         ...(gapTokens === undefined ? {} : { gapTokens })
       };
 
-      // A /fold request ends the run here; an autonomous fold continues the task.
+      const text = renderNote({
+        handle: plan.handle,
+        since: sinceLabel,
+        until: untilLabel,
+        messages: plan.omitted.length,
+        tokens,
+        note,
+        changes,
+        touched,
+        keptUserTurns: plan.keptUserTurns,
+        cwd: state.cwd
+      });
+      // A fold from a script takes effect with the script's result, which then stands as the
+      // note; the edits wait under the script's call, the one the turn reports.
+      state.pendingFolds.set(scriptCall ?? toolCallId, {
+        handle: plan.handle,
+        messages: plan.omitted.length,
+        tokens,
+        edits: plan.edits,
+        ...(scriptCall ? { script: { note: text, details } } : {})
+      });
+
+      // A /fold request ends the run here; an autonomous fold continues the task. Codemode
+      // does not pass this on from a script, so a /fold done there does not end the run.
       const terminate = manual !== undefined;
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: renderNote({
-              handle: plan.handle,
-              since: sinceLabel,
-              until: untilLabel,
-              messages: plan.omitted.length,
-              tokens,
-              note,
-              changes,
-              touched,
-              keptUserTurns: plan.keptUserTurns,
-              cwd: state.cwd
-            })
-          }
-        ],
-        details,
-        terminate
-      };
+      return { content: [{ type: 'text', text }], details, terminate };
     }
+  });
+
+  // Calls a codemode script makes are not in the transcript; remember which call made them so
+  // a fold from a script finds the response that called the script.
+  pi.on('tool_call', (event) => {
+    if (event.parentToolCallId) state.parentCalls.set(event.toolCallId, event.parentToolCallId);
+  });
+
+  // A fold from a script takes effect only if the script succeeds. Its result then carries the
+  // fold's details, and the note too when the script did not print it, written once with the
+  // result rather than edited in later.
+  pi.on('tool_result', (event) => {
+    if (event.parentToolCallId) return undefined;
+    const script = state.pendingFolds.get(event.toolCallId)?.script;
+    if (!script) return undefined;
+    if (event.isError) {
+      state.pendingFolds.delete(event.toolCallId);
+      return undefined;
+    }
+    const own =
+      typeof event.details === 'object' && event.details !== null && !Array.isArray(event.details)
+        ? event.details
+        : {};
+    const details = { ...own, [FOLD_DETAILS_KEY]: script.details };
+    if (textOf(event.content).includes(script.note)) return { details };
+    const content = [...event.content, { type: 'text' as const, text: script.note }];
+    return event.structuredContent === undefined
+      ? { content, details }
+      : { content, details, structuredContent: event.structuredContent };
   });
 
   // Context edits can only be appended at a turn boundary; by then the fold result exists,
   // so the call and its note stay paired and the next request already sees the fold.
   pi.on('turn_end', (event, ctx) => {
+    state.foldResponses.clear();
     const applied = event.toolResults
-      .filter((result) => result.toolName === FOLD_TOOL && !result.isError)
+      .filter((result) => !result.isError)
       .flatMap((result) => {
         const pending = state.pendingFolds.get(result.toolCallId);
+        const stands = pending?.script ? foldNoteDetails(result) : result.toolName === FOLD_TOOL;
+        if (!pending || !stands) return [];
         state.pendingFolds.delete(result.toolCallId);
-        return pending ? [pending] : [];
+        return [pending];
       });
     if (applied.length === 0) return undefined;
 
@@ -585,6 +637,8 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
   // the run would otherwise not show until the next response.
   pi.on('agent_settled', (_event, ctx) => {
     state.pendingFolds.clear();
+    state.foldResponses.clear();
+    state.parentCalls.clear();
     state.manualFold = undefined;
     refreshStatus(ctx, state);
   });
@@ -616,13 +670,18 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         if (since === undefined) return;
       }
       state.manualFold = since === undefined ? 'request' : 'since';
+      // Under codemode "only" fold is not declared; the model reaches it from a script.
+      const how =
+        pi.getSettings().codemode?.mode === 'only' && pi.getActiveTools().includes('codemode')
+          ? 'make one codemode call whose script calls only fold and prints its result'
+          : 'call only fold in this response';
       const target =
         since === undefined ? 'Pick the span that is done' : `Use since "${stampLabel(since)}"`;
       pi.sendMessage(
         {
           customType: FOLD_REQUEST_TYPE,
           display: true,
-          content: `The user asked you to fold now. ${target}, write the note, and call only fold in this response.`
+          content: `The user asked you to fold now. ${target}, write the note, and ${how}.`
         },
         { triggerTurn: true }
       );

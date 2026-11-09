@@ -38,7 +38,7 @@ yet.
 Do not fold right before your final reply to the user; that reply needs the span. If the
 episode was the whole request, fold at the start of the next request, before working on
 it. Call fold as the only tool in its response, and say there in one line what you return
-to.
+to. From a codemode script, call only fold in that script and print its result.
 
 Write the note for a reader who will never see the span; nothing in it will come to mind
 on its own. Its first line names the question and how it ended, specific enough to tell
