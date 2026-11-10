@@ -359,22 +359,20 @@ export class ThreadIndex {
     const path = this.sessions.getBranch(fold.lastEntryId);
     const start = path.findIndex((entry) => entry.id === fold.firstEntryId);
     if (start < 0) return undefined;
-    // The spans of folds this one covers, and of those they covered, are already archived
-    // under their own handles; this thread holds their notes, as its `ask` context does.
+    // The spans of folds applied before this one are already archived under their own
+    // handles: the folds this one covers, whose notes this thread holds, and those that
+    // ended at an `until` inside this span, whose notes lie after it.
+    const note = this.sessions
+      .getEntries()
+      .find((entry) => foldEntryDetails(entry)?.handle === fold.handle);
     const covered = new Set<string>();
-    const records = fold.covers?.length ? foldRecords(this.sessions.getEntries()) : [];
-    const pending = [...(fold.covers ?? [])];
-    const seen = new Set<string>();
-    for (let handle = pending.pop(); handle !== undefined; handle = pending.pop()) {
-      if (seen.has(handle)) continue;
-      seen.add(handle);
-      const record = records.find((candidate) => candidate.handle === handle);
-      if (!record) continue;
-      pending.push(...(record.covers ?? []));
+    for (const record of note ? foldRecords(this.sessions.getBranch(note.id)) : []) {
       const first = path.findIndex((entry) => entry.id === record.firstEntryId);
+      if (first < 0) continue;
       const last = path.findIndex((entry) => entry.id === record.lastEntryId);
-      if (first < 0 || last < first) continue;
-      for (const entry of path.slice(first, last + 1)) covered.add(entry.id);
+      for (const entry of path.slice(first, last < 0 ? undefined : last + 1)) {
+        covered.add(entry.id);
+      }
     }
 
     return {
@@ -386,10 +384,15 @@ export class ThreadIndex {
         .filter((entry) => !covered.has(entry.id))
         .flatMap(sessionEntryToContextMessages),
       context: () => {
-        const messages = buildSessionProjection(
-          this.sessions.getEntries(),
-          fold.lastEntryId
-        ).messages;
+        // As the agent saw the span when it folded: the edits of earlier folds are written
+        // after their notes, which can be after this span.
+        const entries = this.sessions.getEntries();
+        const seen = buildSessionProjection(entries, note?.id ?? fold.lastEntryId).entries;
+        const end = seen.findIndex((entry) => entry.sourceEntry.id === fold.lastEntryId);
+        const messages =
+          end < 0
+            ? buildSessionProjection(entries, fold.lastEntryId).messages
+            : seen.slice(0, end + 1).flatMap((entry) => entry.messages);
         // A span folded through /fold ends with the request to fold; a question appended
         // after it would read as that request, and the thread would try to fold again.
         while (isFoldRequest(messages.at(-1))) messages.pop();

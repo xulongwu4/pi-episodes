@@ -451,6 +451,56 @@ test('a fold reaching behind an earlier fold note covers it', () => {
   assert.equal(after.anchorStamp, 3);
 });
 
+test('a fold over a span that an earlier fold with until emptied holds only what it removed', async () => {
+  const { manager } = session([
+    user('go', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'alpha-out', 2),
+    assistant(call('b', 'bash')),
+    result('b', 'bash', 'beta-out', 3),
+    assistant(call('c', 'bash')),
+    result('c', 'bash', 'gamma-out', 4)
+  ]);
+  // Each fold stops before its own call, so the first note is after the second span.
+  const fold = (id: string, since: number, until: number, stamp: number) => {
+    manager.appendMessage(assistant(call(id, 'fold')));
+    const plan = planFold(manager.buildSessionProjection().entries, id, since, { until });
+    manager.appendMessage({
+      ...result(id, 'fold', `${id} note`, stamp),
+      details: {
+        kind: 'fold',
+        handle: plan.handle,
+        firstEntryId: plan.firstEntryId,
+        lastEntryId: plan.lastEntryId,
+        covers: plan.covers.map((covered) => covered.handle)
+      }
+    } as Parameters<typeof manager.appendMessage>[0]);
+    apply(manager, plan.edits);
+    manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
+    return plan;
+  };
+  const inner = fold('f1', 3, 3, 5);
+  const outer = fold('f2', 2, 4, 6);
+  assert.deepEqual(outer.covers, []);
+
+  const threads = await new ThreadIndex(manager, new Map()).onBranch();
+  const held = (handle: string) => {
+    const thread = threads.find((candidate) => candidate.handle === handle)!;
+    return {
+      archived: JSON.stringify(thread.messages).match(/(alpha|beta|gamma)-out/g),
+      asked: JSON.stringify(thread.context!()).match(/(alpha|beta|gamma)-out/g)
+    };
+  };
+  assert.deepEqual(held(inner.handle), {
+    archived: ['beta-out'],
+    asked: ['alpha-out', 'beta-out']
+  });
+  assert.deepEqual(held(outer.handle), {
+    archived: ['alpha-out', 'gamma-out'],
+    asked: ['alpha-out', 'gamma-out']
+  });
+});
+
 test('a fold whose edits never landed is not covered', () => {
   // Its span is still in context, so its result is only a tool result.
   const plan = planFold(earlierFold(false), 'f1', 2);
