@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -564,6 +564,31 @@ test('a fork folds its own work, and recall and ask reach the fold inside it', a
   }
 });
 
+test('a note names the skill files read inside its span', async () => {
+  const harness = await createSession([
+    () => fauxAssistantMessage(fauxToolCall('read', { path: 'skills/tdd/SKILL.md' })),
+    () => fauxAssistantMessage(fauxToolCall('fold', { since: 't2', note: 'Loaded the skill.' })),
+    (context) => {
+      const note = text(conversation(context).at(-1)!);
+      assert.ok(
+        note.includes(
+          `Skills read inside the span, whose instructions left your context with it: ${join(harness.dir, 'skills/tdd/SKILL.md')}. Read a skill again before relying on it.`
+        )
+      );
+      return fauxAssistantMessage('done');
+    }
+  ]);
+
+  try {
+    await mkdir(join(harness.dir, 'skills/tdd'), { recursive: true });
+    await writeFile(join(harness.dir, 'skills/tdd/SKILL.md'), 'Write the test first.\n');
+    await harness.session.prompt('use the skill');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
 test('stats read the session: folds, rejections, cues followed, and the drop after a fold', async () => {
   let handle = '';
   const harness = await createSession(

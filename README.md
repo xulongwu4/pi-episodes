@@ -67,7 +67,7 @@ When an episode is done, the agent calls `fold(since: "t13", note: "...")`, wher
 | Extension messages | Removed |
 | The fold call and its result | Kept; the result is the note |
 
-The harness extends the note with what changed on disk during the span, the stamps of the user messages that stayed, and a handle such as `ep-1a2b3c4d` that points at the archive. Disk changes come from a working tree diff, so files a shell command generated are listed too; files ignored by git are not.
+The harness extends the note with what changed on disk during the span, the stamps of the user messages that stayed, and a handle such as `ep-1a2b3c4d` that points at the archive. Disk changes come from a working tree diff, so files a shell command generated are listed too; files ignored by git are not. Skill files (`SKILL.md`) read inside the span are named too, since a note says what was learned and not how the skill said to work.
 
 Nothing is deleted. A fold appends `context_edit` entries to the session, which only change what the model sees from then on; `/tree`, exports and the session file still hold the full span. A fold can start before earlier notes. It then removes them with the rest of its span, and its note covers theirs: the harness lists their handles and headlines in it, and `recall` and `ask` still reach each span by its own handle; the covering fold's thread holds their notes, not their spans again. The `/fold` picker offers every stamp since the last compaction. A fold cannot reach back past a compaction summary. A summary can still mention old stamps; folding from one is refused with the earliest stamp that can be folded from, so the retry is right the first time.
 

@@ -3,7 +3,7 @@ import type { Tool } from '@earendil-works/pi-ai';
 import type { ProjectedSessionEntry, SessionEntry } from '@earendil-works/pi-coding-agent';
 import type { FoldDetails, NestedFold } from './archive.js';
 import { headline, openItems, planFold, renderNote } from './fold.js';
-import { estimateTokens, touchedPaths } from './messages.js';
+import { estimateTokens, skillPaths, touchedPaths } from './messages.js';
 import { parseStamp, readStamp, stampLabel, withStamp } from './stamps.js';
 import type { EpisodeState } from './state.js';
 
@@ -158,6 +158,7 @@ export class ForkFolds {
             touched,
             keptUserTurns: plan.keptUserTurns,
             covers: plan.covers,
+            skills: skillPaths(plan.spanMessages, this.state.cwd),
             cwd: this.state.cwd
           })
         }

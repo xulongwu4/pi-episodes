@@ -1,4 +1,4 @@
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ImageContent, TextContent } from '@earendil-works/pi-ai';
 
@@ -81,6 +81,11 @@ export function touchedPaths(
 
 const READ_TOOLS = new Set(['read']);
 const WRITE_TOOLS = new Set(['edit', 'write']);
+
+/** Skill files these messages read. Pi has no skill tool: loading a skill is reading its SKILL.md. */
+export function skillPaths(messages: readonly AgentMessage[], cwd: string): string[] {
+  return touchedPaths(messages, cwd, READ_TOOLS).filter((path) => basename(path) === 'SKILL.md');
+}
 
 /**
  * Files these messages only read: not edited or written by a file tool, and not in the

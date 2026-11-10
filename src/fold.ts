@@ -25,7 +25,7 @@ import {
 } from './archive.js';
 import { anchorGapTokens } from './cache.js';
 import { type FoldRejection, recordEvent } from './events.js';
-import { estimateTokens, readOnlyPaths, textOf, touchedPaths } from './messages.js';
+import { estimateTokens, readOnlyPaths, skillPaths, textOf, touchedPaths } from './messages.js';
 import type { DiskChange } from './snapshots.js';
 import { parseStamp, readStamp, stampLabel, unstampedText } from './stamps.js';
 import type { EpisodeState } from './state.js';
@@ -523,6 +523,8 @@ export function renderNote(options: {
   touched: readonly string[];
   keptUserTurns: readonly string[];
   covers?: readonly { handle: string; headline: string }[];
+  /** Skill files read inside the span. */
+  skills?: readonly string[];
   cwd: string;
 }): string {
   const lines = [
@@ -547,6 +549,13 @@ export function renderNote(options: {
     );
   }
 
+  // A note says what was learned, not how to work; a skill's instructions would be lost unseen.
+  if (options.skills?.length) {
+    lines.push(
+      '',
+      `Skills read inside the span, whose instructions left your context with it: ${options.skills.join(', ')}. Read a skill again before relying on it.`
+    );
+  }
   lines.push(
     '',
     `To go back: recall("<exact words>") searches this span; ask("${options.handle}", "<question>") asks it.`
@@ -723,6 +732,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         touched,
         keptUserTurns: plan.keptUserTurns,
         covers: plan.covers,
+        skills: skillPaths(plan.spanMessages, state.cwd),
         cwd: state.cwd
       });
       // Snapshots take time; a run aborted meanwhile, or already settled, must not get edits.

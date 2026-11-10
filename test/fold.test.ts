@@ -17,6 +17,7 @@ import {
   renderNote,
   USER_TEXT_CAP
 } from '../src/fold.js';
+import { skillPaths } from '../src/messages.js';
 import { readStamp } from '../src/stamps.js';
 import { assistant, call, result, session, user } from './helpers.js';
 
@@ -448,16 +449,33 @@ test('renders the note with disk changes, kept turns and the handle', () => {
     changes: [{ status: 'M', path: '/repo/src/client/api.ts' }],
     touched: [],
     keptUserTurns: ['t4'],
+    skills: ['/home/me/skills/tdd/SKILL.md'],
     cwd: '/repo'
   });
 
   assert.match(text, /^\[fold ep-12345678: 4 messages, t2-t9, ~41k tokens, archived\]/);
   assert.match(text, /Changed on disk \(working tree diff\):\nM src\/client\/api\.ts/);
   assert.match(text, /stay above with their stamps: t4\./);
+  assert.match(
+    text,
+    /Skills read inside the span, .*: \/home\/me\/skills\/tdd\/SKILL\.md\. Read a skill again/
+  );
   assert.match(text, /ask\("ep-12345678"/);
   assert.equal(headline('## Changed\nregenerated'), 'Changed');
 });
 
+test('names the skill files a span read, not the ones it wrote', () => {
+  const messages = [
+    assistant(call('a', 'read', { path: '/skills/tdd/SKILL.md' })),
+    assistant(call('b', 'read', { path: 'docs/SKILL.md.bak' })),
+    assistant(call('c', 'write', { path: '/skills/new/SKILL.md' })),
+    assistant(call('d', 'read', { path: 'skills/review/SKILL.md' }))
+  ];
+  assert.deepEqual(skillPaths(messages, '/repo'), [
+    '/skills/tdd/SKILL.md',
+    '/repo/skills/review/SKILL.md'
+  ]);
+});
 test('reads the Open section of a note, in the forms the template produces', () => {
   const note = [
     'Build fails with TS2322: fixed by regenerating the client.',
