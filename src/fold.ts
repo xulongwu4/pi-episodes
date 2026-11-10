@@ -275,8 +275,12 @@ function removed(
  * its planned edits, then the edits in that order, then the applied marker; Pi writes them one
  * at a time, so a crash can stop the batch midway. For a start entry without a marker, each
  * planned edit whose target does not already carry that replacement, as its latest edit, is
- * written again, in the planned order, then the marker. A fold without a start entry never took
- * effect, and one whose note a later edit hid is left alone: the later fold stands for its span.
+ * written again, in the planned order, then the marker. That holds for a removal whatever was
+ * done to its target since: a span removed in part must not keep a result whose call is gone.
+ * The cut of a user message only saves tokens, so an edit made to that message after the fold
+ * started, by anyone, stands and the cut is not written over it. A fold without a start entry
+ * never took effect, and one whose note a later edit hid is left alone: the later fold stands
+ * for its span.
  * `pending` holds the drafts earlier handlers of this boundary queued, which land first.
  */
 export function completeCutShortFolds(
@@ -296,9 +300,11 @@ export function completeCutShortFolds(
     }
     const note = branch.find((entry) => foldEntryDetails(entry)?.handle === handle);
     if (note && removed(note.id, branch, pending)) return [];
-    const rest = (edits as ContextEditEntryDraft[]).filter(
-      (edit) => latest.get(edit.targetId) !== JSON.stringify(edit.replacement)
-    );
+    const rest = (edits as ContextEditEntryDraft[]).filter((edit) => {
+      const now = latest.get(edit.targetId);
+      if (now === JSON.stringify(edit.replacement)) return false;
+      return edit.replacement === null || now === undefined;
+    });
     return [...rest, { type: 'custom' as const, customType: FOLD_APPLIED_TYPE, data: { handle } }];
   });
 }

@@ -205,6 +205,52 @@ test('a cut-short fold is completed over edits that other extensions made to its
   assert.equal(completeCutShortFolds(manager.getBranch()).length, 0);
 });
 
+test('a cut-short fold does not write its cut of a user message over a later edit of it', () => {
+  const pasted = [...buildLoop];
+  pasted[5] = user('x'.repeat(USER_TEXT_CAP * 2), 4);
+  const build = () => {
+    const { manager, ids } = session(pasted);
+    const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2);
+    manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
+    const cut = plan.edits.findIndex((edit) => edit.targetId === ids[5]);
+    assert.ok(cut > 0 && plan.edits[cut]!.replacement !== null);
+    return { manager, plan, cut, paste: ids[5]! };
+  };
+  const targets = (rest: ReturnType<typeof completeCutShortFolds>) =>
+    rest.flatMap((draft) => (draft.type === 'context_edit' ? [draft.targetId] : []));
+  const redacted = { content: [{ type: 'text' as const, text: 'redacted' }] };
+
+  // Left alone, the cut is completed like the removals.
+  const plain = build();
+  apply(plain.manager, plain.plan.edits.slice(0, 1));
+  assert.ok(targets(completeCutShortFolds(plain.manager.getBranch())).includes(plain.paste));
+
+  // The crash came before the cut, and another extension then rewrote or removed the message.
+  for (const later of [redacted, null]) {
+    const { manager, plan, paste } = build();
+    apply(manager, plan.edits.slice(0, 1));
+    manager.appendContextEdit(paste, later);
+    assert.deepEqual(
+      targets(completeCutShortFolds(manager.getBranch())),
+      plan.edits
+        .slice(1)
+        .map((edit) => edit.targetId)
+        .filter((id) => id !== paste)
+    );
+  }
+
+  // The cut landed, and the message was rewritten after it or in a draft queued at this boundary.
+  for (const where of ['after', 'queued'] as const) {
+    const { manager, plan, cut, paste } = build();
+    apply(manager, plan.edits.slice(0, cut + 1));
+    const edit = { type: 'context_edit' as const, targetId: paste, replacement: redacted };
+    if (where === 'after') manager.appendContextEdit(paste, redacted);
+    const rest = completeCutShortFolds(manager.getBranch(), where === 'queued' ? [edit] : []);
+    assert.ok(!targets(rest).includes(paste), where);
+    assert.equal(targets(rest).length, plan.edits.length - cut - 1, where);
+  }
+});
+
 test('a cut-short fold counts the edits earlier handlers queued at the same boundary', () => {
   const { manager } = session(buildLoop);
   const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2);
