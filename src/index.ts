@@ -1,4 +1,4 @@
-import { relative, resolve } from 'node:path';
+import { relative } from 'node:path';
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -230,7 +230,7 @@ export default function episodes(pi: ExtensionAPI): void {
     const matched = threads.filter(
       (record) =>
         // Compactions record paths as the tools received them, possibly relative.
-        record.files.some((file) => resolve(state.cwd, file) === absolute) &&
+        record.files.some((file) => absolutePath(state.cwd, file) === absolute) &&
         !state.surfaced.has(`${record.handle}:${absolute}`)
     );
     // A cue that points at many threads primes none of them; the newest ones are the likely

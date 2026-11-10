@@ -550,6 +550,59 @@ test('an edit by line anchors from a script is in the fold, and the next one cue
 });
 
 /** As pi-hashline-edit-pro does, replaces the result of an edit with its diff. */
+/** A write that touches no disk: a compaction records the path as the call gave it. */
+const fakeWrite: ExtensionFactory = (pi) => {
+  pi.registerTool({
+    name: 'write',
+    label: 'write',
+    description: 'Write a file.',
+    parameters: Type.Object({ path: Type.String(), content: Type.String() }),
+    async execute() {
+      return { content: [{ type: 'text', text: 'Wrote the file.' }], details: undefined };
+    }
+  });
+};
+
+test('a file under ~ that compacted turns changed cues their thread when it is touched again', async () => {
+  const write = () =>
+    fauxAssistantMessage(fauxToolCall('write', { path: '~/notes.md', content: 'x' }), {
+      stopReason: 'toolUse'
+    });
+  const harness = await createSession(
+    'off',
+    [
+      write,
+      () => fauxAssistantMessage('saved'),
+      () => fauxAssistantMessage('ok'),
+      // pi's summarizer, for the history and for the split turn.
+      () => fauxAssistantMessage('## Goal\nKeep notes.'),
+      () => fauxAssistantMessage('The user said next.'),
+      write,
+      (context) => {
+        assert.match(
+          text(conversation(context).at(-1)!),
+          /\[episodes\] \S*notes\.md was also touched in compacted turns cp-[0-9a-f]{8}/
+        );
+        return fauxAssistantMessage('ok');
+      }
+    ],
+    [fakeWrite],
+    {},
+    { keepRecentTokens: 1 },
+    undefined,
+    [],
+    ['write']
+  );
+  try {
+    await harness.session.prompt('note it');
+    await harness.session.prompt('next');
+    await harness.session.compact();
+    await harness.run('again');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 const diffResult: ExtensionFactory = (pi) => {
   pi.on('tool_result', (event) => {
     if (event.toolName !== 'replace' || event.structuredContent === undefined) return undefined;
