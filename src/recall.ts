@@ -16,6 +16,8 @@ const DEFAULT_LIMIT = 30;
 const MAX_LIMIT = 200;
 /** How much of a turn read back by its stamp goes into context; the rest goes to a file. */
 const READ_BACK_CHARS = 8000;
+/** The same for a range of turns: about what three turns would get one by one. */
+const READ_BACK_RANGE_CHARS = 24_000;
 
 export function createMatcher(
   query: string,
@@ -70,24 +72,33 @@ export function formatMatch(match: RecallMatch): string {
 
 /**
  * The messages a turn stands for in recall's matches: the one carrying the stamp and the
- * responses after it, up to the next stamp.
+ * responses after it, up to the next stamp. With `last`, every turn from `stamp` to that one.
+ * Empty when the thread does not hold both.
  */
-export function turnMessages(thread: SearchableThread, stamp: number): AgentMessage[] {
+export function turnMessages(
+  thread: SearchableThread,
+  stamp: number,
+  last = stamp
+): AgentMessage[] {
   const start = thread.messages.findIndex((message) => readStamp(message) === stamp);
-  if (start < 0) return [];
+  const final = thread.messages.findIndex((message) => readStamp(message) === last);
+  if (start < 0 || final < start) return [];
   const end = thread.messages.findIndex(
-    (message, index) => index > start && readStamp(message) !== undefined
+    (message, index) => index > final && readStamp(message) !== undefined
   );
   return thread.messages.slice(start, end < 0 ? undefined : end);
 }
 
-/** A turn as it was, each message under a line saying whose it is and how long. */
+/** Turns as they were, each message under a line saying whose it is, of which turn and how long. */
 export function formatTurn(handle: string, turn: string, messages: readonly AgentMessage[]) {
+  let label = turn;
   return messages
     .map((message) => {
+      const stamp = readStamp(message);
+      if (stamp !== undefined) label = stampLabel(stamp);
       const text = messageText(message);
       const tool = message.role === 'toolResult' ? ` (${message.toolName})` : '';
-      return `${handle} ${turn} ${message.role}${tool}, ${text.length} chars\n${text}`;
+      return `${handle} ${label} ${message.role}${tool}, ${text.length} chars\n${text}`;
     })
     .join('\n\n');
 }
@@ -149,7 +160,7 @@ const RecallParams = Type.Object({
   turn: Type.Optional(
     Type.String({
       description:
-        'With handle, instead of searching: return what that turn held, verbatim. Use the turn a match named, such as "t14".'
+        'With handle, instead of searching: return what that turn held, verbatim. Use the turn a match named, such as "t14", or a range of turns such as "t14-t16".'
     })
   ),
   regex: Type.Optional(
@@ -211,13 +222,18 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
 
       if (params.turn) {
         const thread = threads[0]!;
-        const stamp = parseStamp(params.turn);
-        const messages = stamp === undefined ? [] : turnMessages(thread, stamp);
-        if (stamp === undefined || messages.length === 0) {
+        const [first, last, ...more] = params.turn.split('-').map(parseStamp);
+        const ranged = params.turn.includes('-');
+        const valid =
+          first !== undefined && more.length === 0 && (!ranged || (last ?? -1) >= first);
+        const messages = valid ? turnMessages(thread, first, last) : [];
+        if (messages.length === 0) {
           throw new Error(`No turn ${params.turn} in ${thread.handle} (${thread.label}).`);
         }
-        const turn = stampLabel(stamp);
-        const text = formatTurn(thread.handle, turn, messages);
+        const from = stampLabel(first!);
+        const turn = last === undefined || last === first ? from : `${from}-${stampLabel(last)}`;
+        const text = formatTurn(thread.handle, from, messages);
+        const cap = turn === from ? READ_BACK_CHARS : READ_BACK_RANGE_CHARS;
         const details: RecallDetails = {
           query,
           threads: 1,
@@ -232,15 +248,15 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
           details.stale = stale.map(({ handle, files }) => ({ handle, files }));
         }
         const lines = stale.map((note) => note.line);
-        if (text.length > READ_BACK_CHARS) {
+        if (text.length > cap) {
           const file = await spill(
             archiveDir(ctx.sessionManager),
             `${thread.handle}-${turn}.txt`,
             text
           );
           lines.push(
-            text.slice(0, READ_BACK_CHARS).toWellFormed(),
-            `... ${text.length - READ_BACK_CHARS} more characters. The whole turn is in ${file}; grep it or read a slice rather than the whole file.`
+            text.slice(0, cap).toWellFormed(),
+            `... ${text.length - cap} more characters. All of ${turn} is in ${file}; grep it or read a slice rather than the whole file.`
           );
           details.file = file;
         } else {

@@ -255,7 +255,16 @@ test('a fold with until removes old turns and keeps the work after them', async 
         return fauxAssistantMessage(fauxToolCall('recall', { query: '"echo two"' }));
       },
       (context) => {
-        assert.match(text(conversation(context).at(-1)!), /ep-[0-9a-f]{8} .*echo two/);
+        const found = text(conversation(context).at(-1)!);
+        assert.match(found, /ep-[0-9a-f]{8} .*echo two/);
+        const handle = /ep-[0-9a-f]{8}/.exec(found)![0];
+        return fauxAssistantMessage(fauxToolCall('recall', { handle, turn: 't2-t3' }));
+      },
+      (context) => {
+        // Both turns of the span, each message under its own turn.
+        const back = text(conversation(context).at(-1)!);
+        assert.match(back, /^ep-[0-9a-f]{8} t2 toolResult \(bash\), \d+ chars\n/);
+        assert.match(back, /\n\nep-[0-9a-f]{8} t3 toolResult \(bash\), \d+ chars\ntwo\n/);
         return fauxAssistantMessage('ok');
       }
     ],
@@ -712,10 +721,7 @@ test('a large tool result arrives cut, and recall searches and reads back all of
         );
         assert.match(back, /row 300 of the table\n/);
         assert.doesNotMatch(back, /row 600 of/);
-        assert.match(
-          back,
-          new RegExp(`more characters\\. The whole turn is in .*${handle}-t2\\.txt`)
-        );
+        assert.match(back, new RegExp(`more characters\\. All of t2 is in .*${handle}-t2\\.txt`));
         return fauxAssistantMessage(fauxToolCall('recall', { handle, turn: 't9' }));
       },
       (context) => {

@@ -57,3 +57,21 @@ test('a turn read back is its stamped message and the responses up to the next s
     'ep-1 t3 toolResult (bash), 45 chars\nok\nsrc/client/api.ts(12,5): error TS2322\n[t3]'
   );
 });
+
+test('a range read back runs from its first turn to the end of its last', () => {
+  const range = turnMessages(thread, 3, 4);
+  assert.deepEqual(
+    range.map((message) => message.role),
+    ['toolResult', 'user', 'assistant']
+  );
+  // Both ends must be in the thread, in order.
+  assert.deepEqual(turnMessages(thread, 3, 9), []);
+  assert.deepEqual(turnMessages(thread, 4, 3), []);
+
+  const text = formatTurn('ep-1', 't3', range);
+  assert.match(text, /^ep-1 t3 toolResult \(bash\), 45 chars\n/);
+  assert.match(
+    text,
+    /\n\nep-1 t4 user, \d+ chars\ndo not edit generated files\n\[t4\]\n\nep-1 t4 assistant, /
+  );
+});
