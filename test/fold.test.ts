@@ -21,7 +21,7 @@ import {
   renderNote,
   USER_TEXT_CAP
 } from '../src/fold.js';
-import { skillPaths } from '../src/messages.js';
+import { skillPaths, touchedPaths } from '../src/messages.js';
 import { readStamp } from '../src/stamps.js';
 import { assistant, call, result, session, user } from './helpers.js';
 
@@ -665,6 +665,31 @@ test('names the skill files a span read, not the ones it wrote', () => {
     join(homedir(), '.pi/skills/plan/SKILL.md')
   ]);
 });
+
+test('a call that failed touched no file', () => {
+  const failed = { ...result('b', 'write', 'EACCES'), isError: true };
+  const script = {
+    ...result('c', 'codemode', 'done'),
+    nestedCalls: {
+      calls: [
+        { id: 'n1', name: 'write', arguments: { path: 'c.ts' }, status: 'error' as const },
+        { id: 'n2', name: 'write', arguments: { path: 'd.ts' }, status: 'ok' as const }
+      ],
+      complete: true
+    }
+  };
+  const messages = [
+    assistant(call('a', 'read', { path: 'a.ts' }), call('b', 'write', { path: 'a.ts' })),
+    result('a', 'read', 'a'),
+    failed,
+    assistant(call('c', 'codemode', {})),
+    script
+  ];
+  assert.deepEqual(touchedPaths(messages, '/repo'), ['/repo/a.ts', '/repo/d.ts']);
+  // The write of a.ts failed, so the span only read it.
+  assert.deepEqual(touchedPaths(messages, '/repo', new Set(['write'])), ['/repo/d.ts']);
+});
+
 test('reads the Open section of a note, in the forms the template produces', () => {
   const note = [
     'Build fails with TS2322: fixed by regenerating the client.',

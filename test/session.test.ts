@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -342,6 +342,13 @@ test('points back to a folded span when its files are touched or changed again',
         const note = text(conversation(context).at(-1)!);
         assert.match(note, /Changed on disk \(working tree diff\):\nA a\.txt/);
         handle = /ep-[0-9a-f]{8}/.exec(note)![0];
+        rmSync(join(harness.dir, 'a.txt'));
+        return fauxAssistantMessage(fauxToolCall('read', { path: 'a.txt' }));
+      },
+      (context) => {
+        // The read failed, so it touched nothing and the cue is still to come.
+        assert.doesNotMatch(text(conversation(context).at(-1)!), /was also touched/);
+        writeFileSync(join(harness.dir, 'a.txt'), 'one');
         return fauxAssistantMessage(fauxToolCall('read', { path: 'a.txt' }));
       },
       (context) => {

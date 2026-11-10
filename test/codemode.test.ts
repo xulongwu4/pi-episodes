@@ -411,7 +411,7 @@ test('files a script read are in the fold, and reading one again cues the thread
 /**
  * Tools shaped like those of pi-hashline-edit-pro: an edit takes line anchors and names its file
  * only in the structured result, and a search takes the path it searched. An edit between the
- * `SAME` anchors changes nothing, and says so.
+ * `SAME` anchors changes nothing, and says so; with `STALE` anchors it reports a failure.
  */
 const anchorTools: ExtensionFactory = (pi) => {
   pi.registerTool({
@@ -421,6 +421,13 @@ const anchorTools: ExtensionFactory = (pi) => {
     parameters: Type.Object({ remove_from: Type.String(), remove_to: Type.String() }),
     async execute(_id, params) {
       const classification = params.remove_from === SAME.remove_from ? 'noop' : 'applied';
+      if (params.remove_from === STALE.remove_from) {
+        return {
+          content: [{ type: 'text', text: 'Stale anchor.' }],
+          details: undefined,
+          structuredContent: { ok: false, kind: 'error', path: 'api.ts' }
+        };
+      }
       return {
         content: [{ type: 'text', text: 'Replaced 1 line.' }],
         details: { diff: '+x' },
@@ -440,6 +447,7 @@ const anchorTools: ExtensionFactory = (pi) => {
 };
 const ANCHORS = { remove_from: 'abcde', remove_to: 'abcde' };
 const SAME = { remove_from: 'fghij', remove_to: 'fghij' };
+const STALE = { remove_from: 'klmno', remove_to: 'klmno' };
 
 function toolResults(harness: Awaited<ReturnType<typeof createSession>>, toolName: string) {
   return harness.session.sessionManager
@@ -585,13 +593,17 @@ for (const order of ['before', 'after'] as const) {
   });
 }
 
-test('an edit by line anchors that changed nothing leaves the file as only read', async () => {
+test('an edit by line anchors that changed nothing or failed leaves the file as only read', async () => {
   const harness = await createSession(
     'off',
     [
       () =>
         fauxAssistantMessage(
-          [fauxToolCall('read', { path: 'api.ts' }), fauxToolCall('replace', SAME)],
+          [
+            fauxToolCall('read', { path: 'api.ts' }),
+            fauxToolCall('replace', SAME),
+            fauxToolCall('replace', STALE)
+          ],
           { stopReason: 'toolUse' }
         ),
       () =>
@@ -613,7 +625,10 @@ test('an edit by line anchors that changed nothing leaves the file as only read'
     const [record] = threadRecords(harness.session.sessionManager.getBranch());
     assert.ok(record?.kind === 'fold');
     assert.deepEqual(record.readOnly, [join(harness.dir, 'api.ts')]);
-    assert.deepEqual(toolResults(harness, 'replace')[0]?.details, { diff: '+x' });
+    assert.deepEqual(
+      toolResults(harness, 'replace').map((message) => message.details),
+      [{ diff: '+x' }, undefined]
+    );
   } finally {
     await harness.cleanup();
   }

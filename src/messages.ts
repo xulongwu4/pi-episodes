@@ -40,7 +40,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * takes line anchors and names the file only in its structured result, which the session does
  * not keep: `fromResult` then says the path is found later only if it is recorded. A move
  * between two files names the one it moved to. A result that says it failed or changed nothing
- * names no file.
+ * names no file; the caller leaves out a call that failed outright.
  */
 export function fileTouch(
   name: string,
@@ -132,7 +132,7 @@ export function estimateTokens(messages: readonly AgentMessage[]): number {
  * Absolute paths that file tools read or wrote in these messages, including calls a codemode
  * script made. Pi records those on the script's result with bounded arguments, so a call whose
  * arguments were dropped for size is missed. A path that was not in the arguments is the one
- * recorded with the result.
+ * recorded with the result. A call that failed touched nothing.
  */
 /** A path as pi's file tools take it, which read ~ as the home directory, made absolute. */
 export function absolutePath(cwd: string, path: string): string {
@@ -149,15 +149,22 @@ export function touchedPaths(
     const path = args?.path;
     if (tools.has(name) && typeof path === 'string' && path) paths.add(absolutePath(cwd, path));
   };
+  const failed = new Set(
+    messages.flatMap((message) =>
+      message.role === 'toolResult' && message.isError ? [message.toolCallId] : []
+    )
+  );
   for (const message of messages) {
     if (message.role === 'toolResult') {
-      for (const call of message.nestedCalls?.calls ?? []) add(call.name, call.arguments);
+      for (const call of message.nestedCalls?.calls ?? []) {
+        if (call.status !== 'error') add(call.name, call.arguments);
+      }
       for (const file of recordedFiles(message.details)) add(file.name, { path: file.path });
       continue;
     }
     if (message.role !== 'assistant') continue;
     for (const block of message.content) {
-      if (block.type === 'toolCall') add(block.name, block.arguments);
+      if (block.type === 'toolCall' && !failed.has(block.id)) add(block.name, block.arguments);
     }
   }
   return [...paths];

@@ -165,11 +165,10 @@ export default function episodes(pi: ExtensionAPI): void {
         ? []
         : (scriptFiles.get(event.toolCallId) ?? []);
     scriptFiles.delete(event.toolCallId);
-    const touch = fileTouch(
-      event.toolName,
-      event.input,
-      event.isError ? undefined : event.structuredContent
-    );
+    // A call that failed touched nothing: no cue is spent on it, and no file is recorded.
+    const touch = event.isError
+      ? undefined
+      : fileTouch(event.toolName, event.input, event.structuredContent);
     if (touch) {
       const root = event.parentToolCallId ? state.rootCall(event.toolCallId) : undefined;
       if (touch.fromResult) {
