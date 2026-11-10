@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { FOLD_APPLIED_TYPE } from '../src/archive.js';
 import {
   breakEven,
   cacheRates,
@@ -8,6 +9,7 @@ import {
   statsLines,
   uncachedSplit
 } from '../src/stats.js';
+import { assistant, call, result, session, user } from './helpers.js';
 
 test('the graph scales to the largest request shown and keeps the newest', () => {
   const points = [100, 200, 400, 800, 100].map((tokens) => ({ tokens }));
@@ -87,6 +89,128 @@ test('the cache rates are those of the costs the session recorded, or say what t
     statsLines(stats).includes(
       'fold cost break-even after median 4 request(s), 1/1 folds past it; ~$0.020 spent on notes and re-sent input, up to ~$0.025 saved since (cached input at 25% of the input price, from recorded costs)'
     )
+  );
+});
+
+test('rates keep each model apart and leave out requests without a cost', () => {
+  const sent = (model: string, price: number, input: number, cacheRead: number, read = 0.1) => ({
+    input,
+    output: 0,
+    cacheRead,
+    cacheWrite: 0,
+    model,
+    cost: { input: input * price, output: 0, cacheRead: cacheRead * price * read, cacheWrite: 0 }
+  });
+  const near = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-9);
+  // Both models bill cached input at a tenth; one mostly read from cache, the other did not.
+  near(cacheRates([sent('a', 1e-6, 100, 100_000), sent('b', 1e-4, 100_000, 100)]).cached, 0.1);
+  // Tokens of a request with no recorded cost are not input that cost nothing.
+  const free = {
+    ...sent('a', 0, 9000, 0),
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  };
+  near(cacheRates([sent('a', 1e-6, 1000, 4000), free]).cached, 0.1);
+
+  // Cache reads recorded at no cost are free: a fold saves nothing on later requests.
+  const gratis = cacheRates([sent('a', 1e-6, 1000, 4000, 0)]);
+  assert.equal(gratis.basis, 'costs');
+  assert.equal(gratis.cached, 0);
+  const fold = { handle: 'ep-1', net: 10_000, uncachedAfter: 9000, requests: 5 };
+  assert.equal(breakEven(fold, gratis), Infinity);
+  assert.equal(breakEven({ ...fold, uncachedAfter: 0 }, gratis), Infinity);
+
+  // One request that read nothing from cache does not say what cached input costs.
+  assert.deepEqual(cacheRates([sent('a', 1e-6, 1000, 0)]), {
+    cached: 0.1,
+    write: 1,
+    output: 0,
+    basis: 'assumed'
+  });
+});
+
+test('a rate off by rounding does not add a request, and folds that never pay are counted', () => {
+  // 750 of re-sent input and a note of 2,500 against 3,250 saved on each request.
+  const rates = { cached: 0.25, write: 1, output: 5.000000000000001, basis: 'costs' as const };
+  const even = { handle: 'ep-1', net: 13_000, note: 500, uncachedAfter: 1000, requests: 1 };
+  assert.equal(breakEven(even, rates), 1);
+
+  const never = { handle: 'ep-2', net: 0, uncachedAfter: 1000, requests: 9 };
+  const stats = episodeStats([], '/repo');
+  stats.folds.rates = rates;
+  stats.folds.each.push(even, never, { ...never, handle: 'ep-3' });
+  assert.ok(
+    statsLines(stats).includes(
+      'fold cost never breaks even for half the folds or more, 1/3 folds past break-even (cached input at 25% of the input price, from recorded costs)'
+    )
+  );
+});
+
+test('folds applied together share the request after them, and a compaction ends their savings', () => {
+  const { manager } = session([user('go', 1), assistant(call('a', 'bash'))]);
+  const sent = (input: number, cacheRead: number, timestamp: number) => {
+    manager.appendMessage({
+      ...assistant('ok'),
+      usage: {
+        input,
+        output: 10,
+        cacheRead,
+        cacheWrite: 0,
+        totalTokens: input + cacheRead + 10,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+      },
+      timestamp
+    });
+  };
+  const minute = 60_000;
+  sent(20_000, 0, 0);
+  for (const [id, handle] of [
+    ['f1', 'ep-1'],
+    ['f2', 'ep-2']
+  ] as const) {
+    manager.appendMessage({
+      ...result(id, 'fold', 'note', 2),
+      details: {
+        kind: 'fold',
+        handle,
+        since: 't2',
+        firstEntryId: 'a',
+        lastEntryId: 'b',
+        messages: 2,
+        tokens: 5000,
+        headline: 'note',
+        keptUserTurns: [],
+        files: [],
+        noteTokens: 1000
+      }
+    } as Parameters<typeof manager.appendMessage>[0]);
+  }
+  manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: 'ep-1' });
+  manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: 'ep-2' });
+  sent(7000, 5000, minute);
+  // Seven minutes after the request before it began, though both were written just now.
+  sent(11_000, 2000, 8 * minute);
+  let stats = episodeStats(manager.getBranch(), '/repo');
+  assert.deepEqual(
+    stats.folds.each.map((fold) => [fold.handle, fold.uncachedAfter, fold.requests]),
+    [
+      ['ep-1', 0, 2],
+      ['ep-2', 7000, 2]
+    ]
+  );
+  assert.equal(stats.folds.saved, 2 * 2 * 4000);
+  assert.deepEqual(
+    [stats.uncached.afterFold, stats.uncached.missed, stats.uncached.afterPause],
+    [7000, 10_000, 10_000]
+  );
+
+  manager.appendCompaction('summary', null, 13_000);
+  sent(3000, 0, 9 * minute);
+  sent(1000, 3000, 10 * minute);
+  stats = episodeStats(manager.getBranch(), '/repo');
+  assert.equal(stats.folds.saved, 2 * 2 * 4000);
+  assert.deepEqual(
+    stats.folds.each.map((fold) => fold.requests),
+    [2, 2]
   );
 });
 

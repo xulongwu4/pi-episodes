@@ -86,8 +86,11 @@ function spent(fold: FoldCost, rates: CacheRates): number {
  */
 export function breakEven(fold: FoldCost, rates: CacheRates = ASSUMED_RATES): number | undefined {
   if (fold.uncachedAfter === undefined) return undefined;
-  if (fold.net <= 0) return Number.POSITIVE_INFINITY;
-  return Math.ceil(spent(fold, rates) / (fold.net * rates.cached));
+  // Where cached input is free, as where the note is as long as the span, nothing is saved.
+  const saved = fold.net * rates.cached;
+  if (saved <= 0) return Number.POSITIVE_INFINITY;
+  // Rates worked out from costs carry rounding error, which must not add a request.
+  return Math.ceil((spent(fold, rates) / saved) * (1 - 1e-9));
 }
 
 /** The part of a request's usage the rates are read from. */
@@ -97,39 +100,83 @@ interface PricedUsage {
   cacheRead: number;
   cacheWrite: number;
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  /** The model that answered: prices are per model. */
+  model?: string;
 }
+
+/** The mean of the values that are known, each weighted; undefined when none is. */
+function weighted(values: readonly { value: number | undefined; weight: number }[]) {
+  const known = values.filter((entry) => entry.value !== undefined && entry.weight > 0);
+  const weight = sum(known.map((entry) => entry.weight));
+  return weight > 0 ? sum(known.map((entry) => entry.value! * entry.weight)) / weight : undefined;
+}
+
 /**
  * The rates the session's own requests show. Costs come from pi's price table for the model
- * that answered; with several models the rates are the token-weighted mix.
+ * that answered. Each model's rates are worked out from its own requests, since one model's
+ * cached tokens say nothing next to another's input price, and requests without a recorded
+ * cost are left out, since their tokens would count as free. With several models the rates
+ * are the mix, weighted by the tokens each was sent. A cache read recorded at no cost is a
+ * rate of zero, not an unknown one.
  */
 export function cacheRates(usages: readonly PricedUsage[]): CacheRates {
-  const total = { input: 0, output: 0, read: 0, write: 0 };
-  const cost = { input: 0, output: 0, read: 0, write: 0 };
+  const models = new Map<string, Record<'input' | 'output' | 'read' | 'write', number[]>>();
   for (const usage of usages) {
-    total.input += usage.input;
-    total.output += usage.output;
-    total.read += usage.cacheRead;
-    total.write += usage.cacheWrite;
-    cost.input += usage.cost?.input ?? 0;
-    cost.output += usage.cost?.output ?? 0;
-    cost.read += usage.cost?.cacheRead ?? 0;
-    cost.write += usage.cost?.cacheWrite ?? 0;
+    const cost = usage.cost;
+    if (!cost || cost.input + cost.output + cost.cacheRead + cost.cacheWrite <= 0) continue;
+    const key = usage.model ?? '';
+    const model = models.get(key) ?? {
+      input: [0, 0],
+      output: [0, 0],
+      read: [0, 0],
+      write: [0, 0]
+    };
+    models.set(key, model);
+    const add = (part: number[], tokens: number, dollars: number) => {
+      part[0]! += tokens;
+      part[1]! += dollars;
+    };
+    add(model.input, usage.input, cost.input);
+    add(model.output, usage.output, cost.output);
+    add(model.read, usage.cacheRead, cost.cacheRead);
+    add(model.write, usage.cacheWrite, cost.cacheWrite);
   }
-  const inputPrice = total.input > 0 && cost.input > 0 ? cost.input / total.input : undefined;
+  const rates = [...models.values()].flatMap((model) => {
+    const [input, inputCost] = model.input as [number, number];
+    if (input <= 0 || inputCost <= 0) return [];
+    const price = inputCost / input;
+    const rate = ([tokens, dollars]: number[]) =>
+      tokens! > 0 ? dollars! / tokens! / price : undefined;
+    return [
+      {
+        price,
+        cached: rate(model.read),
+        // No cost for the tokens written: the provider bills them as input.
+        write: model.write[1]! > 0 ? rate(model.write) : undefined,
+        output: rate(model.output),
+        weight: input + model.read[0]! + model.write[0]!
+      }
+    ];
+  });
+  const mix = (pick: (model: (typeof rates)[number]) => number | undefined) =>
+    weighted(rates.map((model) => ({ value: pick(model), weight: model.weight })));
+  const inputPrice = mix((model) => model.price);
   const priced = inputPrice === undefined ? {} : { inputPrice };
-  const output =
-    inputPrice !== undefined && cost.output > 0 ? cost.output / total.output / inputPrice : 0;
-  if (usages.length > 1 && total.read === 0) {
+  const output = mix((model) => model.output) ?? 0;
+  const cached = mix((model) => model.cached);
+  if (cached !== undefined && inputPrice !== undefined) {
+    return {
+      cached,
+      write: mix((model) => model.write) ?? 1,
+      output,
+      basis: 'costs',
+      inputPrice
+    };
+  }
+  if (usages.length > 1 && usages.every((usage) => usage.cacheRead === 0)) {
     return { cached: 1, write: 1, output, basis: 'uncached', ...priced };
   }
-  if (inputPrice === undefined || cost.read <= 0) return { ...ASSUMED_RATES, output, ...priced };
-  return {
-    cached: cost.read / total.read / inputPrice,
-    write: cost.write > 0 ? cost.write / total.write / inputPrice : 1,
-    output,
-    basis: 'costs',
-    inputPrice
-  };
+  return ASSUMED_RATES;
 }
 export interface RequestPoint {
   /** Tokens the request was sent with: input plus cache read and write. */
@@ -371,7 +418,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
   let mark: RequestPoint['after'];
   /** Folds still saving on each request, and the one whose first request has not come yet. */
   let inEffect: FoldCost[] = [];
-  let awaiting: FoldCost | undefined;
+  let awaiting: FoldCost[] = [];
   const usages: PricedUsage[] = [];
 
   /** A recall that matched the thread, or an ask of it, within the next few responses. */
@@ -413,14 +460,15 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       const handle = (entry.data as { handle?: string } | undefined)?.handle;
       active += (handle && foldNet.get(handle)) || 0;
       if (handle) {
-        awaiting = {
+        const fold = {
           handle,
           net: foldNet.get(handle) ?? 0,
           note: foldNote.get(handle) ?? 0,
           requests: 0
         };
-        stats.folds.each.push(awaiting);
-        inEffect.push(awaiting);
+        awaiting.push(fold);
+        stats.folds.each.push(fold);
+        inEffect.push(fold);
       }
       mark = 'fold';
       return;
@@ -484,8 +532,9 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       const usage = found.usage;
       const tokens = usage.input + usage.cacheRead + usage.cacheWrite;
       if (tokens === 0) return;
-      usages.push(usage);
-      const at = Date.parse(entry.timestamp);
+      usages.push({ ...usage, model: `${found.provider}/${found.model}` });
+      // The message carries the time its request began; the entry, the time it was written.
+      const at = Number.isFinite(found.timestamp) ? found.timestamp : Date.parse(entry.timestamp);
       stats.requests.push({
         tokens,
         uncached: usage.input + usage.cacheWrite,
@@ -494,12 +543,15 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       });
       if (mark === 'fold') {
         stats.folds.uncachedAfter.push(usage.input + usage.cacheWrite);
-        if (awaiting) {
-          awaiting.uncachedAfter = usage.input + usage.cacheWrite;
-          awaiting.writeAfter = usage.cacheWrite;
-        }
+        // Folds applied at one turn end share the request after them; its miss is counted
+        // once, for the last of them.
+        awaiting.forEach((fold, order) => {
+          const last = order === awaiting.length - 1;
+          fold.uncachedAfter = last ? usage.input + usage.cacheWrite : 0;
+          fold.writeAfter = last ? usage.cacheWrite : 0;
+        });
       }
-      awaiting = undefined;
+      awaiting = [];
       for (const fold of inEffect) fold.requests++;
       mark = undefined;
       stats.folds.saved += active;
@@ -672,7 +724,7 @@ export function statsLines(stats: EpisodeStats): string[] {
   const rates = folds.rates;
   const needed = folds.each.flatMap((fold) => breakEven(fold, rates) ?? []);
   if (needed.length > 0) {
-    const finite = needed.filter(Number.isFinite);
+    const middle = median(needed);
     const paid = folds.each.filter((fold) => fold.requests >= (breakEven(fold, rates) ?? Infinity));
     const basis =
       rates.basis === 'costs'
@@ -686,7 +738,7 @@ export function statsLines(stats: EpisodeStats): string[] {
         ? ''
         : `; ~$${(sum(folds.each.map((fold) => spent(fold, rates))) * price).toFixed(3)} spent on notes and re-sent input, up to ~$${(sum(folds.each.map((fold) => fold.net * fold.requests)) * rates.cached * price).toFixed(3)} saved since`;
     lines.push(
-      `fold cost ${finite.length > 0 ? `break-even after median ${median(finite)} request(s), ` : ''}${paid.length}/${needed.length} folds past it${dollars} (${basis})`
+      `fold cost ${Number.isFinite(middle) ? `break-even after median ${middle} request(s), ${paid.length}/${needed.length} folds past it` : `never breaks even for half the folds or more, ${paid.length}/${needed.length} folds past break-even`}${dollars} (${basis})`
     );
   }
   if (stats.outputs.capped > 0) {
