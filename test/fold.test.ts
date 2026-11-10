@@ -219,6 +219,29 @@ test('a cut-short fold counts the edits earlier handlers queued at the same boun
   );
 });
 
+test('a cut-short fold whose note an edit removed, before it or queued, is not completed', () => {
+  for (const where of ['before', 'queued'] as const) {
+    const { manager } = session(buildLoop);
+    const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2);
+    const noteId = manager.appendMessage(
+      Object.assign(result('f1', 'fold', 'note', 6), {
+        details: {
+          kind: 'fold',
+          handle: plan.handle,
+          firstEntryId: plan.firstEntryId,
+          lastEntryId: plan.lastEntryId
+        }
+      })
+    );
+    if (where === 'before') manager.appendContextEdit(noteId, null);
+    manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
+    apply(manager, plan.edits.slice(0, 1));
+    const pending =
+      where === 'queued' ? [{ type: 'context_edit', targetId: noteId, replacement: null }] : [];
+    assert.deepEqual(completeCutShortFolds(manager.getBranch(), pending), [], where);
+  }
+});
+
 test('a fold whose batch never landed is not completed, whatever later edits touch its span', () => {
   // Without its start entry the fold never took effect; an edit by another extension to a
   // result in its span is not progress of the fold.

@@ -210,6 +210,21 @@ function entryEdit(
   return undefined;
 }
 
+type PendingDraft = { type: string; targetId?: string; replacement?: unknown };
+
+/** Whether the latest edit of an entry, on the branch or among queued drafts, removes it. */
+function removed(
+  id: string,
+  branch: readonly SessionEntry[],
+  pending: readonly PendingDraft[]
+): boolean {
+  let gone = false;
+  for (const entry of [...branch, ...pending]) {
+    if (entry.type === 'context_edit' && entry.targetId === id) gone = entry.replacement === null;
+  }
+  return gone;
+}
+
 /**
  * The rest of the edits of folds cut short partway. An applied fold writes a start entry holding
  * its planned edits, then the edits in that order, then the applied marker; Pi writes them one
@@ -221,7 +236,7 @@ function entryEdit(
  */
 export function completeCutShortFolds(
   branch: readonly SessionEntry[],
-  pending: readonly { type: string; targetId?: string; replacement?: unknown }[] = []
+  pending: readonly PendingDraft[] = []
 ): (ContextEditEntryDraft | { type: 'custom'; customType: string; data: { handle: string } })[] {
   const applied = appliedFolds(branch);
   return branch.flatMap((start, index) => {
@@ -235,7 +250,7 @@ export function completeCutShortFolds(
       }
     }
     const note = branch.find((entry) => foldEntryDetails(entry)?.handle === handle);
-    if (note && latest.get(note.id) === 'null') return [];
+    if (note && removed(note.id, branch, pending)) return [];
     const rest = (edits as ContextEditEntryDraft[]).filter(
       (edit) => latest.get(edit.targetId) !== JSON.stringify(edit.replacement)
     );
@@ -746,6 +761,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
   // so the call and its note stay paired and the next request already sees the fold.
   pi.on('turn_end', (event, ctx) => {
     state.foldResponses.clear();
+    const branch = ctx.sessionManager.getBranch();
     const applied = event.toolResults
       .filter((result) => !result.isError)
       .flatMap((result) => {
@@ -758,9 +774,17 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
           : result.toolName === FOLD_TOOL;
         if (!pending || !stands) return [];
         state.pendingFolds.delete(result.toolCallId);
+        // An earlier handler that removes the note leaves nothing to stand for the span.
+        const note = branch.find(
+          (entry) =>
+            entry.type === 'message' &&
+            entry.message.role === 'toolResult' &&
+            entry.message.toolCallId === result.toolCallId
+        );
+        if (note && removed(note.id, branch, event.entries)) return [];
         return [pending];
       });
-    const repairs = completeCutShortFolds(ctx.sessionManager.getBranch(), event.entries);
+    const repairs = completeCutShortFolds(branch, event.entries);
     if (applied.length === 0 && repairs.length === 0) return undefined;
 
     for (const fold of applied) {

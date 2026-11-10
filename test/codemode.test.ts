@@ -71,7 +71,9 @@ async function createSession(
   settings: Record<string, unknown> = {},
   compaction: Record<string, unknown> = {},
   /** Entries to resume from, as after a restart. */
-  entries?: Parameters<typeof SessionManager.inMemory>[2]
+  entries?: Parameters<typeof SessionManager.inMemory>[2],
+  /** Extensions whose handlers run before those of episodes. */
+  before: ExtensionFactory[] = []
 ) {
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-codemode-'));
   const faux = fauxProvider();
@@ -96,6 +98,7 @@ async function createSession(
     extensionFactories: [
       (pi) => pi.registerProvider(faux.provider),
       ...(mode === 'off' ? [] : [createCodemodeExtension({ models: false })]),
+      ...before,
       episodes,
       ...extensions
     ]
@@ -1095,5 +1098,56 @@ test('a fold cut short partway through its edits is completed at the next turn e
     assert.equal(threadRecords(resumed.session.sessionManager.getBranch()).length, 1);
   } finally {
     await resumed.cleanup();
+  }
+});
+
+test('a fold whose note an earlier turn-end handler removes does not take effect', async () => {
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo kept-output' }), {
+          stopReason: 'toolUse'
+        }),
+      () =>
+        fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'n' }), {
+          stopReason: 'toolUse'
+        }),
+      (context) => {
+        assert.match(conversation(context).map(text).join('\n'), /kept-output/);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    [],
+    {},
+    {},
+    undefined,
+    [
+      (pi) => {
+        pi.on('turn_end', (event, ctx) => {
+          const note = ctx.sessionManager
+            .getBranch()
+            .find(
+              (entry) =>
+                entry.type === 'message' &&
+                entry.message.role === 'toolResult' &&
+                entry.message.toolName === 'fold'
+            );
+          if (!note) return undefined;
+          return {
+            entries: [
+              ...event.entries,
+              { type: 'context_edit' as const, targetId: note.id, replacement: null }
+            ]
+          };
+        });
+      }
+    ]
+  );
+  try {
+    await harness.run('go');
+    assert.equal(threadRecords(harness.session.sessionManager.getBranch()).length, 0);
+  } finally {
+    await harness.cleanup();
   }
 });
