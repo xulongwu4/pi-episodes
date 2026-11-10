@@ -237,16 +237,18 @@ Runs vary a lot between attempts. Unless a section says otherwise, run each cond
 
 **Pass.** Equal outcome, no more tool calls, and a cost difference in the direction the cut sizes predict.
 
-**Result.** 2026-11-10, gpt-6-luna at low thinking, one session per condition, a 97-turn task, pi 1.4.0, commit 125ea30.
+**Result.** 2026-11-10, gpt-6-luna at low thinking, a 97-turn task, pi 1.4.0, commit 125ea30. Three sessions per condition under codemode, one with the built-in tools. Cost includes forks.
 
-| | Cost | Peak context | Model calls | Results cut | Tokens kept out | Final quiz | Turn checks |
-|---|---|---|---|---|---|---|---|
-| codemode, cap on | $0.194 | 89k | 290 | 36 | ~220k | 12/12 | 218/228 |
-| codemode, cap off | $0.278 | 87k | 421 | | | 12/12 | 143/228 |
-| built-in tools, cap on | $0.305 | 99k | 315 | 3 | ~22k | 12/12 | 223/228 |
-| built-in tools, cap off | $0.378 | 212k | 299 | | | 12/12 | 226/228 |
+| | Sessions | Cost | Peak context | Model calls | Results cut | Tokens kept out | Final quiz | Turn checks of 228 |
+|---|---|---|---|---|---|---|---|---|
+| codemode, cap on | 3 | $0.209 ($0.194, $0.234, $0.200) | 84k to 94k | 290, 326, 305 | 36, 50, 78 | ~220k, ~333k, ~507k | 12/12 each | 218, 164, 205 |
+| codemode, cap off | 3 | $0.261 ($0.278, $0.246, $0.261) | 82k to 87k | 421, 265, 349 | | | 12/12 each | 143, 205, 209 |
+| built-in tools, cap on | 1 | $0.305 | 99k | 315 | 3 | ~22k | 12/12 | 223 |
+| built-in tools, cap off | 1 | $0.378 | 212k | 299 | | | 12/12 | 226 |
 
-No call in either capped run named a cut result's file. From the cut sizes alone, with each cut result staying a median of 31 requests, the cap saved about $0.09 under codemode, which is near the $0.08 measured, and under $0.01 with the built-in tools, where `read` returned 51 results of 16,000 characters or more and is not cut. The built-in pair therefore shows how far two runs differ with the cap nearly idle: one cost 24% more than the other. With that much spread, the 43% between the codemode runs cannot be credited to the cap from one pair; one session per condition supports "no harm seen, saving plausible under codemode" and no more. The codemode run without the cap also made 131 more model calls for reasons that have nothing to do with it. Repeat at three sessions per condition before quoting a percentage.
+Under codemode the cap lowered cost by 20% on average ($0.052; the two sets of three do not overlap, the closest pair being $0.011 apart and the farthest $0.084), at the same quiz score and with turn checks no worse. No call in any capped run named a cut result's file, so the model did not go back for what was cut. The saving worked out from the cut sizes alone was $0.09 to $0.17 per session, two to three times what was measured: without the cap the fold nudge fires sooner, so a large result does not stay as long as that sum assumes. Peak context is the same either way for the same reason.
+
+With the built-in tools the cap is nearly idle: `read` returned 51 results of 16,000 characters or more in the capped session and is not cut. Those two sessions still differ by 24%, which is the spread between runs and says nothing about the cap. One codemode session without the cap stopped at turn 67 on a provider error (`{"detail":"Bad Request"}`) and was rerun; it is not in the table.
 
 <br />
 
