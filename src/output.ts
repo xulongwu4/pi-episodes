@@ -1,13 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ImageContent, TextContent } from '@earendil-works/pi-ai';
 
 /** Key in a tool result's `details` that says where the text it was cut from is kept. */
 export const CAPPED_KEY = 'episodesOutput';
-/** A first text block up to this long is taken for a tool's status header and left alone. */
-const HEADER_CHARS = 200;
+/** The status block that opens a codemode result, as codemode's renderer looks for it. */
+const SCRIPT_HEADER = /^Script (completed|failed)\nWall time [\d.]+ seconds\nOutput:\n$/;
 
 export interface CappedOutput {
   /** File holding the text the preview was cut from. */
@@ -49,7 +49,8 @@ function tail(text: string, chars: number): string {
  * Cuts a tool result of `limit` characters or more down to about `keep`: the start and the
  * end, two to one, around a line naming the file that holds all of it. The file is written
  * before the result is changed, so a preview never points at text that was not kept.
- * Undefined when the result is under the limit.
+ * Undefined when the result is under the limit, or has an image between its text blocks:
+ * one preview could not keep that order.
  */
 export async function capOutput(
   content: readonly Block[],
@@ -58,11 +59,16 @@ export async function capOutput(
   keep: number
 ): Promise<{ content: Block[]; capped: CappedOutput } | undefined> {
   const first = content[0];
-  // codemode's result opens with a short status block that its renderer looks for there.
-  const header =
-    first?.type === 'text' && first.text.length <= HEADER_CHARS && content.length > 1 ? 1 : 0;
-  const body = content.slice(header);
-  const text = body
+  // That block stays where the renderer looks for it; it is not part of the output.
+  const header = first?.type === 'text' && SCRIPT_HEADER.test(first.text) ? 1 : 0;
+  const texts = content.flatMap((block, index) =>
+    index >= header && block.type === 'text' ? [index] : []
+  );
+  const from = texts[0];
+  const to = texts.at(-1);
+  if (from === undefined || to === undefined || to - from + 1 !== texts.length) return undefined;
+  const text = content
+    .slice(from, to + 1)
     .flatMap((block) => (block.type === 'text' ? [block.text] : []))
     .join('\n')
     .toWellFormed();
@@ -74,20 +80,21 @@ export async function capOutput(
   await mkdir(dir, { recursive: true });
   // Parallel results with the same text must not share a temporary file.
   const temporary = `${path}.${randomUUID()}.tmp`;
-  await writeFile(temporary, text);
-  await rename(temporary, path);
+  try {
+    await writeFile(temporary, text);
+    await rename(temporary, path);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
 
   const start = head(text, Math.floor((keep * 2) / 3));
   const end = tail(text, Math.floor(keep / 3));
   const omitted = text.length - start.length - end.length;
   const preview = `${start}\n\n[episodes] ${omitted} of ${text.length} characters left out here. All of this output is in ${path}; grep it or read a slice, not the whole file. recall searches it once it is folded.\n\n${end}`;
   return {
-    content: [
-      ...content.slice(0, header),
-      { type: 'text', text: preview },
-      ...body.filter((block) => block.type !== 'text')
-    ],
-    capped: { path, chars: text.length, block: header }
+    content: [...content.slice(0, from), { type: 'text', text: preview }, ...content.slice(to + 1)],
+    capped: { path, chars: text.length, block: from }
   };
 }
 
@@ -98,7 +105,14 @@ export async function capOutput(
 export async function withFullOutput(message: AgentMessage): Promise<AgentMessage> {
   if (message.role !== 'toolResult') return message;
   const capped = cappedOutput(message.details);
-  if (!capped || message.content[capped.block]?.type !== 'text') return message;
+  if (!capped) return message;
+  // The preview names its file. A handler that ran after the cut can have put a block before
+  // it, so the recorded index is only where to look first.
+  const at = [capped.block, ...message.content.keys()].find((index) => {
+    const block = message.content[index];
+    return block?.type === 'text' && block.text.includes(capped.path);
+  });
+  if (at === undefined) return message;
   let text: string;
   try {
     text = await readFile(capped.path, 'utf8');
@@ -107,8 +121,6 @@ export async function withFullOutput(message: AgentMessage): Promise<AgentMessag
   }
   return {
     ...message,
-    content: message.content.map((block, index) =>
-      index === capped.block ? { type: 'text', text } : block
-    )
+    content: message.content.map((block, index) => (index === at ? { type: 'text', text } : block))
   };
 }

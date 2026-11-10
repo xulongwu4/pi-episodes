@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -47,21 +48,72 @@ test('a large result keeps its start and end and names the file with all of it',
   }
 });
 
-test('a short first block and images stay as they are', async () => {
+test('the header of a script result and images stay where they are', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
   try {
     const image = { type: 'image' as const, data: 'AAAA', mimeType: 'image/png' };
+    const header = {
+      type: 'text' as const,
+      text: 'Script completed\nWall time 0.2 seconds\nOutput:\n'
+    };
     const cut = await capOutput(
-      [{ type: 'text', text: 'Script completed\nOutput:\n' }, { type: 'text', text: long }, image],
+      [header, image, { type: 'text', text: long }, image],
       dir,
       1000,
       300
     );
     assert.ok(cut);
-    assert.deepEqual(cut.content[0], { type: 'text', text: 'Script completed\nOutput:\n' });
-    assert.equal(cut.capped.block, 1);
-    assert.deepEqual(cut.content[2], image);
+    assert.deepEqual(
+      cut.content.map((block) => (block.type === 'text' ? block.text.slice(0, 6) : 'image')),
+      ['Script', 'image', 'line 0', 'image']
+    );
+    assert.equal(cut.capped.block, 2);
     assert.equal(await readFile(cut.capped.path, 'utf8'), long);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a short first block of another tool is part of the output and of its file', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    const cut = await capOutput(
+      [
+        { type: 'text', text: 'Found 400 lines:' },
+        { type: 'text', text: long }
+      ],
+      dir,
+      1000,
+      300
+    );
+    assert.ok(cut);
+    assert.equal(cut.content.length, 1);
+    assert.equal(cut.capped.block, 0);
+    assert.equal(await readFile(cut.capped.path, 'utf8'), `Found 400 lines:\n${long}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a result with an image between its text blocks is left whole', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    const image = { type: 'image' as const, data: 'AAAA', mimeType: 'image/png' };
+    const text = { type: 'text' as const, text: long };
+    assert.equal(await capOutput([text, image, text], dir, 1000, 300), undefined);
+    assert.deepEqual(await readdir(dir), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a file that cannot be put in place leaves no temporary file', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    const name = `output-${createHash('sha256').update(long).digest('hex').slice(0, 16)}.txt`;
+    await mkdir(join(dir, name));
+    await assert.rejects(capOutput([{ type: 'text', text: long }], dir, 1000, 300));
+    assert.deepEqual(await readdir(dir), [name]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -87,6 +139,15 @@ test('the full text is put back for search, under the stamp', async () => {
     assert.ok(full.role === 'toolResult');
     assert.deepEqual(full.content[0], { type: 'text', text: long });
     assert.equal(readStamp(full), 7);
+
+    // A handler that ran after the cut put a block first: the preview is found by its file.
+    const notice = { type: 'text' as const, text: 'a notice' };
+    const moved = await withFullOutput({ ...message, content: [notice, ...message.content] });
+    assert.ok(moved.role === 'toolResult');
+    assert.deepEqual(moved.content.slice(0, 2), [notice, { type: 'text', text: long }]);
+    // Without the preview nothing is put back.
+    const replaced = { ...message, content: withStamp([notice], 7) };
+    assert.equal(await withFullOutput(replaced), replaced);
 
     // A file that is gone leaves the preview, which is what the model saw.
     await rm(cut.capped.path);
