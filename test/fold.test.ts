@@ -264,7 +264,7 @@ test('a cut-short fold counts the edits earlier handlers queued at the same boun
   );
 });
 
-test('a cut-short fold whose note an edit removed gets its marker and no more edits', () => {
+test('a cut-short fold whose note an edit removed is completed like any other', () => {
   for (const where of ['before', 'after', 'queued'] as const) {
     const { manager } = session(buildLoop);
     const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2);
@@ -285,13 +285,17 @@ test('a cut-short fold whose note an edit removed gets its marker and no more ed
     const pending =
       where === 'queued' ? [{ type: 'context_edit', targetId: noteId, replacement: null }] : [];
     assert.equal(cutShortFold(manager.getBranch()), plan.handle, where);
-    // What already left the context is on record, and the rest of the span stays in it.
+    // The whole span leaves the context, so the record holds no part a later fold can take.
     const rest = completeCutShortFolds(manager.getBranch(), pending);
     assert.deepEqual(
       rest,
-      [{ type: 'custom', customType: FOLD_APPLIED_TYPE, data: { handle: plan.handle } }],
+      [
+        ...plan.edits.slice(1),
+        { type: 'custom', customType: FOLD_APPLIED_TYPE, data: { handle: plan.handle } }
+      ],
       where
     );
+    apply(manager, plan.edits.slice(1));
     manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
     assert.deepEqual(
       foldRecords(manager.getBranch()).map((record) => record.handle),

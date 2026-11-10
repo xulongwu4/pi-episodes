@@ -19,7 +19,6 @@ import {
   FOLD_STARTED_TYPE,
   FOLD_TOOL,
   type FoldDetails,
-  foldEntryDetails,
   foldNoteDetails,
   ThreadIndex
 } from './archive.js';
@@ -282,10 +281,11 @@ function removed(
  * done to its target since: a span removed in part must not keep a result whose call is gone.
  * The cut of a user message only saves tokens, so an edit made to that message after the fold
  * started, by anyone, stands and the cut is not written over it. A fold without a start entry
- * never took effect. One whose note another extension has removed since gets only the marker:
- * nothing more leaves the context in the name of a note that is gone, and what did leave is
- * on record for recall. No fold of this extension removes that note, because fold refuses to
- * run while a start entry has no marker.
+ * never took effect. One whose note another extension has removed since is completed like any
+ * other: its record then says what a fold removed whole and lost its note afterwards says,
+ * and no part of the span stays in context for a later fold to archive a second time. No fold
+ * of this extension removes that note, because fold refuses to run while a start entry has
+ * no marker.
  * `pending` holds the drafts earlier handlers of this boundary queued, which land first.
  */
 export function completeCutShortFolds(
@@ -304,8 +304,6 @@ export function completeCutShortFolds(
       }
     }
     const marker = { type: 'custom' as const, customType: FOLD_APPLIED_TYPE, data: { handle } };
-    const note = branch.find((entry) => foldEntryDetails(entry)?.handle === handle);
-    if (note && removed(note.id, branch, pending)) return [marker];
     const rest = (edits as ContextEditEntryDraft[]).filter((edit) => {
       const now = latest.get(edit.targetId);
       if (now === JSON.stringify(edit.replacement)) return false;
@@ -960,7 +958,9 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     const repairs = completeCutShortFolds(branch, event.entries);
     if (applied.length === 0 && repairs.length === 0) return undefined;
     // The cut of a user message only saves tokens, so an edit an earlier handler queued for
-    // that message stands, as it does when a cut-short fold is completed.
+    // that message stands, as it does when a cut-short fold is completed. The note was written
+    // before this boundary: if that edit removes the message, the note still lists its turn
+    // among the ones that stay.
     const edited = new Set(
       (event.entries as readonly PendingDraft[]).flatMap((draft) =>
         draft.type === 'context_edit' && draft.targetId !== undefined ? [draft.targetId] : []
