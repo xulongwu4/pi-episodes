@@ -266,6 +266,9 @@ test('a fold with until removes old turns and keeps the work after them', async 
     await harness.session.prompt('go');
     if (harness.failures[0]) throw harness.failures[0];
     assert.equal(harness.pending(), 0);
+    const stats = episodeStats(harness.session.sessionManager.getBranch(), harness.dir);
+    assert.equal(stats.folds.bounded, 1);
+    assert.ok(statsLines(stats).some((line) => /^folds 1, .*1 ending at until/.test(line)));
   } finally {
     await harness.cleanup();
   }

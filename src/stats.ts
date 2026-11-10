@@ -24,10 +24,33 @@ const SMALL_SPAN_TOKENS = 2000;
 const FOLLOW_WINDOW = 3;
 
 /**
- * What a cached input token costs next to an uncached one: 0.1 at Anthropic and for OpenAI's
- * current models. An assumption, since the session does not record prices.
+ * What a cached input token costs next to an uncached one when the session recorded no
+ * prices: 0.1 at Anthropic and for OpenAI's current models.
  */
-const CACHED_RATE = 0.1;
+const ASSUMED_CACHED_RATE = 0.1;
+
+/** What cached input and cache writes cost next to uncached input, and where that is from. */
+export interface CacheRates {
+  cached: number;
+  /** 1 where the provider does not bill cache writes apart from input. */
+  write: number;
+  /** An output token next to an uncached input one; 0 when no costs say, and notes then count as free. */
+  output: number;
+  /**
+   * `costs`: the prices the session's requests were recorded with. `uncached`: no request
+   * read anything from cache, so cached input costs what uncached does. `assumed`: neither.
+   */
+  basis: 'costs' | 'uncached' | 'assumed';
+  /** Dollars per uncached input token, when the session recorded costs. */
+  inputPrice?: number;
+}
+
+const ASSUMED_RATES: CacheRates = {
+  cached: ASSUMED_CACHED_RATE,
+  write: 1,
+  output: 0,
+  basis: 'assumed'
+};
 
 export interface FoldCost {
   handle: string;
@@ -35,21 +58,78 @@ export interface FoldCost {
   net: number;
   /** Input not read from cache on the first request after it; absent before that request. */
   uncachedAfter?: number;
+  /** Estimated tokens of its note, which the model wrote as output. */
+  note?: number;
+  /** The part of it written to the cache, which some providers bill above the input price. */
+  writeAfter?: number;
   /** Requests it has been in effect for, up to a compaction. */
   requests: number;
 }
 
 /**
- * Requests a fold must stay in effect for before it has saved more than it cost. It cost the
- * input the next request sent at the full rate instead of the cached one; every request it
- * is in effect for then saves its net tokens at the cached rate. That first request's miss
- * also holds what it would have sent uncached without the fold, so the result errs high.
- * Infinity for a note as long as its span; undefined before the first request.
+ * What a fold cost, in tokens at the input price: the model wrote its note as output, and the
+ * next request sent its miss at the full or the cache write rate instead of the cached one. A
+ * miss that would have happened without the fold, such as a cache that expired while the user
+ * was away, is counted too.
  */
-export function breakEven(fold: FoldCost): number | undefined {
+function spent(fold: FoldCost, rates: CacheRates): number {
+  const write = fold.writeAfter ?? 0;
+  const input = (fold.uncachedAfter ?? 0) - write;
+  const resent = input * (1 - rates.cached) + write * (rates.write - rates.cached);
+  return Math.max(0, resent) + (fold.note ?? 0) * rates.output;
+}
+
+/**
+ * Requests a fold must stay in effect for before it has saved more than it cost: every
+ * request it is in effect for saves its net tokens at the cached rate. Infinity for a note as
+ * long as its span; undefined before the first request.
+ */
+export function breakEven(fold: FoldCost, rates: CacheRates = ASSUMED_RATES): number | undefined {
   if (fold.uncachedAfter === undefined) return undefined;
   if (fold.net <= 0) return Number.POSITIVE_INFINITY;
-  return Math.ceil((fold.uncachedAfter * (1 - CACHED_RATE)) / (fold.net * CACHED_RATE));
+  return Math.ceil(spent(fold, rates) / (fold.net * rates.cached));
+}
+
+/** The part of a request's usage the rates are read from. */
+interface PricedUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+}
+/**
+ * The rates the session's own requests show. Costs come from pi's price table for the model
+ * that answered; with several models the rates are the token-weighted mix.
+ */
+export function cacheRates(usages: readonly PricedUsage[]): CacheRates {
+  const total = { input: 0, output: 0, read: 0, write: 0 };
+  const cost = { input: 0, output: 0, read: 0, write: 0 };
+  for (const usage of usages) {
+    total.input += usage.input;
+    total.output += usage.output;
+    total.read += usage.cacheRead;
+    total.write += usage.cacheWrite;
+    cost.input += usage.cost?.input ?? 0;
+    cost.output += usage.cost?.output ?? 0;
+    cost.read += usage.cost?.cacheRead ?? 0;
+    cost.write += usage.cost?.cacheWrite ?? 0;
+  }
+  const inputPrice = total.input > 0 && cost.input > 0 ? cost.input / total.input : undefined;
+  const priced = inputPrice === undefined ? {} : { inputPrice };
+  const output =
+    inputPrice !== undefined && cost.output > 0 ? cost.output / total.output / inputPrice : 0;
+  if (usages.length > 1 && total.read === 0) {
+    return { cached: 1, write: 1, output, basis: 'uncached', ...priced };
+  }
+  if (inputPrice === undefined || cost.read <= 0) return { ...ASSUMED_RATES, output, ...priced };
+  return {
+    cached: cost.read / total.read / inputPrice,
+    write: cost.write > 0 ? cost.write / total.write / inputPrice : 1,
+    output,
+    basis: 'costs',
+    inputPrice
+  };
 }
 export interface RequestPoint {
   /** Tokens the request was sent with: input plus cache read and write. */
@@ -70,6 +150,8 @@ export interface EpisodeStats {
     tokens: number;
     spanTokens: number[];
     small: number;
+    /** Folds that stopped at `until` and left later turns in the context. */
+    bounded: number;
     noteTokens: number;
     /** Folds sharing their response with other tool calls, which the prompt asks against. */
     notAlone: number;
@@ -88,6 +170,8 @@ export interface EpisodeStats {
     uncachedAfter: number[];
     /** Each fold in the order applied, to tell which have paid for themselves. */
     each: FoldCost[];
+    /** What the break-even of each fold is worked out with. */
+    rates: CacheRates;
     /** Folds whose request reported on the anchor, and those where it was placed. */
     anchorKnown: number;
     anchored: number;
@@ -182,6 +266,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       tokens: 0,
       spanTokens: [],
       small: 0,
+      bounded: 0,
       noteTokens: 0,
       notAlone: 0,
       beforeFinal: 0,
@@ -190,6 +275,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       retriedOk: 0,
       uncachedAfter: [],
       each: [],
+      rates: ASSUMED_RATES,
       anchorKnown: 0,
       anchored: 0,
       gapTokens: []
@@ -208,12 +294,14 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
 
   const applied = appliedFolds(entries);
   const foldNet = new Map<string, number>();
+  const foldNote = new Map<string, number>();
   /** Net tokens of folds in effect, saved again on every request until a compaction. */
   let active = 0;
   let mark: RequestPoint['after'];
   /** Folds still saving on each request, and the one whose first request has not come yet. */
   let inEffect: FoldCost[] = [];
   let awaiting: FoldCost | undefined;
+  const usages: PricedUsage[] = [];
 
   /** A recall that matched the thread, or an ask of it, within the next few responses. */
   const followed = (index: number, handle: string) => {
@@ -254,7 +342,12 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       const handle = (entry.data as { handle?: string } | undefined)?.handle;
       active += (handle && foldNet.get(handle)) || 0;
       if (handle) {
-        awaiting = { handle, net: foldNet.get(handle) ?? 0, requests: 0 };
+        awaiting = {
+          handle,
+          net: foldNet.get(handle) ?? 0,
+          note: foldNote.get(handle) ?? 0,
+          requests: 0
+        };
         stats.folds.each.push(awaiting);
         inEffect.push(awaiting);
       }
@@ -320,10 +413,14 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       const usage = found.usage;
       const tokens = usage.input + usage.cacheRead + usage.cacheWrite;
       if (tokens === 0) return;
+      usages.push(usage);
       stats.requests.push(mark ? { tokens, after: mark } : { tokens });
       if (mark === 'fold') {
         stats.folds.uncachedAfter.push(usage.input + usage.cacheWrite);
-        if (awaiting) awaiting.uncachedAfter = usage.input + usage.cacheWrite;
+        if (awaiting) {
+          awaiting.uncachedAfter = usage.input + usage.cacheWrite;
+          awaiting.writeAfter = usage.cacheWrite;
+        }
       }
       awaiting = undefined;
       for (const fold of inEffect) fold.requests++;
@@ -356,8 +453,10 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       folds.tokens += fold.tokens;
       folds.spanTokens.push(fold.tokens);
       if (fold.tokens < SMALL_SPAN_TOKENS) folds.small++;
+      if (fold.keptFrom) folds.bounded++;
       folds.noteTokens += fold.noteTokens ?? 0;
       foldNet.set(fold.handle, Math.max(0, fold.tokens - (fold.noteTokens ?? 0)));
+      foldNote.set(fold.handle, fold.noteTokens ?? 0);
       if (fold.anchor?.placed !== undefined) {
         folds.anchorKnown++;
         if (fold.anchor.placed) folds.anchored++;
@@ -410,6 +509,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
     }
   });
 
+  stats.folds.rates = cacheRates(usages);
   return stats;
 }
 
@@ -447,6 +547,9 @@ function median(values: readonly number[]): number {
     : Math.round((sorted[middle - 1]! + sorted[middle]!) / 2);
 }
 
+function sum(values: readonly number[]): number {
+  return values.reduce((total, value) => total + value, 0);
+}
 function average(values: readonly number[]): number {
   return Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
 }
@@ -472,6 +575,7 @@ export function statsLines(stats: EpisodeStats): string[] {
       [folds.pickedByUser, 'span picked by you'],
       [folds.requestedByUser, 'asked by you'],
       [folds.small, 'under 2k'],
+      [folds.bounded, 'ending at until'],
       [folds.notAlone, 'not alone in their response'],
       [folds.beforeFinal, 'right before a final reply']
     );
@@ -487,12 +591,24 @@ export function statsLines(stats: EpisodeStats): string[] {
       `context ~${k(folds.tokens)} folded, ~${k(folds.saved)} fewer tokens sent since, compactions ${stats.compactions}`
     );
   }
-  const needed = folds.each.flatMap((fold) => breakEven(fold) ?? []);
+  const rates = folds.rates;
+  const needed = folds.each.flatMap((fold) => breakEven(fold, rates) ?? []);
   if (needed.length > 0) {
     const finite = needed.filter(Number.isFinite);
-    const paid = folds.each.filter((fold) => fold.requests >= (breakEven(fold) ?? Infinity));
+    const paid = folds.each.filter((fold) => fold.requests >= (breakEven(fold, rates) ?? Infinity));
+    const basis =
+      rates.basis === 'costs'
+        ? `cached input at ${Math.round(rates.cached * 100)}% of the input price, from recorded costs`
+        : rates.basis === 'uncached'
+          ? 'nothing was read from cache, so a fold costs only its note'
+          : `cached input counted at ${rates.cached * 100}%`;
+    const price = rates.inputPrice;
+    const dollars =
+      price === undefined
+        ? ''
+        : `; ~$${(sum(folds.each.map((fold) => spent(fold, rates))) * price).toFixed(3)} spent on notes and re-sent input, up to ~$${(sum(folds.each.map((fold) => fold.net * fold.requests)) * rates.cached * price).toFixed(3)} saved since`;
     lines.push(
-      `fold cost ${finite.length > 0 ? `break-even after median ${median(finite)} request(s), ` : ''}${paid.length}/${needed.length} folds past it (cached input counted at ${CACHED_RATE * 100}%)`
+      `fold cost ${finite.length > 0 ? `break-even after median ${median(finite)} request(s), ` : ''}${paid.length}/${needed.length} folds past it${dollars} (${basis})`
     );
   }
   if (stats.outputs.capped > 0) {
