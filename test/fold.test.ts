@@ -63,7 +63,7 @@ test('folds from the response behind since and keeps user messages from the span
   assert.equal(plan.omitted.length, 4);
   assert.deepEqual(
     plan.edits.map((edit) => [edit.targetId, edit.replacement]),
-    [ids[3], ids[4], ids[6], ids[7]].map((id) => [id, null])
+    [ids[7], ids[6], ids[4], ids[3]].map((id) => [id, null])
   );
 
   apply(manager, plan.edits);
@@ -80,6 +80,30 @@ test('folds from the response behind since and keeps user messages from the span
   ]);
   assert.equal(readStamp(view.filter((message) => message.role === 'user')[1]!), 4);
   assertPaired(view);
+});
+
+test('every prefix of the edits of a fold leaves each tool result next to its call', () => {
+  const { manager, ids } = session(buildLoop);
+  const { edits } = planFold(manager.buildSessionProjection().entries, 'f1', 2);
+  assert.ok(edits.length > 2);
+  // Pi writes the edits one at a time; a crash after any of them must leave a valid context.
+  for (let applied = 0; applied <= edits.length; applied++) {
+    const { manager: partial, ids: same } = session(buildLoop);
+    const prefix = edits.slice(0, applied);
+    apply(
+      partial,
+      prefix.map((edit) => ({ ...edit, targetId: same[ids.indexOf(edit.targetId)]! }))
+    );
+    partial.appendMessage(result('f1', 'fold', 'note', 6));
+    const llm = convertToLlm([...partial.buildSessionProjection().messages]);
+    const called = new Set<string>();
+    for (const message of llm) {
+      if (message.role === 'assistant') {
+        for (const block of message.content) if (block.type === 'toolCall') called.add(block.id);
+      }
+      if (message.role === 'toolResult') assert.ok(called.has(message.toolCallId), `${applied}`);
+    }
+  }
 });
 
 test('a stamp on one result of a parallel batch folds the whole batch', () => {

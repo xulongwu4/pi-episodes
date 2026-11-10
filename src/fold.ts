@@ -347,6 +347,11 @@ export function planFold(
     // System messages, compaction checkpoints and `!` commands are not editable and stay.
   }
 
+  // Pi writes these edits one entry at a time, so a crash can apply only some of them. Removing
+  // the span from its end keeps every applied prefix a valid context: a call that lost its
+  // result gets a placeholder from pi-ai, but a result whose call is gone reaches the provider.
+  edits.reverse();
+
   let anchorStamp: number | undefined;
   for (let index = startIndex - 1; index >= 0 && anchorStamp === undefined; index--) {
     anchorStamp = entries[index]!.messages.map(readStamp).findLast((stamp) => stamp !== undefined);
@@ -712,6 +717,9 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     return {
       entries: [
         ...event.entries,
+        // The marker goes last. A fold cut short leaves part of its span removed, a valid
+        // context, and no applied note; a marker written first would leave the rest of the span
+        // stuck behind a note no fold can reach past.
         ...applied.flatMap((fold) => [
           ...fold.edits,
           { type: 'custom' as const, customType: FOLD_APPLIED_TYPE, data: { handle: fold.handle } }
