@@ -211,47 +211,31 @@ function entryEdit(
 }
 
 /**
- * The rest of the edits of folds cut short partway. An applied fold writes a start entry naming
- * its edit targets, then its edits in that order, then the applied marker; Pi writes them one at
- * a time, so a crash can stop the batch midway. A start entry without a marker: the targets after
- * the edits that landed still need their edits, then the marker. Only edits right after the
- * start entry count as landed, so another extension's edit is never taken for the fold's own.
- * A fold whose note a later fold hid is left alone: the later fold stands for its span.
+ * The rest of the edits of folds cut short partway. An applied fold writes a start entry holding
+ * its planned edits, then the edits in that order, then the applied marker; Pi writes them one
+ * at a time, so a crash can stop the batch midway. For a start entry without a marker, each
+ * planned edit whose target does not already carry that replacement, as its latest edit, is
+ * written again, in the planned order, then the marker. A fold without a start entry never took
+ * effect, and one whose note a later edit hid is left alone: the later fold stands for its span.
  */
 export function completeCutShortFolds(
   branch: readonly SessionEntry[]
 ): (ContextEditEntryDraft | { type: 'custom'; customType: string; data: { handle: string } })[] {
   const applied = appliedFolds(branch);
-  const byId = new Map(branch.map((entry) => [entry.id, entry]));
   return branch.flatMap((start, index) => {
     if (start.type !== 'custom' || start.customType !== FOLD_STARTED_TYPE) return [];
-    const { handle, targets } = (start.data ?? {}) as { handle?: unknown; targets?: unknown };
-    if (typeof handle !== 'string' || applied.has(handle) || !Array.isArray(targets)) return [];
-    let landed = 0;
-    while (landed < targets.length) {
-      const entry = branch[index + 1 + landed];
-      if (entry?.type !== 'context_edit' || entry.targetId !== targets[landed]) break;
-      landed++;
+    const { handle, edits } = (start.data ?? {}) as { handle?: unknown; edits?: unknown };
+    if (typeof handle !== 'string' || applied.has(handle) || !Array.isArray(edits)) return [];
+    const latest = new Map<string, string>();
+    for (const entry of branch.slice(index + 1)) {
+      if (entry.type === 'context_edit')
+        latest.set(entry.targetId, JSON.stringify(entry.replacement));
     }
-    const later = branch.slice(index + 1);
     const note = branch.find((entry) => foldEntryDetails(entry)?.handle === handle);
-    if (
-      note &&
-      later.some((entry) => entry.type === 'context_edit' && entry.targetId === note.id)
-    ) {
-      return [];
-    }
-    const rest = targets.slice(landed).flatMap((id): ContextEditEntryDraft[] => {
-      const source = typeof id === 'string' ? byId.get(id) : undefined;
-      if (!source) return [];
-      if (source.type === 'message' && source.message.role === 'user') {
-        const capped = capUserContent(source.message.content, handle);
-        return capped
-          ? [{ type: 'context_edit', targetId: id, replacement: { content: capped } }]
-          : [];
-      }
-      return [{ type: 'context_edit', targetId: id, replacement: null }];
-    });
+    if (note && latest.get(note.id) === 'null') return [];
+    const rest = (edits as ContextEditEntryDraft[]).filter(
+      (edit) => latest.get(edit.targetId) !== JSON.stringify(edit.replacement)
+    );
     return [...rest, { type: 'custom' as const, customType: FOLD_APPLIED_TYPE, data: { handle } }];
   });
 }
@@ -793,7 +777,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
           {
             type: 'custom' as const,
             customType: FOLD_STARTED_TYPE,
-            data: { handle: fold.handle, targets: fold.edits.map((edit) => edit.targetId) }
+            data: { handle: fold.handle, edits: fold.edits }
           },
           ...fold.edits,
           { type: 'custom' as const, customType: FOLD_APPLIED_TYPE, data: { handle: fold.handle } }

@@ -25,9 +25,8 @@ export const FOLD_REQUEST_TYPE = 'episodes-fold-request';
  */
 export const FOLD_APPLIED_TYPE = 'episodes-fold-applied';
 /**
- * Written first in a fold's batch, with the fold's handle and the targets of its edits in the
- * order they follow. It tells a fold cut short from one that never took effect, and which of its
- * edits landed.
+ * Written first in a fold's batch, with the fold's handle and the edits that follow, in order.
+ * It tells a fold cut short from one that never took effect, and holds the edits still to write.
  */
 export const FOLD_STARTED_TYPE = 'episodes-fold-started';
 /**

@@ -120,9 +120,9 @@ test('the rest of a fold cut short after any of its edits completes it', () => {
       }
     });
     const noteId = made.manager.appendMessage(note);
-    const targets = plan.edits.map((edit) => edit.targetId);
-    if (started)
-      made.manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, targets });
+    if (started) {
+      made.manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
+    }
     return { ...made, plan, noteId };
   };
   const done = build(true);
@@ -160,6 +160,43 @@ test('the rest of a fold cut short after any of its edits completes it', () => {
     assert.deepEqual(roles(manager.buildSessionProjection().messages), folded, `${applied}`);
     assert.deepEqual(completeCutShortFolds(manager.getBranch()), []);
   }
+});
+
+test('a cut-short fold is completed over edits that other extensions made to its span', () => {
+  const { manager } = session(buildLoop);
+  const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2);
+  const noteId = manager.appendMessage(
+    Object.assign(result('f1', 'fold', 'note', 6), {
+      details: {
+        kind: 'fold',
+        handle: plan.handle,
+        firstEntryId: plan.firstEntryId,
+        lastEntryId: plan.lastEntryId
+      }
+    })
+  );
+  manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
+  apply(manager, plan.edits.slice(0, 2));
+  // Another extension restores the first removed entry, shortens the next planned one, and
+  // rewrites the note without hiding it.
+  const restored = plan.edits[0]!.targetId;
+  manager.appendContextEdit(restored, { content: [{ type: 'text', text: 'back' }] });
+  manager.appendContextEdit(plan.edits[2]!.targetId, {
+    content: [{ type: 'text', text: 'short' }]
+  });
+  manager.appendContextEdit(noteId, { content: [{ type: 'text', text: 'note' }] });
+
+  const rest = completeCutShortFolds(manager.getBranch());
+  assert.deepEqual(
+    rest.flatMap((draft) => (draft.type === 'context_edit' ? [draft.targetId] : [])),
+    [restored, ...plan.edits.slice(2).map((edit) => edit.targetId)]
+  );
+  for (const draft of rest) {
+    if (draft.type === 'context_edit') manager.appendContextEdit(draft.targetId, draft.replacement);
+    else manager.appendCustomEntry(draft.customType, draft.data);
+  }
+  assertPaired(manager.buildSessionProjection().messages);
+  assert.equal(completeCutShortFolds(manager.getBranch()).length, 0);
 });
 
 test('a fold whose batch never landed is not completed, whatever later edits touch its span', () => {
