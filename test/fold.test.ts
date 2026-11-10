@@ -4,6 +4,7 @@ import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { convertToLlm, type SessionManager } from '@earendil-works/pi-coding-agent';
 import { FOLD_APPLIED_TYPE } from '../src/archive.js';
 import {
+  completeCutShortFolds,
   foldableTurns,
   headline,
   openItems,
@@ -103,6 +104,78 @@ test('every prefix of the edits of a fold leaves each tool result next to its ca
       }
       if (message.role === 'toolResult') assert.ok(called.has(message.toolCallId), `${applied}`);
     }
+  }
+});
+
+test('the rest of a fold cut short after any of its edits completes it', () => {
+  const build = () => {
+    const made = session(buildLoop);
+    const plan = planFold(made.manager.buildSessionProjection().entries, 'f1', 2);
+    const note = Object.assign(result('f1', 'fold', 'note', 6), {
+      details: {
+        kind: 'fold',
+        handle: plan.handle,
+        firstEntryId: plan.firstEntryId,
+        lastEntryId: plan.lastEntryId
+      }
+    });
+    const noteId = made.manager.appendMessage(note);
+    return { ...made, plan, noteId };
+  };
+  const done = build();
+  apply(done.manager, done.plan.edits);
+  const folded = done.manager.buildSessionProjection().messages;
+
+  for (let applied = 0; applied <= done.plan.edits.length; applied++) {
+    const { manager, ids, plan, noteId } = build();
+    apply(
+      manager,
+      done.plan.edits
+        .slice(0, applied)
+        .map((edit) => ({ ...edit, targetId: ids[done.ids.indexOf(edit.targetId)]! }))
+    );
+    const rest = completeCutShortFolds(
+      manager.getBranch(),
+      manager.buildSessionProjection().entries
+    );
+    // A note that a later fold hid is not completed: the later fold stands for its span.
+    if (applied > 0) {
+      const hidden = completeCutShortFolds(
+        [
+          ...manager.getBranch(),
+          {
+            type: 'context_edit',
+            id: 'later',
+            parentId: null,
+            timestamp: '',
+            targetId: noteId,
+            replacement: null
+          }
+        ],
+        manager.buildSessionProjection().entries
+      );
+      assert.deepEqual(hidden, []);
+    }
+    // A fold none of whose edits landed never took effect, and is not completed.
+    if (applied === 0) {
+      assert.deepEqual(rest, []);
+      continue;
+    }
+    assert.deepEqual(rest.at(-1), {
+      type: 'custom',
+      customType: FOLD_APPLIED_TYPE,
+      data: { handle: plan.handle }
+    });
+    for (const draft of rest) {
+      if (draft.type === 'context_edit')
+        manager.appendContextEdit(draft.targetId, draft.replacement);
+      else manager.appendCustomEntry(draft.customType, draft.data);
+    }
+    assert.deepEqual(roles(manager.buildSessionProjection().messages), roles(folded), `${applied}`);
+    assert.deepEqual(
+      completeCutShortFolds(manager.getBranch(), manager.buildSessionProjection().entries),
+      []
+    );
   }
 });
 

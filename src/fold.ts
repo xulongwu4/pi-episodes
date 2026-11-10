@@ -6,7 +6,8 @@ import type {
   ContextEditEntryDraft,
   ExtensionAPI,
   MessageRenderer,
-  ProjectedSessionEntry
+  ProjectedSessionEntry,
+  SessionEntry
 } from '@earendil-works/pi-coding-agent';
 import { Text } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
@@ -17,6 +18,7 @@ import {
   FOLD_REQUEST_TYPE,
   FOLD_TOOL,
   type FoldDetails,
+  foldEntryDetails,
   foldNoteDetails,
   ThreadIndex
 } from './archive.js';
@@ -178,6 +180,70 @@ export function foldableTurns(entries: readonly ProjectedSessionEntry[]): Foldab
   return turns.reverse();
 }
 
+/**
+ * What a fold does to one entry of its span: a user message keeps its first USER_TEXT_CAP
+ * characters, a response, tool result or extension message is removed. System messages,
+ * compaction checkpoints and `!` commands are not editable and stay.
+ */
+function entryEdit(
+  entry: ProjectedSessionEntry,
+  handle: string
+): ContextEditEntryDraft | undefined {
+  const source = entry.sourceEntry;
+  const message = entryMessage(entry);
+  const projected = entry.messages[0];
+  if (!projected) return undefined;
+  if (message?.role === 'user' && projected.role === 'user') {
+    const capped = capUserContent(projected.content, handle);
+    return (
+      capped && { type: 'context_edit', targetId: source.id, replacement: { content: capped } }
+    );
+  }
+  if (
+    source.type === 'custom_message' ||
+    message?.role === 'assistant' ||
+    message?.role === 'toolResult'
+  ) {
+    return { type: 'context_edit', targetId: source.id, replacement: null };
+  }
+  return undefined;
+}
+
+/**
+ * The rest of the edits of folds cut short partway: a note without the applied marker, some of
+ * whose span an edit after it already hid. Pi writes a fold's edits one at a time, from the end
+ * of the span, so a crash can stop it midway; its remaining edits and its marker complete it.
+ * A note that a later fold hid, or whose span no edit touched, is left alone.
+ */
+export function completeCutShortFolds(
+  branch: readonly SessionEntry[],
+  entries: readonly ProjectedSessionEntry[]
+): (ContextEditEntryDraft | { type: 'custom'; customType: string; data: { handle: string } })[] {
+  const applied = appliedFolds(branch);
+  return branch.flatMap((note, index) => {
+    const details = foldEntryDetails(note);
+    if (!details || applied.has(details.handle)) return [];
+    const first = branch.findIndex((entry) => entry.id === details.firstEntryId);
+    const last = branch.findIndex((entry) => entry.id === details.lastEntryId);
+    if (first < 0 || last < first || last >= index) return [];
+    const span = new Set(branch.slice(first, last + 1).map((entry) => entry.id));
+    const edited = new Set(
+      branch
+        .slice(index + 1)
+        .flatMap((entry) => (entry.type === 'context_edit' ? [entry.targetId] : []))
+    );
+    if (edited.has(note.id) || ![...span].some((id) => edited.has(id))) return [];
+    const rest = entries
+      .filter((entry) => span.has(entry.sourceEntry.id) && !edited.has(entry.sourceEntry.id))
+      .flatMap((entry) => entryEdit(entry, details.handle) ?? [])
+      .reverse();
+    return [
+      ...rest,
+      { type: 'custom' as const, customType: FOLD_APPLIED_TYPE, data: { handle: details.handle } }
+    ];
+  });
+}
+
 export interface FoldOptions {
   /** The newest stamp written in the session, to tell a made-up stamp from one that is gone. */
   latestStamp?: number;
@@ -318,7 +384,6 @@ export function planFold(
 
   for (const entry of span) {
     if (entry.messages.length === 0) continue;
-    const source = entry.sourceEntry;
     const message = entryMessage(entry);
     const projected = entry.messages[0]!;
     if (message?.role === 'assistant') reachedResponse = true;
@@ -327,24 +392,14 @@ export function planFold(
       if (stamp !== undefined) laterStamps.push(stamp);
     }
 
+    const edit = entryEdit(entry, handle);
+    if (edit) edits.push(edit);
     if (message?.role === 'user' && projected.role === 'user') {
       const stamp = readStamp(projected);
       if (stamp !== undefined) keptUserTurns.push(stampLabel(stamp));
-      const capped = capUserContent(projected.content, handle);
-      if (capped)
-        edits.push({ type: 'context_edit', targetId: source.id, replacement: { content: capped } });
-      continue;
-    }
-
-    if (
-      source.type === 'custom_message' ||
-      message?.role === 'assistant' ||
-      message?.role === 'toolResult'
-    ) {
-      edits.push({ type: 'context_edit', targetId: source.id, replacement: null });
+    } else if (edit) {
       omitted.push(...entry.messages);
     }
-    // System messages, compaction checkpoints and `!` commands are not editable and stay.
   }
 
   // Pi writes these edits one entry at a time, so a crash can apply only some of them. Removing
@@ -706,7 +761,11 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         state.pendingFolds.delete(result.toolCallId);
         return [pending];
       });
-    if (applied.length === 0) return undefined;
+    const repairs = completeCutShortFolds(
+      ctx.sessionManager.getBranch(),
+      event.context.contextEntries
+    );
+    if (applied.length === 0 && repairs.length === 0) return undefined;
 
     for (const fold of applied) {
       ctx.ui.notify(
@@ -717,6 +776,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     return {
       entries: [
         ...event.entries,
+        ...repairs,
         // The marker goes last. A fold cut short leaves part of its span removed, a valid
         // context, and no applied note; a marker written first would leave the rest of the span
         // stuck behind a note no fold can reach past.

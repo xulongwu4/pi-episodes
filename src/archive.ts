@@ -18,9 +18,10 @@ export const FORK_TOOL = 'fork';
 /** The message /fold sends to ask for a fold. */
 export const FOLD_REQUEST_TYPE = 'episodes-fold-request';
 /**
- * Appended with a fold's context edits, in the same all-or-nothing batch. A fold result
- * without it never took effect: pi drops every boundary draft when any is invalid, and a crash
- * can land between the result and the turn end.
+ * Appended after a fold's context edits, in the same boundary batch. Pi checks the batch as a
+ * whole but writes it one entry at a time, so a fold result without the marker either never took
+ * effect (the batch was refused, or a crash came before the turn end) or was cut short partway
+ * through its edits; the next turn end completes the latter.
  */
 export const FOLD_APPLIED_TYPE = 'episodes-fold-applied';
 /**
@@ -221,7 +222,7 @@ function toolDetails(entry: SessionEntry, toolName: string): unknown {
   return entry.message.details;
 }
 
-function foldEntryDetails(entry: SessionEntry): FoldDetails | undefined {
+export function foldEntryDetails(entry: SessionEntry): FoldDetails | undefined {
   return entry.type === 'message' ? foldNoteDetails(entry.message) : undefined;
 }
 

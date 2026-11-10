@@ -69,7 +69,9 @@ async function createSession(
   extensions: ExtensionFactory[] = [],
   /** The `episodes` settings. */
   settings: Record<string, unknown> = {},
-  compaction: Record<string, unknown> = {}
+  compaction: Record<string, unknown> = {},
+  /** Entries to resume from, as after a restart. */
+  entries?: Parameters<typeof SessionManager.inMemory>[2]
 ) {
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-codemode-'));
   const faux = fauxProvider();
@@ -116,7 +118,7 @@ async function createSession(
       'fork',
       ...(mode === 'off' ? [] : ['codemode'])
     ],
-    sessionManager: SessionManager.inMemory(dir),
+    sessionManager: SessionManager.inMemory(dir, undefined, entries),
     settingsManager: SettingsManager.inMemory({
       compaction: { enabled: false, ...compaction },
       // Pi's settings type has no slot for extension keys.
@@ -1036,5 +1038,62 @@ test('the start of a user message, which a fold keeps, is not counted as growth'
     assert.ok(nudgeGrowth(entries) < 100);
   } finally {
     await harness.cleanup();
+  }
+});
+
+test('a fold cut short partway through its edits is completed at the next turn end', async () => {
+  const needle = `needle-${'x'.repeat(400)}`;
+  const first = await createSession('off', [
+    () =>
+      fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${needle}` }), {
+        stopReason: 'toolUse'
+      }),
+    () =>
+      fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'Printed a line.' }), {
+        stopReason: 'toolUse'
+      }),
+    () => fauxAssistantMessage('done')
+  ]);
+  let saved: NonNullable<Parameters<typeof SessionManager.inMemory>[2]>;
+  try {
+    await first.run('go');
+    const manager = first.session.sessionManager;
+    const all = manager.getEntries();
+    const edits = all.flatMap((entry, index) => (entry.type === 'context_edit' ? [index] : []));
+    assert.ok(edits.length > 1);
+    // A crash after the first edit was written: the rest of the batch and the marker are lost.
+    saved = [manager.getHeader()!, ...all.slice(0, edits[0]! + 1)];
+  } finally {
+    await first.cleanup();
+  }
+
+  const resumed = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo next' }), {
+          stopReason: 'toolUse'
+        }),
+      (context) => {
+        assert.doesNotMatch(conversation(context).map(text).join('\n'), /needle-x/);
+        return fauxAssistantMessage(fauxToolCall('recall', { query: 'needle' }), {
+          stopReason: 'toolUse'
+        });
+      },
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /needle-x/);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    [],
+    {},
+    {},
+    saved
+  );
+  try {
+    await resumed.run('next');
+    assert.equal(threadRecords(resumed.session.sessionManager.getBranch()).length, 1);
+  } finally {
+    await resumed.cleanup();
   }
 });
