@@ -286,7 +286,7 @@ test('a stamp on one result of a parallel batch folds the whole batch', () => {
 function earlierFold(applied: boolean) {
   const note = {
     ...result('f0', 'fold', 'first note', 3),
-    details: { kind: 'fold', handle: 'ep-0' }
+    details: { kind: 'fold', handle: 'ep-0', headline: 'first note' }
   };
   const { manager } = session([
     user('go', 1),
@@ -306,21 +306,58 @@ function earlierFold(applied: boolean) {
   return manager.buildSessionProjection().entries;
 }
 
-test('refuses to reach behind an earlier fold note', () => {
+test('a fold reaching behind an earlier fold note covers it', () => {
   const entries = earlierFold(true);
 
-  assert.throws(
-    () => planFold(entries, 'f1', 2),
-    /behind an earlier fold note\. The earliest stamp you can fold from is t4\./
+  const merged = planFold(entries, 'f1', 2);
+  assert.deepEqual(merged.covers, [{ handle: 'ep-0', headline: 'first note' }]);
+  assert.equal(merged.anchorStamp, 1);
+  // The note's own stamp starts the span at the response that called the earlier fold.
+  assert.deepEqual(
+    planFold(entries, 'f1', 3).covers.map((fold) => fold.handle),
+    ['ep-0']
   );
-  // The note's own stamp would fold the note itself.
-  assert.throws(() => planFold(entries, 'f1', 3), /behind an earlier fold note/);
-  assert.equal(planFold(entries, 'f1', 4).anchorStamp, 3);
+  const after = planFold(entries, 'f1', 4);
+  assert.deepEqual(after.covers, []);
+  assert.equal(after.anchorStamp, 3);
 });
 
-test('a fold whose edits never landed is not a boundary', () => {
-  // Pi drops every boundary draft when one is invalid, so a note can exist without its edits.
-  assert.equal(planFold(earlierFold(false), 'f1', 2).anchorStamp, 1);
+test('a fold whose edits never landed is not covered', () => {
+  // Its span is still in context, so its result is only a tool result.
+  const plan = planFold(earlierFold(false), 'f1', 2);
+  assert.equal(plan.anchorStamp, 1);
+  assert.deepEqual(plan.covers, []);
+});
+
+test('a user message an earlier fold capped is not capped again', () => {
+  const { manager, ids } = session([
+    user('x'.repeat(USER_TEXT_CAP * 2), 1),
+    assistant(call('x', 'bash')),
+    result('x', 'bash', 'out', 2),
+    assistant(call('f0', 'fold'))
+  ]);
+  const first = planFold(manager.buildSessionProjection().entries, 'f0', 1);
+  assert.ok(first.edits.some((edit) => edit.targetId === ids[0]));
+  apply(manager, first.edits);
+  manager.appendMessage(
+    Object.assign(result('f0', 'fold', 'first note', 3), {
+      details: { kind: 'fold', handle: first.handle, headline: 'first note' }
+    })
+  );
+  manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: first.handle });
+  for (const message of [
+    assistant(call('y', 'bash')),
+    result('y', 'bash', 'out', 4),
+    assistant(call('f1', 'fold'))
+  ]) {
+    manager.appendMessage(message);
+  }
+  const second = planFold(manager.buildSessionProjection().entries, 'f1', 1);
+  assert.deepEqual(
+    second.covers.map((fold) => fold.handle),
+    [first.handle]
+  );
+  assert.ok(!second.edits.some((edit) => edit.targetId === ids[0]));
 });
 
 test('rejects stamps that are missing, after the call, or leave nothing to fold', () => {

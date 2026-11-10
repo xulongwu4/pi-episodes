@@ -52,6 +52,8 @@ export interface FoldPlan {
   before: AgentMessage[];
   sent: AgentMessage[];
   keptUserTurns: string[];
+  /** Earlier fold notes inside the span, which the new note stands for from now on. */
+  covers: { handle: string; headline: string }[];
   edits: ContextEditEntryDraft[];
 }
 
@@ -74,6 +76,9 @@ function isFoldNote(entry: ProjectedSessionEntry, applied: ReadonlySet<string>):
   return details !== undefined && applied.has(details.handle);
 }
 
+const CAPPED =
+  /\n\[\d+ more characters of this message are in ep-[0-9a-f]+; recall can search them\]$/;
+
 function capUserContent(
   content: string | (TextContent | ImageContent)[],
   handle: string
@@ -84,7 +89,13 @@ function capUserContent(
     (sum, block) => sum + (block.type === 'text' ? block.text.length : 0),
     0
   );
-  if (total <= USER_TEXT_CAP) return undefined;
+  // A message an earlier fold capped is not capped again.
+  if (
+    total <= USER_TEXT_CAP ||
+    blocks.some((block) => block.type === 'text' && CAPPED.test(block.text))
+  ) {
+    return undefined;
+  }
 
   let budget = USER_TEXT_CAP;
   return blocks.map((block, index) => {
@@ -111,12 +122,25 @@ export interface FoldableTurn {
 
 const PREVIEW_WIDTH = 72;
 
-/** Index of the latest applied fold note or compaction; no fold reaches back past it. */
-export function foldBoundary(entries: readonly ProjectedSessionEntry[]): number {
+/**
+ * Index of the latest compaction, or with `notes` of the latest applied fold note too. No fold
+ * reaches back past a compaction; one that reaches back past a note merges it, which the nudge
+ * asks for only when notes take up room.
+ */
+export function foldBoundary(entries: readonly ProjectedSessionEntry[], notes = true): number {
   const applied = appliedFolds(entries.map((entry) => entry.sourceEntry));
   return entries.findLastIndex(
-    (entry) => entry.sourceEntry.type === 'compaction' || isFoldNote(entry, applied)
+    (entry) => entry.sourceEntry.type === 'compaction' || (notes && isFoldNote(entry, applied))
   );
+}
+
+/** Estimated tokens of the applied fold notes since the latest compaction. */
+export function noteTokens(entries: readonly ProjectedSessionEntry[]): number {
+  const applied = appliedFolds(entries.map((entry) => entry.sourceEntry));
+  return entries
+    .slice(foldBoundary(entries, false) + 1)
+    .filter((entry) => isFoldNote(entry, applied))
+    .reduce((sum, entry) => sum + estimateTokens(entry.messages), 0);
 }
 
 /**
@@ -136,11 +160,15 @@ function spanStart(
   return caller < 0 ? index : caller;
 }
 
-/** The earliest stamp a fold can start from now, and the index of the entry its span starts at. */
+/**
+ * The earliest stamp a fold can start from after the latest note, or with `notes` false after
+ * the latest compaction, and the index of the entry its span starts at.
+ */
 export function foldStart(
-  entries: readonly ProjectedSessionEntry[]
+  entries: readonly ProjectedSessionEntry[],
+  notes = true
 ): { stamp: number; index: number } | undefined {
-  const boundary = foldBoundary(entries);
+  const boundary = foldBoundary(entries, notes);
   for (let index = boundary + 1; index < entries.length; index++) {
     for (const message of entries[index]!.messages) {
       const stamp = readStamp(message);
@@ -313,16 +341,13 @@ export function planFold(
     throw new FoldError('one-per-response', 'Only one fold per response; this one was ignored.');
   }
 
-  // Nothing before the latest applied note or the compaction summary can be folded: the
-  // note already stands for its span, and the summary for everything it replaced.
+  // Nothing before the compaction summary can be folded: it stands for everything it
+  // replaced. An earlier note can: the new note covers it, and its span stays archived.
   const applied = options.applied ?? appliedFolds(entries.map((entry) => entry.sourceEntry));
-  const lastNote = entries.findLastIndex(
-    (entry, index) => index < foldIndex && isFoldNote(entry, applied)
-  );
   const compaction = entries.findLastIndex(
     (entry, index) => index < foldIndex && entry.sourceEntry.type === 'compaction'
   );
-  const boundary = Math.max(lastNote, compaction, floorIndex);
+  const boundary = Math.max(compaction, floorIndex);
   let earliest: number | undefined;
   for (let index = boundary + 1; index < foldIndex && earliest === undefined; index++) {
     earliest = entries[index]!.messages.filter(
@@ -367,11 +392,9 @@ export function planFold(
 
   if (startIndex <= boundary) {
     const [reason, what]: [FoldRejection, string] =
-      boundary === lastNote
-        ? ['behind-note', 'an earlier fold note']
-        : boundary === compaction
-          ? ['behind-compaction', 'the compaction summary']
-          : ['behind-fork-start', 'the start of this fork; a fork folds only its own work'];
+      boundary === compaction
+        ? ['behind-compaction', 'the compaction summary']
+        : ['behind-fork-start', 'the start of this fork; a fork folds only its own work'];
     throw new FoldError(reason, `A fold cannot reach behind ${what}. ${pick}`);
   }
 
@@ -394,6 +417,7 @@ export function planFold(
   const omitted: AgentMessage[] = [];
   const keptUserTurns: string[] = [];
   const laterStamps: number[] = [];
+  const covers: { handle: string; headline: string }[] = [];
   let reachedResponse = false;
 
   for (const entry of span) {
@@ -406,6 +430,8 @@ export function planFold(
       if (stamp !== undefined) laterStamps.push(stamp);
     }
 
+    const covered = isFoldNote(entry, applied) ? foldNoteDetails(message) : undefined;
+    if (covered) covers.push({ handle: covered.handle, headline: covered.headline });
     const edit = entryEdit(entry, handle);
     if (edit) edits.push(edit);
     if (message?.role === 'user' && projected.role === 'user') {
@@ -437,6 +463,7 @@ export function planFold(
     before: entries.slice(0, startIndex).flatMap((entry) => entry.messages),
     sent: entries.slice(0, foldIndex).flatMap((entry) => entry.messages),
     keptUserTurns,
+    covers,
     edits
   };
 }
@@ -504,6 +531,7 @@ export function renderNote(options: {
   changes: readonly DiskChange[] | undefined;
   touched: readonly string[];
   keptUserTurns: readonly string[];
+  covers?: readonly { handle: string; headline: string }[];
   cwd: string;
 }): string {
   const lines = [
@@ -518,6 +546,13 @@ export function renderNote(options: {
     lines.push(
       '',
       `User messages from inside the span stay above with their stamps: ${options.keptUserTurns.join(', ')}.`
+    );
+  }
+
+  if (options.covers?.length) {
+    lines.push(
+      '',
+      `This fold covers the notes of earlier folds; recall and ask still reach their spans by handle: ${options.covers.map((fold) => `${fold.handle} (${fold.headline})`).join('; ')}.`
     );
   }
 
@@ -659,6 +694,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         keptUserTurns: plan.keptUserTurns,
         files: [...files]
       };
+      if (plan.covers.length > 0) details.covers = plan.covers.map((fold) => fold.handle);
       if (treeAfter) details.treeAfter = treeAfter;
       const open = openItems(note);
       if (open) details.open = open;
@@ -690,6 +726,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         changes,
         touched,
         keptUserTurns: plan.keptUserTurns,
+        covers: plan.covers,
         cwd: state.cwd
       });
       // Snapshots take time; a run aborted meanwhile, or already settled, must not get edits.

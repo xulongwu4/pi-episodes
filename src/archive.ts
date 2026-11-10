@@ -62,6 +62,8 @@ export interface FoldDetails {
   /** The note's open items, for the reminder after the fold. */
   open?: string;
   keptUserTurns: string[];
+  /** Handles of earlier folds whose notes were inside the span. */
+  covers?: string[];
   /** Absolute paths touched or changed inside the span. */
   files: string[];
   /** Working tree at fold time, to tell later readers which of `files` changed since. */

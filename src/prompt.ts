@@ -57,8 +57,9 @@ will see; recall searches the span, not the note. Then:
   the pin, remove the debug flag, run the formatter).
 
 Quote exact paths, symbols, commands and error strings. Conditions and open items are what
-gets dropped first; keep them. A fold cannot reach back past the latest note or a
-compaction summary; stamps a summary mentions are gone, so since must be a stamp you see
+gets dropped first; keep them. A fold can start before earlier notes; its note then covers
+theirs, so carry over what the rest of the task needs from them. It cannot reach back past
+a compaction summary; stamps a summary mentions are gone, so since must be a stamp you see
 at the end of a message.
 
 Going back: the archive is the record, the note only its cue. recall searches the archived

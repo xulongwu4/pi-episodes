@@ -297,26 +297,32 @@ test('one fold per response, across the folds of a script', async () => {
   }
 });
 
-test('a later fold cannot reach behind a note a script left', async () => {
+test('a later fold covers a note a script left, and both spans stay recallable', async () => {
   const harness = await createSession('only', [
-    () => script('text(await tools.bash({ command: "echo one" }));'),
+    () => script('text(await tools.bash({ command: "echo first-output" }));'),
     () => script('text(await tools.fold({ since: "t1", note: "first" }));'),
     () => fauxAssistantMessage('next'),
     () => script('text(await tools.bash({ command: "echo two" }));'),
-    () =>
-      script(
-        'let r; try { r = await tools.fold({ since: "t1", note: "again" }); } catch (e) { r = String(e); } text(r);'
-      ),
+    () => script('text(await tools.fold({ since: "t1", note: "again" }));'),
     (context) => {
+      const view = conversation(context);
       assert.match(
-        text(conversation(context).at(-1)!),
-        /A fold cannot reach behind an earlier fold note\. The earliest stamp you can fold from is t4\./
+        text(view.at(-1)!),
+        /covers the notes of earlier folds; .*ep-[0-9a-f]+ \(first\)/
       );
+      assert.doesNotMatch(view.slice(0, -1).map(text).join('\n'), /\bfirst\b|echo two/);
+      return script('text(await tools.recall({ query: "first-output" }));');
+    },
+    (context) => {
+      assert.match(text(conversation(context).at(-1)!), /first-output/);
       return fauxAssistantMessage('ok');
     }
   ]);
   try {
     await harness.run('go', 'more');
+    const records = threadRecords(harness.session.sessionManager.getBranch());
+    assert.equal(records.length, 2);
+    assert.deepEqual((records[1] as { covers?: string[] }).covers, [records[0]!.handle]);
   } finally {
     await harness.cleanup();
   }
@@ -782,6 +788,61 @@ test('a nudge on the next prompt leads to a fold from the earliest stamp', async
       assert.equal(threadRecords(branch).length, 1, mode);
       // After the fold, too little built up for a second nudge.
       assert.equal(episodeStats(branch, harness.dir).nudges, 1, mode);
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+test('once earlier notes take up room, the nudge names a stamp before them to merge them', async () => {
+  for (const [note, since, merges] of [
+    ['Printed a long line.', 't5', false],
+    [`Printed a long line. ${'detail '.repeat(60)}`, 't1', true]
+  ] as const) {
+    const big = 'x'.repeat(800);
+    const bash = () =>
+      fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${big}` }), {
+        stopReason: 'toolUse'
+      });
+    const done = () => fauxAssistantMessage('done');
+    const nudged = (context: Parameters<typeof conversation>[0]) => {
+      const nudge = text(conversation(context).at(-1)!);
+      assert.match(nudge, /tokens of work built up/);
+      return nudge;
+    };
+    const harness = await createSession(
+      'off',
+      [
+        bash,
+        done,
+        (context) => {
+          nudged(context);
+          return fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note }), {
+            stopReason: 'toolUse'
+          });
+        },
+        done,
+        bash,
+        done,
+        (context) => {
+          const nudge = nudged(context);
+          assert.equal(/since "(t\d+)"/.exec(nudge)![1], since, note);
+          assert.equal(/which it merges/.test(nudge), merges, note);
+          return fauxAssistantMessage(fauxToolCall('fold', { since, note: 'Both lines.' }), {
+            stopReason: 'toolUse'
+          });
+        },
+        done
+      ],
+      [],
+      // A note of a quarter of the threshold, 75 tokens, takes up room.
+      { foldNudgeTokens: 300 }
+    );
+    try {
+      await harness.run('first', 'second', 'third', 'fourth');
+      const records = threadRecords(harness.session.sessionManager.getBranch());
+      assert.equal(records.length, 2, note);
+      assert.equal(((records[1] as { covers?: string[] }).covers ?? []).length, merges ? 1 : 0);
     } finally {
       await harness.cleanup();
     }

@@ -5,7 +5,7 @@ import {
   estimateTokens as estimateMessageTokens,
   type ProjectedSessionEntry
 } from '@earendil-works/pi-coding-agent';
-import { foldInstruction, foldStart, renderFoldAsk, USER_TEXT_CAP } from './fold.js';
+import { foldInstruction, foldStart, noteTokens, renderFoldAsk, USER_TEXT_CAP } from './fold.js';
 import { estimateTokens } from './messages.js';
 import { episodesSettings } from './settings.js';
 import { stampLabel } from './stamps.js';
@@ -68,9 +68,11 @@ function continues(message: AssistantMessage): boolean {
  * Once `foldNudgeTokens` built up since the last fold, compaction or nudge, the next user prompt
  * gets one short message asking for a fold, and so does the next request of a run that grew by
  * twice as much on its own. Once less than `foldNudgeTokens` of room is left before pi compacts,
- * a quarter of it is enough. It names the earliest stamp a fold can start from: a fold from a
- * later stamp leaves the work before it behind the new note for good. It is appended, never
- * edited in, so the cached prefix is untouched.
+ * a quarter of it is enough. It names the earliest stamp after the latest note: a fold from a
+ * later stamp leaves the work before it in context. A fold that reaches back past notes merges
+ * them, but rewrites the cache from its start, so the nudge asks for that only once the notes
+ * since the latest compaction hold a quarter of the threshold, naming the earliest stamp after
+ * the compaction. It is appended, never edited in, so the cached prefix is untouched.
  */
 export function registerNudge(pi: ExtensionAPI): void {
   const nudge = (
@@ -83,8 +85,7 @@ export function registerNudge(pi: ExtensionAPI): void {
   ): string | undefined => {
     const settings = episodesSettings(pi.getSettings());
     if (!settings.foldNudge || !pi.getActiveTools().includes('fold')) return undefined;
-    const earliest = foldStart(entries);
-    if (!earliest) return undefined;
+    if (!foldStart(entries)) return undefined;
     // The window of the model that answers, which a routing model does not report itself.
     const usage = ctx.getContextUsage();
     const threshold = nudgeThreshold(settings.foldNudgeTokens, usage?.contextWindow);
@@ -93,11 +94,18 @@ export function registerNudge(pi: ExtensionAPI): void {
       usage.tokens + incoming + threshold >= usage.contextWindow - reserveTokens(pi, ctx.model);
     const growth = nudgeGrowth(entries);
     if (growth < (pressed ? threshold / 4 : factor * threshold)) return undefined;
+    const notes = noteTokens(entries);
+    const merge = notes >= threshold / 4;
+    const earliest = foldStart(entries, !merge);
+    if (!earliest) return undefined;
     const since = stampLabel(earliest.stamp);
+    const covering = merge
+      ? `a note covering everything from there, including the notes of earlier folds there (about ${Math.round(notes / 1000)}k tokens), which it merges into one`
+      : 'a note covering everything from there';
     return (
       `About ${Math.round(growth / 1000)}k tokens of work built up since the last fold, compaction or message like this one. ` +
-      `If the work since ${since} is finished and ${when} does not need its raw output, fold it first: ${foldInstruction(pi)}, with since "${since}", the earliest stamp you can fold from, and a note covering everything from there; then continue. ` +
-      'Do not fold from a later stamp instead: the work before it would stay in your context for good. If that work is still needed, fold once it is done.'
+      `If the work since ${since} is finished and ${when} does not need its raw output, fold it first: ${foldInstruction(pi)}, with since "${since}", the earliest stamp you can fold from, and ${covering}; then continue. ` +
+      'Do not fold from a later stamp instead: the work before it would stay in your context. If that work is still needed, fold once it is done.'
     );
   };
 

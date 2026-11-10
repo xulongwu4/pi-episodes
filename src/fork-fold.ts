@@ -132,6 +132,7 @@ export class ForkFolds {
       keptUserTurns: plan.keptUserTurns,
       files: touched
     };
+    if (plan.covers.length > 0) record.covers = plan.covers.map((fold) => fold.handle);
     const open = openItems(note);
     if (open) record.open = open;
     this.folds.push({
@@ -156,6 +157,7 @@ export class ForkFolds {
             changes: undefined,
             touched,
             keptUserTurns: plan.keptUserTurns,
+            covers: plan.covers,
             cwd: this.state.cwd
           })
         }

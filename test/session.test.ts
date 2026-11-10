@@ -204,14 +204,16 @@ test('fold, recall, ask and fork in a live session', async () => {
   }
 });
 
-test('rejects a fold that reaches behind the previous note', async () => {
+test('a fold that reaches behind the previous note merges it', async () => {
   const harness = await createSession([
     () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo one' })),
     () => fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'first' })),
     () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo two' })),
     () => fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'second' })),
     (context) => {
-      assert.match(text(conversation(context).at(-1)!), /cannot reach behind an earlier fold note/);
+      const view = conversation(context);
+      assert.match(text(view.at(-1)!), /This fold covers the notes of earlier folds/);
+      assert.equal(view.filter((message) => message.role === 'toolResult').length, 1);
       return fauxAssistantMessage('ok');
     }
   ]);
