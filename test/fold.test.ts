@@ -199,6 +199,26 @@ test('a cut-short fold is completed over edits that other extensions made to its
   assert.equal(completeCutShortFolds(manager.getBranch()).length, 0);
 });
 
+test('a cut-short fold counts the edits earlier handlers queued at the same boundary', () => {
+  const { manager } = session(buildLoop);
+  const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2);
+  manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
+  apply(manager, plan.edits.slice(0, 1));
+  const restored = plan.edits[0]!.targetId;
+  const pending = [
+    {
+      type: 'context_edit' as const,
+      targetId: restored,
+      replacement: { content: [{ type: 'text' as const, text: 'back' }] }
+    }
+  ];
+  const rest = completeCutShortFolds(manager.getBranch(), pending);
+  assert.equal(
+    rest.flatMap((draft) => (draft.type === 'context_edit' ? [draft.targetId] : []))[0],
+    restored
+  );
+});
+
 test('a fold whose batch never landed is not completed, whatever later edits touch its span', () => {
   // Without its start entry the fold never took effect; an edit by another extension to a
   // result in its span is not progress of the fold.

@@ -217,9 +217,11 @@ function entryEdit(
  * planned edit whose target does not already carry that replacement, as its latest edit, is
  * written again, in the planned order, then the marker. A fold without a start entry never took
  * effect, and one whose note a later edit hid is left alone: the later fold stands for its span.
+ * `pending` holds the drafts earlier handlers of this boundary queued, which land first.
  */
 export function completeCutShortFolds(
-  branch: readonly SessionEntry[]
+  branch: readonly SessionEntry[],
+  pending: readonly { type: string; targetId?: string; replacement?: unknown }[] = []
 ): (ContextEditEntryDraft | { type: 'custom'; customType: string; data: { handle: string } })[] {
   const applied = appliedFolds(branch);
   return branch.flatMap((start, index) => {
@@ -227,9 +229,10 @@ export function completeCutShortFolds(
     const { handle, edits } = (start.data ?? {}) as { handle?: unknown; edits?: unknown };
     if (typeof handle !== 'string' || applied.has(handle) || !Array.isArray(edits)) return [];
     const latest = new Map<string, string>();
-    for (const entry of branch.slice(index + 1)) {
-      if (entry.type === 'context_edit')
+    for (const entry of [...branch.slice(index + 1), ...pending]) {
+      if (entry.type === 'context_edit' && entry.targetId !== undefined) {
         latest.set(entry.targetId, JSON.stringify(entry.replacement));
+      }
     }
     const note = branch.find((entry) => foldEntryDetails(entry)?.handle === handle);
     if (note && latest.get(note.id) === 'null') return [];
@@ -757,7 +760,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         state.pendingFolds.delete(result.toolCallId);
         return [pending];
       });
-    const repairs = completeCutShortFolds(ctx.sessionManager.getBranch());
+    const repairs = completeCutShortFolds(ctx.sessionManager.getBranch(), event.entries);
     if (applied.length === 0 && repairs.length === 0) return undefined;
 
     for (const fold of applied) {
