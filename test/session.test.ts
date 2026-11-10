@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -369,6 +370,48 @@ test('points back to a folded span when its files are touched or changed again',
     await harness.session.prompt('write a file');
     if (harness.failures[0]) throw harness.failures[0];
     assert.equal(harness.pending(), 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('with snapshots off, a note lists the files that file tools used and no diff', async () => {
+  const harness = await createSession(
+    [
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('bash', { command: 'printf one > a.txt; printf two > b.txt' })
+        ),
+      () => fauxAssistantMessage(fauxToolCall('read', { path: 'b.txt' })),
+      () => fauxAssistantMessage(fauxToolCall('fold', { since: 't2', note: 'Wrote two files.' })),
+      (context) => {
+        // In a repository, where a snapshot would have listed the file the shell wrote too.
+        const note = text(conversation(context).at(-1)!);
+        assert.match(
+          note,
+          /Files used by file tools \(no working tree diff is available[^\n]*\nb\.txt\n/
+        );
+        assert.doesNotMatch(note, /a\.txt|working tree diff\):/);
+        return fauxAssistantMessage(fauxToolCall('bash', { command: 'printf three > b.txt' }));
+      },
+      () => fauxAssistantMessage(fauxToolCall('recall', { query: '"printf one"' })),
+      (context) => {
+        const result = text(conversation(context).at(-1)!);
+        assert.match(result, /ep-[0-9a-f]{8} /);
+        assert.doesNotMatch(result, /predates changes/);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    { git: true, episodes: { snapshots: false } }
+  );
+
+  try {
+    await harness.session.prompt('write two files');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+    // No private index or object store was made for the session.
+    const id = harness.session.sessionManager.getSessionId();
+    assert.equal(existsSync(join(tmpdir(), `pi-episodes-${id}-${process.pid}`)), false);
   } finally {
     await harness.cleanup();
   }

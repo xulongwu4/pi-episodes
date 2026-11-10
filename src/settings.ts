@@ -27,6 +27,11 @@ export interface EpisodesSettings {
   outputCap: boolean;
   outputCapChars: number;
   outputCapKeepChars: number;
+  /**
+   * Snapshot the working tree at every stamped message, for the disk changes in a note and
+   * the staleness of a thread. Off where `git add -A` over the tree is too slow or unwanted.
+   */
+  snapshots: boolean;
 }
 
 const DEFAULTS: EpisodesSettings = {
@@ -39,7 +44,8 @@ const DEFAULTS: EpisodesSettings = {
   foldNudgeTokens: 50_000,
   outputCap: true,
   outputCapChars: 16_000,
-  outputCapKeepChars: 6_000
+  outputCapKeepChars: 6_000,
+  snapshots: true
 };
 
 function flag(value: unknown, fallback: boolean): boolean {
@@ -62,6 +68,7 @@ export function episodesSettings(settings: object): EpisodesSettings {
     foldNudgeTokens: positive(raw.foldNudgeTokens, DEFAULTS.foldNudgeTokens),
     outputCap: flag(raw.outputCap, DEFAULTS.outputCap),
     outputCapChars: positive(raw.outputCapChars, DEFAULTS.outputCapChars),
-    outputCapKeepChars: positive(raw.outputCapKeepChars, DEFAULTS.outputCapKeepChars)
+    outputCapKeepChars: positive(raw.outputCapKeepChars, DEFAULTS.outputCapKeepChars),
+    snapshots: flag(raw.snapshots, DEFAULTS.snapshots)
   };
 }

@@ -51,7 +51,7 @@ export default function episodes(pi: ExtensionAPI): void {
   const forks = new ForkRegistry();
 
   pi.on('session_start', (_event, ctx) => {
-    state.reset(ctx);
+    state.reset(ctx, episodesSettings(pi.getSettings()).snapshots);
     recordMeta(pi, ctx);
     refreshStatus(ctx, state);
   });

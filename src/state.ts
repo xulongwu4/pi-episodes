@@ -51,10 +51,12 @@ export class EpisodeState {
   /** Built on the first ranked recall; rebuilt per session rather than stored, it is derived. */
   recallIndex: RecallIndex | undefined;
 
-  reset(ctx: ExtensionContext): void {
+  reset(ctx: ExtensionContext, snapshots = true): void {
     void this.snapshots?.dispose();
     this.cwd = realpathOr(ctx.cwd);
-    this.snapshots = new Snapshots(this.cwd, ctx.sessionManager.getSessionId());
+    this.snapshots = snapshots
+      ? new Snapshots(this.cwd, ctx.sessionManager.getSessionId())
+      : undefined;
     this.pendingFolds.clear();
     this.foldResponses.clear();
     this.parentCalls.clear();
