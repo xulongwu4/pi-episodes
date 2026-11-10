@@ -6,10 +6,12 @@ import {
   FOLD_APPLIED_TYPE,
   FOLD_STARTED_TYPE,
   type ForkArchive,
+  foldRecords,
   ThreadIndex
 } from '../src/archive.js';
 import {
   completeCutShortFolds,
+  cutShortFold,
   foldableTurns,
   headline,
   openItems,
@@ -125,28 +127,19 @@ test('the rest of a fold cut short after any of its edits completes it', () => {
         lastEntryId: plan.lastEntryId
       }
     });
-    const noteId = made.manager.appendMessage(note);
+    made.manager.appendMessage(note);
     if (started) {
       made.manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
     }
-    return { ...made, plan, noteId };
+    return { ...made, plan };
   };
   const done = build(true);
   apply(done.manager, done.plan.edits);
   const folded = roles(done.manager.buildSessionProjection().messages);
 
   for (let applied = 0; applied <= done.plan.edits.length; applied++) {
-    const { manager, plan, noteId } = build(true);
+    const { manager, plan } = build(true);
     apply(manager, plan.edits.slice(0, applied));
-    // A note that a later fold hid is not completed: the later fold stands for its span.
-    const hidden = { type: 'context_edit', id: 'later', parentId: null, timestamp: '' } as const;
-    assert.deepEqual(
-      completeCutShortFolds([
-        ...manager.getBranch(),
-        { ...hidden, targetId: noteId, replacement: null }
-      ]),
-      []
-    );
     const rest = completeCutShortFolds(manager.getBranch());
     // Only the edits that did not land, in their order.
     assert.deepEqual(
@@ -225,29 +218,27 @@ test('a cut-short fold does not write its cut of a user message over a later edi
   apply(plain.manager, plain.plan.edits.slice(0, 1));
   assert.ok(targets(completeCutShortFolds(plain.manager.getBranch())).includes(plain.paste));
 
-  // The crash came before the cut, and another extension then rewrote or removed the message.
+  // Another extension rewrote or removed the message, on the branch or in a draft queued at
+  // this boundary, whether the crash came before the cut or after it.
   for (const later of [redacted, null]) {
-    const { manager, plan, paste } = build();
-    apply(manager, plan.edits.slice(0, 1));
-    manager.appendContextEdit(paste, later);
-    assert.deepEqual(
-      targets(completeCutShortFolds(manager.getBranch())),
-      plan.edits
-        .slice(1)
-        .map((edit) => edit.targetId)
-        .filter((id) => id !== paste)
-    );
-  }
-
-  // The cut landed, and the message was rewritten after it or in a draft queued at this boundary.
-  for (const where of ['after', 'queued'] as const) {
-    const { manager, plan, cut, paste } = build();
-    apply(manager, plan.edits.slice(0, cut + 1));
-    const edit = { type: 'context_edit' as const, targetId: paste, replacement: redacted };
-    if (where === 'after') manager.appendContextEdit(paste, redacted);
-    const rest = completeCutShortFolds(manager.getBranch(), where === 'queued' ? [edit] : []);
-    assert.ok(!targets(rest).includes(paste), where);
-    assert.equal(targets(rest).length, plan.edits.length - cut - 1, where);
+    for (const where of ['branch', 'queued'] as const) {
+      for (const crash of ['before the cut', 'after the cut'] as const) {
+        const { manager, plan, cut, paste } = build();
+        const landed = crash === 'before the cut' ? 1 : cut + 1;
+        apply(manager, plan.edits.slice(0, landed));
+        const edit = { type: 'context_edit' as const, targetId: paste, replacement: later };
+        if (where === 'branch') manager.appendContextEdit(paste, later);
+        const rest = completeCutShortFolds(manager.getBranch(), where === 'queued' ? [edit] : []);
+        assert.deepEqual(
+          targets(rest),
+          plan.edits
+            .slice(landed)
+            .map((edit) => edit.targetId)
+            .filter((id) => id !== paste),
+          [JSON.stringify(later), where, crash].join(', ')
+        );
+      }
+    }
   }
 });
 
@@ -271,8 +262,8 @@ test('a cut-short fold counts the edits earlier handlers queued at the same boun
   );
 });
 
-test('a cut-short fold whose note an edit removed, before it or queued, is not completed', () => {
-  for (const where of ['before', 'queued'] as const) {
+test('a cut-short fold whose note an edit removed gets its marker and no more edits', () => {
+  for (const where of ['before', 'after', 'queued'] as const) {
     const { manager } = session(buildLoop);
     const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2);
     const noteId = manager.appendMessage(
@@ -288,8 +279,24 @@ test('a cut-short fold whose note an edit removed, before it or queued, is not c
     if (where === 'before') manager.appendContextEdit(noteId, null);
     manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
     apply(manager, plan.edits.slice(0, 1));
+    if (where === 'after') manager.appendContextEdit(noteId, null);
     const pending =
       where === 'queued' ? [{ type: 'context_edit', targetId: noteId, replacement: null }] : [];
+    assert.equal(cutShortFold(manager.getBranch()), plan.handle, where);
+    // What already left the context is on record, and the rest of the span stays in it.
+    const rest = completeCutShortFolds(manager.getBranch(), pending);
+    assert.deepEqual(
+      rest,
+      [{ type: 'custom', customType: FOLD_APPLIED_TYPE, data: { handle: plan.handle } }],
+      where
+    );
+    manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
+    assert.deepEqual(
+      foldRecords(manager.getBranch()).map((record) => record.handle),
+      [plan.handle],
+      where
+    );
+    assert.equal(cutShortFold(manager.getBranch()), undefined, where);
     assert.deepEqual(completeCutShortFolds(manager.getBranch(), pending), [], where);
   }
 });

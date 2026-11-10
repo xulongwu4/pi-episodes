@@ -279,8 +279,10 @@ function removed(
  * done to its target since: a span removed in part must not keep a result whose call is gone.
  * The cut of a user message only saves tokens, so an edit made to that message after the fold
  * started, by anyone, stands and the cut is not written over it. A fold without a start entry
- * never took effect, and one whose note a later edit hid is left alone: the later fold stands
- * for its span.
+ * never took effect. One whose note another extension has removed since gets only the marker:
+ * nothing more leaves the context in the name of a note that is gone, and what did leave is
+ * on record for recall. No fold of this extension removes that note, because fold refuses to
+ * run while a start entry has no marker.
  * `pending` holds the drafts earlier handlers of this boundary queued, which land first.
  */
 export function completeCutShortFolds(
@@ -298,15 +300,27 @@ export function completeCutShortFolds(
         latest.set(entry.targetId, JSON.stringify(entry.replacement));
       }
     }
+    const marker = { type: 'custom' as const, customType: FOLD_APPLIED_TYPE, data: { handle } };
     const note = branch.find((entry) => foldEntryDetails(entry)?.handle === handle);
-    if (note && removed(note.id, branch, pending)) return [];
+    if (note && removed(note.id, branch, pending)) return [marker];
     const rest = (edits as ContextEditEntryDraft[]).filter((edit) => {
       const now = latest.get(edit.targetId);
       if (now === JSON.stringify(edit.replacement)) return false;
       return edit.replacement === null || now === undefined;
     });
-    return [...rest, { type: 'custom' as const, customType: FOLD_APPLIED_TYPE, data: { handle } }];
+    return [...rest, marker];
   });
+}
+
+/** The handle of a fold that started and has no applied marker; the next turn end completes it. */
+export function cutShortFold(branch: readonly SessionEntry[]): string | undefined {
+  const applied = appliedFolds(branch);
+  for (const entry of branch) {
+    if (entry.type !== 'custom' || entry.customType !== FOLD_STARTED_TYPE) continue;
+    const handle = (entry.data as { handle?: unknown } | undefined)?.handle;
+    if (typeof handle === 'string' && !applied.has(handle)) return handle;
+  }
+  return undefined;
 }
 
 export interface FoldOptions {
@@ -719,6 +733,16 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
             );
           }
           state.foldResponses.set(caller.sourceEntry.id, toolCallId);
+        }
+        // Part of that fold's span is still in context and its note does not count as one
+        // yet; a fold planned over this state would archive the span twice.
+        const unfinished = cutShortFold(ctx.sessionManager.getBranch());
+        if (unfinished !== undefined) {
+          throw new FoldError(
+            'earlier-fold-unfinished',
+            unfinished +
+              ' was interrupted partway and is completed when this response ends. Fold again in your next response; the turns of its span are gone by then.'
+          );
         }
         since = parseStamp(params.since);
         if (since === undefined) {

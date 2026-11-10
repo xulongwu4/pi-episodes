@@ -1452,6 +1452,73 @@ test('a fold cut short partway through its edits is completed at the next turn e
   }
 });
 
+test('a fold is refused while an earlier one is cut short, and works after the turn end', async () => {
+  const first = await createSession('off', [
+    () =>
+      fauxAssistantMessage(fauxToolCall('bash', { command: 'echo first-output' }), {
+        stopReason: 'toolUse'
+      }),
+    () =>
+      fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'Printed a line.' }), {
+        stopReason: 'toolUse'
+      }),
+    () => fauxAssistantMessage('done')
+  ]);
+  let saved: NonNullable<Parameters<typeof SessionManager.inMemory>[2]>;
+  try {
+    await first.run('go');
+    const manager = first.session.sessionManager;
+    const all = manager.getEntries();
+    const edits = all.flatMap((entry, index) => (entry.type === 'context_edit' ? [index] : []));
+    assert.ok(edits.length > 1);
+    saved = [manager.getHeader()!, ...all.slice(0, edits[0]! + 1)];
+  } finally {
+    await first.cleanup();
+  }
+
+  const resumed = await createSession(
+    'off',
+    [
+      // The rest of the first span is still in context, and so is its call of fold.
+      () =>
+        fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'Again.' }), {
+          stopReason: 'toolUse'
+        }),
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /^ep-[0-9a-f]{8} was interrupted/);
+        return fauxAssistantMessage(fauxToolCall('bash', { command: 'echo second-output' }), {
+          stopReason: 'toolUse'
+        });
+      },
+      () =>
+        fauxAssistantMessage(fauxToolCall('fold', { since: 't4', note: 'Printed another.' }), {
+          stopReason: 'toolUse'
+        }),
+      (context) => {
+        const sent = conversation(context).map(text).join('\n');
+        assert.doesNotMatch(sent, /first-output|second-output/);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    [],
+    {},
+    {},
+    saved
+  );
+  try {
+    await resumed.run('next');
+    const branch = resumed.session.sessionManager.getBranch();
+    const records = threadRecords(branch);
+    assert.equal(records.length, 2);
+    // Each entry is in one thread only.
+    const threads = await new ThreadIndex(resumed.session.sessionManager, new Map()).onBranch();
+    const hits = threads.filter((thread) => /first-output/.test(JSON.stringify(thread.messages)));
+    assert.equal(hits.length, 1);
+  } finally {
+    await resumed.cleanup();
+  }
+});
+
 test('a fold whose note an earlier turn-end handler removes does not take effect', async () => {
   const harness = await createSession(
     'off',

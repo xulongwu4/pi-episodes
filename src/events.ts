@@ -19,6 +19,7 @@ export type FoldRejection =
   | 'empty-note'
   | 'not-in-context'
   | 'one-per-response'
+  | 'earlier-fold-unfinished'
   | 'no-such-stamp'
   | 'gone'
   | 'not-before-call'
