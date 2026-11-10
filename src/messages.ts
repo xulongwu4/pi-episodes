@@ -1,3 +1,4 @@
+import { homedir } from 'node:os';
 import { basename, resolve } from 'node:path';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ImageContent, TextContent } from '@earendil-works/pi-ai';
@@ -133,6 +134,11 @@ export function estimateTokens(messages: readonly AgentMessage[]): number {
  * arguments were dropped for size is missed. A path that was not in the arguments is the one
  * recorded with the result.
  */
+/** A path as pi's file tools take it, which read ~ as the home directory, made absolute. */
+export function absolutePath(cwd: string, path: string): string {
+  return resolve(cwd, path === '~' || path.startsWith('~/') ? homedir() + path.slice(1) : path);
+}
+
 export function touchedPaths(
   messages: readonly AgentMessage[],
   cwd: string,
@@ -141,7 +147,7 @@ export function touchedPaths(
   const paths = new Set<string>();
   const add = (name: string, args: Record<string, unknown> | undefined) => {
     const path = args?.path;
-    if (tools.has(name) && typeof path === 'string' && path) paths.add(resolve(cwd, path));
+    if (tools.has(name) && typeof path === 'string' && path) paths.add(absolutePath(cwd, path));
   };
   for (const message of messages) {
     if (message.role === 'toolResult') {

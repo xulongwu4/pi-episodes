@@ -20,7 +20,7 @@ import { recordEvent, recordMeta } from './events.js';
 import { codemodeOnly, registerFold } from './fold.js';
 import { registerFork } from './fork.js';
 import { ForkRegistry, registerForksView } from './forks-view.js';
-import { type FileTouch, fileTouch, withFiles } from './messages.js';
+import { absolutePath, type FileTouch, fileTouch, withFiles } from './messages.js';
 import { registerNudge } from './nudge.js';
 import { CAPPED_KEY, capOutput } from './output.js';
 import { CODEMODE_CALLS, EPISODES_SECTION } from './prompt.js';
@@ -178,7 +178,7 @@ export default function episodes(pi: ExtensionAPI): void {
         if (root) scriptFiles.set(root, [...(scriptFiles.get(root) ?? []), file]);
       }
       const cue = cueFor(
-        resolve(state.cwd, touch.path),
+        absolutePath(state.cwd, touch.path),
         threadRecords(ctx.sessionManager.getBranch())
       );
       if (cue && root) scriptCues.set(root, [...(scriptCues.get(root) ?? []), cue]);

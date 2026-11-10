@@ -1,4 +1,3 @@
-import { resolve } from 'node:path';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 import {
@@ -11,6 +10,7 @@ import {
 } from './archive.js';
 import { COMPACTION_NOTICE_TYPE } from './compaction.js';
 import { type EpisodeEvent, EVENT_TYPE } from './events.js';
+import { absolutePath } from './messages.js';
 import { NUDGE_TYPE } from './nudge.js';
 import { cappedOutput } from './output.js';
 import { EPISODES_SECTION } from './prompt.js';
@@ -442,7 +442,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
     stats.stale.shown += stale.length;
     const reads = callsAfter(entries, index, FOLLOW_WINDOW)
       .filter((call) => call.name === 'read' && call.path)
-      .map((call) => resolve(cwd, call.path!));
+      .map((call) => absolutePath(cwd, call.path!));
     for (const thread of stale) {
       if (thread.files.some((file) => reads.includes(file))) stats.stale.reread++;
     }

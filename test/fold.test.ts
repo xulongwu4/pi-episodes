@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { convertToLlm, type SessionManager } from '@earendil-works/pi-coding-agent';
@@ -653,11 +655,14 @@ test('names the skill files a span read, not the ones it wrote', () => {
     assistant(call('a', 'read', { path: '/skills/tdd/SKILL.md' })),
     assistant(call('b', 'read', { path: 'docs/SKILL.md.bak' })),
     assistant(call('c', 'write', { path: '/skills/new/SKILL.md' })),
-    assistant(call('d', 'read', { path: 'skills/review/SKILL.md' }))
+    assistant(call('d', 'read', { path: 'skills/review/SKILL.md' })),
+    // As pi's read takes it: under the home directory, not under the working directory.
+    assistant(call('e', 'read', { path: '~/.pi/skills/plan/SKILL.md' }))
   ];
   assert.deepEqual(skillPaths(messages, '/repo'), [
     '/skills/tdd/SKILL.md',
-    '/repo/skills/review/SKILL.md'
+    '/repo/skills/review/SKILL.md',
+    join(homedir(), '.pi/skills/plan/SKILL.md')
   ]);
 });
 test('reads the Open section of a note, in the forms the template produces', () => {
