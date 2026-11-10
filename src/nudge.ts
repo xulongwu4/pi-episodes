@@ -5,7 +5,7 @@ import {
   estimateTokens as estimateMessageTokens,
   type ProjectedSessionEntry
 } from '@earendil-works/pi-coding-agent';
-import { foldInstruction, foldStart, noteTokens, renderFoldAsk, USER_TEXT_CAP } from './fold.js';
+import { foldBoundary, foldInstruction, foldStart, renderFoldAsk, USER_TEXT_CAP } from './fold.js';
 import { estimateTokens } from './messages.js';
 import { episodesSettings } from './settings.js';
 import { stampLabel } from './stamps.js';
@@ -24,15 +24,31 @@ export function nudgeThreshold(tokens: number, contextWindow: number | undefined
  * such as those of calls made next to a fold call, and what a fold keeps, such as the start of
  * each user message, are not counted.
  */
-export function nudgeGrowth(entries: readonly ProjectedSessionEntry[]): number {
-  const start = foldStart(entries);
+export function nudgeGrowth(entries: readonly ProjectedSessionEntry[], notes = true): number {
+  const start = foldStart(entries, notes);
   if (!start) return 0;
   const nudged = entries.findLastIndex(
     (entry) =>
       entry.sourceEntry.type === 'custom_message' && entry.sourceEntry.customType === NUDGE_TYPE
   );
+  return foldableTokens(entries.slice(Math.max(start.index, nudged + 1)));
+}
+
+/**
+ * Tokens a fold from the earliest stamp after the latest compaction could remove that sit up
+ * to the latest note: earlier notes, and work a fold that started later left behind them.
+ */
+export function tokensBehindNote(entries: readonly ProjectedSessionEntry[]): number {
+  const start = foldStart(entries, false);
+  const boundary = foldBoundary(entries);
+  return start && start.index <= boundary
+    ? foldableTokens(entries.slice(start.index, boundary + 1))
+    : 0;
+}
+
+function foldableTokens(entries: readonly ProjectedSessionEntry[]): number {
   let tokens = 0;
-  for (const entry of entries.slice(Math.max(start.index, nudged + 1))) {
+  for (const entry of entries) {
     const source = entry.sourceEntry;
     const role = source.type === 'message' ? source.message.role : undefined;
     const size = estimateTokens(entry.messages);
@@ -70,9 +86,11 @@ function continues(message: AssistantMessage): boolean {
  * twice as much on its own. Once less than `foldNudgeTokens` of room is left before pi compacts,
  * a quarter of it is enough. It names the earliest stamp after the latest note: a fold from a
  * later stamp leaves the work before it in context. A fold that reaches back past notes merges
- * them, but rewrites the cache from its start, so the nudge asks for that only once the notes
- * since the latest compaction hold a quarter of the threshold, naming the earliest stamp after
- * the compaction. It is appended, never edited in, so the cached prefix is untouched.
+ * them, and what a later fold left behind them, but rewrites the cache from its start. That
+ * pays only where pi would compact, which loses the cache too, so only close to compaction,
+ * and once a quarter of the threshold sits up to the latest note, does the nudge name the
+ * earliest stamp after the compaction and count that work as well. It is appended, never
+ * edited in, so the cached prefix is untouched.
  */
 export function registerNudge(pi: ExtensionAPI): void {
   const nudge = (
@@ -92,15 +110,15 @@ export function registerNudge(pi: ExtensionAPI): void {
     const pressed =
       usage?.tokens != null &&
       usage.tokens + incoming + threshold >= usage.contextWindow - reserveTokens(pi, ctx.model);
-    const growth = nudgeGrowth(entries);
+    const behind = pressed ? tokensBehindNote(entries) : 0;
+    const merge = behind >= threshold / 4;
+    const growth = nudgeGrowth(entries, !merge);
     if (growth < (pressed ? threshold / 4 : factor * threshold)) return undefined;
-    const notes = noteTokens(entries);
-    const merge = notes >= threshold / 4;
     const earliest = foldStart(entries, !merge);
     if (!earliest) return undefined;
     const since = stampLabel(earliest.stamp);
     const covering = merge
-      ? `a note covering everything from there, including the notes of earlier folds there (about ${Math.round(notes / 1000)}k tokens), which it merges into one`
+      ? `a note covering everything from there, including the notes of earlier folds there (about ${Math.round(behind / 1000)}k tokens with what they left behind), which it merges into one; pi would compact soon otherwise`
       : 'a note covering everything from there';
     return (
       `About ${Math.round(growth / 1000)}k tokens of work built up since the last fold, compaction or message like this one. ` +

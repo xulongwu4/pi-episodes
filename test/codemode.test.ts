@@ -9,6 +9,7 @@ import {
   fauxProvider,
   fauxToolCall,
   getCurrentTools,
+  getSystemMessageText,
   type ImageContent,
   type Message,
   type TranscriptContext
@@ -26,10 +27,11 @@ import {
   appliedFolds,
   FOLD_APPLIED_TYPE,
   FOLD_DETAILS_KEY,
+  ThreadIndex,
   threadRecords
 } from '../src/archive.js';
 import { cacheAnchor } from '../src/cache.js';
-import { foldableTurns } from '../src/fold.js';
+import { foldableTurns, foldStart } from '../src/fold.js';
 import episodes from '../src/index.js';
 import { nudgeGrowth, nudgeThreshold } from '../src/nudge.js';
 import { episodeStats } from '../src/stats.js';
@@ -323,6 +325,15 @@ test('a later fold covers a note a script left, and both spans stay recallable',
     const records = threadRecords(harness.session.sessionManager.getBranch());
     assert.equal(records.length, 2);
     assert.deepEqual((records[1] as { covers?: string[] }).covers, [records[0]!.handle]);
+    // The covered span is archived under its own handle only, as the covering fold's ask sees it.
+    const threads = await new ThreadIndex(harness.session.sessionManager, new Map()).onBranch();
+    const holding = threads.filter((thread) =>
+      thread.messages.some((message) => /first-output/.test(text(message as Message)))
+    );
+    assert.deepEqual(
+      holding.map((thread) => thread.handle),
+      [records[0]!.handle]
+    );
   } finally {
     await harness.cleanup();
   }
@@ -794,52 +805,52 @@ test('a nudge on the next prompt leads to a fold from the earliest stamp', async
   }
 });
 
-test('once earlier notes take up room, the nudge names a stamp before them to merge them', async () => {
-  for (const [note, since, merges] of [
-    ['Printed a long line.', 't5', false],
-    [`Printed a long line. ${'detail '.repeat(60)}`, 't1', true]
+test('close to compaction, once notes take up room, the nudge names a stamp before them to merge them', async () => {
+  const long = `Printed a long line. ${'detail '.repeat(400)}`;
+  // Far from compaction a run is nudged at twice the threshold, and never to merge.
+  for (const [note, since, merges, reserveTokens, size] of [
+    ['Printed a long line.', 't4', false, 127_000, 4000],
+    [long, 't1', true, 127_000, 4000],
+    [long, 't4', false, 16_384, 17_000]
   ] as const) {
-    const big = 'x'.repeat(800);
     const bash = () =>
-      fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${big}` }), {
+      fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(size)}` }), {
         stopReason: 'toolUse'
       });
-    const done = () => fauxAssistantMessage('done');
-    const nudged = (context: Parameters<typeof conversation>[0]) => {
-      const nudge = text(conversation(context).at(-1)!);
-      assert.match(nudge, /tokens of work built up/);
-      return nudge;
+    const nudge = (context: Parameters<typeof conversation>[0]) => {
+      const last = text(conversation(context).at(-1)!);
+      assert.match(last, /tokens of work built up/);
+      return last;
     };
     const harness = await createSession(
       'off',
       [
         bash,
-        done,
         (context) => {
-          nudged(context);
+          nudge(context);
           return fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note }), {
             stopReason: 'toolUse'
           });
         },
-        done,
+        () => fauxAssistantMessage('done'),
         bash,
-        done,
         (context) => {
-          const nudge = nudged(context);
-          assert.equal(/since "(t\d+)"/.exec(nudge)![1], since, note);
-          assert.equal(/which it merges/.test(nudge), merges, note);
+          const last = nudge(context);
+          assert.equal(/since "(t\d+)"/.exec(last)![1], since, note);
+          assert.equal(/which it merges/.test(last), merges, note);
           return fauxAssistantMessage(fauxToolCall('fold', { since, note: 'Both lines.' }), {
             stopReason: 'toolUse'
           });
         },
-        done
+        () => fauxAssistantMessage('done')
       ],
       [],
-      // A note of a quarter of the threshold, 75 tokens, takes up room.
-      { foldNudgeTokens: 300 }
+      // Under pressure a quarter of the threshold, 500 tokens, is enough to nudge and to merge.
+      { foldNudgeTokens: 2000 },
+      { reserveTokens }
     );
     try {
-      await harness.run('first', 'second', 'third', 'fourth');
+      await harness.run('first', 'second');
       const records = threadRecords(harness.session.sessionManager.getBranch());
       assert.equal(records.length, 2, note);
       assert.equal(((records[1] as { covers?: string[] }).covers ?? []).length, merges ? 1 : 0);
@@ -913,10 +924,8 @@ test('a call made next to a fold call is not offered as a start', async () => {
           /sibling/.test(text(message as Message))
       );
     assert.ok(sibling);
-    assert.deepEqual(
-      foldableTurns(entries).map((turn) => turn.label.replace(/^t\d+ +/, '')),
-      ['you: next']
-    );
+    const next = foldableTurns(entries).find((turn) => turn.label.endsWith('you: next'));
+    assert.equal(foldStart(entries)?.stamp, next?.stamp);
     // Nor is its result counted as work a fold could remove.
     assert.ok(nudgeGrowth(entries) < 100);
   } finally {
@@ -1210,5 +1219,27 @@ test('a fold whose note an earlier turn-end handler removes does not take effect
     assert.equal(threadRecords(harness.session.sessionManager.getBranch()).length, 0);
   } finally {
     await harness.cleanup();
+  }
+});
+
+test('under codemode "only" the prompt gives the calls of fold, recall and ask', async () => {
+  for (const mode of ['on', 'only'] as const) {
+    let prompt = '';
+    const harness = await createSession(mode, [
+      (context) => {
+        prompt = context.messages
+          .filter((message) => message.role === 'system')
+          .map(getSystemMessageText)
+          .join('\n');
+        return fauxAssistantMessage('ok');
+      }
+    ]);
+    try {
+      await harness.run('go');
+      assert.match(prompt, /<episodes>/);
+      assert.equal(/tools\.recall\(\{ query, handle\?/.test(prompt), mode === 'only', mode);
+    } finally {
+      await harness.cleanup();
+    }
   }
 });

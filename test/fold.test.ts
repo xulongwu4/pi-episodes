@@ -2,7 +2,12 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { convertToLlm, type SessionManager } from '@earendil-works/pi-coding-agent';
-import { FOLD_APPLIED_TYPE, FOLD_STARTED_TYPE } from '../src/archive.js';
+import {
+  FOLD_APPLIED_TYPE,
+  FOLD_STARTED_TYPE,
+  type ForkArchive,
+  ThreadIndex
+} from '../src/archive.js';
 import {
   completeCutShortFolds,
   foldableTurns,
@@ -498,7 +503,7 @@ test('after a compaction, stamps the summary mentions are gone and the kept ones
   assert.equal(plan.keptUserTurns.join(), 't3');
 });
 
-test('lists the turns a fold can start from, newest first, after the latest note', () => {
+test('lists the turns a fold can start from, newest first, after the latest compaction', () => {
   const { manager } = session(buildLoop);
   assert.deepEqual(
     foldableTurns(manager.buildSessionProjection().entries).map((turn) => turn.label),
@@ -512,6 +517,63 @@ test('lists the turns a fold can start from, newest first, after the latest note
   );
   assert.deepEqual(
     foldableTurns(earlierFold(true)).map((turn) => turn.stamp),
-    [4]
+    [4, 3, 2, 1]
   );
+});
+
+test('a fold inside a fork that covers an earlier one holds only what it removed itself', async () => {
+  const fold = (handle: string, covers?: string[]) => ({
+    kind: 'fold' as const,
+    handle,
+    since: 't1',
+    firstEntryId: '',
+    lastEntryId: '',
+    messages: 0,
+    tokens: 0,
+    headline: handle,
+    keptUserTurns: [],
+    files: [],
+    ...(covers ? { covers } : {})
+  });
+  const messages = [
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'raw-a', 2),
+    assistant(call('f0', 'fold')),
+    result('f0', 'fold', 'note-a', 3),
+    assistant(call('b', 'bash')),
+    result('b', 'bash', 'raw-b', 4),
+    assistant(call('f1', 'fold')),
+    result('f1', 'fold', 'note-b', 5)
+  ];
+  const archive: ForkArchive = {
+    handle: 'fk-1',
+    task: 't',
+    parentEntryId: 'p',
+    messages,
+    folds: [
+      { record: fold('ep-a'), first: 0, last: 1, omit: [0, 1] },
+      { record: fold('ep-b', ['ep-a']), first: 0, last: 5, omit: [2, 3, 4, 5] }
+    ]
+  } as ForkArchive;
+  const { manager } = session([
+    user('go', 1),
+    Object.assign(result('k', 'fork', 'done', 6), {
+      details: {
+        kind: 'fork',
+        handle: 'fk-1',
+        task: 't',
+        parentEntryId: 'p',
+        turns: 1,
+        headline: 'h',
+        files: []
+      }
+    })
+  ]);
+  const threads = await new ThreadIndex(manager, new Map([['fk-1', archive]])).onBranch();
+  const texts = (handle: string) =>
+    threads
+      .find((thread) => thread.handle === handle)!
+      .messages.flatMap((message) => (message.role === 'toolResult' ? [readStamp(message)] : []));
+  assert.deepEqual(texts('ep-a'), [2]);
+  assert.deepEqual(texts('ep-b'), [3, 4]);
 });

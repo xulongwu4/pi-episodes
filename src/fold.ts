@@ -134,15 +134,6 @@ export function foldBoundary(entries: readonly ProjectedSessionEntry[], notes = 
   );
 }
 
-/** Estimated tokens of the applied fold notes since the latest compaction. */
-export function noteTokens(entries: readonly ProjectedSessionEntry[]): number {
-  const applied = appliedFolds(entries.map((entry) => entry.sourceEntry));
-  return entries
-    .slice(foldBoundary(entries, false) + 1)
-    .filter((entry) => isFoldNote(entry, applied))
-    .reduce((sum, entry) => sum + estimateTokens(entry.messages), 0);
-}
-
 /**
  * Index of the entry a span starting at this message starts at. A span starting at a tool
  * result starts at the response that made the call, which can be behind the boundary: a call
@@ -183,11 +174,11 @@ export function foldStart(
 }
 
 /**
- * Stamped turns a fold can start from, newest first: those after the latest applied note or
- * compaction summary, with a one-line preview to recognize them by.
+ * Stamped turns a fold can start from, newest first: those after the latest compaction
+ * summary, with a one-line preview to recognize them by.
  */
 export function foldableTurns(entries: readonly ProjectedSessionEntry[]): FoldableTurn[] {
-  const boundary = foldBoundary(entries);
+  const boundary = foldBoundary(entries, false);
   const turns: FoldableTurn[] = [];
   for (let index = boundary + 1; index < entries.length; index++) {
     for (const message of entries[index]!.messages) {
@@ -585,8 +576,13 @@ export const renderFoldAsk: MessageRenderer = (message, _options, theme) => {
   );
 };
 /** How to ask for a fold call. Under codemode "only" fold is not declared; scripts reach it. */
+/** Whether tools such as fold are hidden from the model and called from codemode scripts. */
+export function codemodeOnly(pi: ExtensionAPI): boolean {
+  return pi.getSettings().codemode?.mode === 'only' && pi.getActiveTools().includes('codemode');
+}
+
 export function foldInstruction(pi: ExtensionAPI): string {
-  return pi.getSettings().codemode?.mode === 'only' && pi.getActiveTools().includes('codemode')
+  return codemodeOnly(pi)
     ? 'make one codemode call whose script calls only fold and prints its result'
     : 'call only fold in this response';
 }
@@ -881,7 +877,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       if (since === undefined && ctx.hasUI) {
         const turns = foldableTurns(ctx.sessionManager.buildSessionProjection().entries);
         if (turns.length === 0) {
-          ctx.ui.notify('Nothing can be folded yet: no turns since the last note.', 'info');
+          ctx.ui.notify('Nothing can be folded yet: no turns since the last compaction.', 'info');
           return;
         }
         const choice = await ctx.ui.select(

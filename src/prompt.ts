@@ -78,3 +78,10 @@ lookups. A fork is a copy of you, not a second opinion. For a review, if you hav
 for another agent, give it the user's requests and the diff, not your reasoning.
 
 `.trim();
+
+/** Appended when fold, recall and ask are called from codemode scripts, out of the model's view. */
+export const CODEMODE_CALLS = /* md */ `
+From a codemode script: tools.fold({ since: "t13", note }), tools.recall({ query, handle?,
+regex?, limit? }) (limit 30 by default, at most 200; the rest go to a file), and
+tools.ask({ handle, question }). Print what they return.
+`.trim();

@@ -357,12 +357,32 @@ export class ThreadIndex {
     const path = this.sessions.getBranch(fold.lastEntryId);
     const start = path.findIndex((entry) => entry.id === fold.firstEntryId);
     if (start < 0) return undefined;
+    // The spans of folds this one covers, and of those they covered, are already archived
+    // under their own handles; this thread holds their notes, as its `ask` context does.
+    const covered = new Set<string>();
+    const records = fold.covers?.length ? foldRecords(this.sessions.getEntries()) : [];
+    const pending = [...(fold.covers ?? [])];
+    const seen = new Set<string>();
+    for (let handle = pending.pop(); handle !== undefined; handle = pending.pop()) {
+      if (seen.has(handle)) continue;
+      seen.add(handle);
+      const record = records.find((candidate) => candidate.handle === handle);
+      if (!record) continue;
+      pending.push(...(record.covers ?? []));
+      const first = path.findIndex((entry) => entry.id === record.firstEntryId);
+      const last = path.findIndex((entry) => entry.id === record.lastEntryId);
+      if (first < 0 || last < first) continue;
+      for (const entry of path.slice(first, last + 1)) covered.add(entry.id);
+    }
 
     return {
       handle: fold.handle,
       kind: 'fold',
       label: fold.until ? `turns ${fold.since}-${fold.until}` : `turns from ${fold.since} on`,
-      messages: path.slice(start).flatMap(sessionEntryToContextMessages),
+      messages: path
+        .slice(start)
+        .filter((entry) => !covered.has(entry.id))
+        .flatMap(sessionEntryToContextMessages),
       context: () => {
         const messages = buildSessionProjection(
           this.sessions.getEntries(),
@@ -402,11 +422,15 @@ export class ThreadIndex {
       }
     ];
     folds.forEach((fold, order) => {
+      // What earlier folds already removed is archived under their handles.
+      const earlier = new Set(folds.slice(0, order).flatMap((other) => other.omit));
       threads.push({
         handle: fold.record.handle,
         kind: 'fold',
         label: `${fold.record.until ? `turns ${fold.record.since}-${fold.record.until}` : `turns from ${fold.record.since} on`}, inside ${fork.handle}`,
-        messages: archive.messages.slice(fold.first, fold.last + 1),
+        messages: archive.messages
+          .slice(fold.first, fold.last + 1)
+          .filter((_, index) => !earlier.has(fold.first + index)),
         // What the child saw when it folded: its earlier folds applied, this one not yet.
         context: () => [
           ...prefix(),

@@ -6,12 +6,12 @@ import { cacheAnchor, placeAnchor } from './cache.js';
 import { registerCompactionNotice } from './compaction.js';
 import { registerStampDisplay } from './display.js';
 import { recordEvent, recordMeta } from './events.js';
-import { registerFold } from './fold.js';
+import { codemodeOnly, registerFold } from './fold.js';
 import { registerFork } from './fork.js';
 import { ForkRegistry, registerForksView } from './forks-view.js';
 import { FILE_TOOLS } from './messages.js';
 import { registerNudge } from './nudge.js';
-import { EPISODES_SECTION } from './prompt.js';
+import { CODEMODE_CALLS, EPISODES_SECTION } from './prompt.js';
 import { registerRecall } from './recall.js';
 import { registerReminder } from './reminder.js';
 import { episodesSettings } from './settings.js';
@@ -48,7 +48,9 @@ export default function episodes(pi: ExtensionAPI): void {
   });
 
   pi.on('before_agent_start', (event) => {
-    event.systemPromptOptions.sections.episodes = EPISODES_SECTION;
+    event.systemPromptOptions.sections.episodes = codemodeOnly(pi)
+      ? `${EPISODES_SECTION}\n\n${CODEMODE_CALLS}`
+      : EPISODES_SECTION;
   });
 
   // Text copied back from an earlier message (for example by /tree) carries its old stamp
