@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { convertToLlm, type SessionManager } from '@earendil-works/pi-coding-agent';
-import { FOLD_APPLIED_TYPE } from '../src/archive.js';
+import { FOLD_APPLIED_TYPE, FOLD_STARTED_TYPE } from '../src/archive.js';
 import {
   completeCutShortFolds,
   foldableTurns,
@@ -108,7 +108,7 @@ test('every prefix of the edits of a fold leaves each tool result next to its ca
 });
 
 test('the rest of a fold cut short after any of its edits completes it', () => {
-  const build = () => {
+  const build = (started: boolean) => {
     const made = session(buildLoop);
     const plan = planFold(made.manager.buildSessionProjection().entries, 'f1', 2);
     const note = Object.assign(result('f1', 'fold', 'note', 6), {
@@ -120,47 +120,33 @@ test('the rest of a fold cut short after any of its edits completes it', () => {
       }
     });
     const noteId = made.manager.appendMessage(note);
+    const targets = plan.edits.map((edit) => edit.targetId);
+    if (started)
+      made.manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, targets });
     return { ...made, plan, noteId };
   };
-  const done = build();
+  const done = build(true);
   apply(done.manager, done.plan.edits);
-  const folded = done.manager.buildSessionProjection().messages;
+  const folded = roles(done.manager.buildSessionProjection().messages);
 
   for (let applied = 0; applied <= done.plan.edits.length; applied++) {
-    const { manager, ids, plan, noteId } = build();
-    apply(
-      manager,
-      done.plan.edits
-        .slice(0, applied)
-        .map((edit) => ({ ...edit, targetId: ids[done.ids.indexOf(edit.targetId)]! }))
-    );
-    const rest = completeCutShortFolds(
-      manager.getBranch(),
-      manager.buildSessionProjection().entries
-    );
+    const { manager, plan, noteId } = build(true);
+    apply(manager, plan.edits.slice(0, applied));
     // A note that a later fold hid is not completed: the later fold stands for its span.
-    if (applied > 0) {
-      const hidden = completeCutShortFolds(
-        [
-          ...manager.getBranch(),
-          {
-            type: 'context_edit',
-            id: 'later',
-            parentId: null,
-            timestamp: '',
-            targetId: noteId,
-            replacement: null
-          }
-        ],
-        manager.buildSessionProjection().entries
-      );
-      assert.deepEqual(hidden, []);
-    }
-    // A fold none of whose edits landed never took effect, and is not completed.
-    if (applied === 0) {
-      assert.deepEqual(rest, []);
-      continue;
-    }
+    const hidden = { type: 'context_edit', id: 'later', parentId: null, timestamp: '' } as const;
+    assert.deepEqual(
+      completeCutShortFolds([
+        ...manager.getBranch(),
+        { ...hidden, targetId: noteId, replacement: null }
+      ]),
+      []
+    );
+    const rest = completeCutShortFolds(manager.getBranch());
+    // Only the edits that did not land, in their order.
+    assert.deepEqual(
+      rest.flatMap((draft) => (draft.type === 'context_edit' ? [draft.targetId] : [])),
+      plan.edits.slice(applied).map((edit) => edit.targetId)
+    );
     assert.deepEqual(rest.at(-1), {
       type: 'custom',
       customType: FOLD_APPLIED_TYPE,
@@ -171,12 +157,29 @@ test('the rest of a fold cut short after any of its edits completes it', () => {
         manager.appendContextEdit(draft.targetId, draft.replacement);
       else manager.appendCustomEntry(draft.customType, draft.data);
     }
-    assert.deepEqual(roles(manager.buildSessionProjection().messages), roles(folded), `${applied}`);
-    assert.deepEqual(
-      completeCutShortFolds(manager.getBranch(), manager.buildSessionProjection().entries),
-      []
-    );
+    assert.deepEqual(roles(manager.buildSessionProjection().messages), folded, `${applied}`);
+    assert.deepEqual(completeCutShortFolds(manager.getBranch()), []);
   }
+});
+
+test('a fold whose batch never landed is not completed, whatever later edits touch its span', () => {
+  // Without its start entry the fold never took effect; an edit by another extension to a
+  // result in its span is not progress of the fold.
+  const { manager, ids } = session(buildLoop);
+  const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2);
+  manager.appendMessage(
+    Object.assign(result('f1', 'fold', 'note', 6), {
+      details: {
+        kind: 'fold',
+        handle: plan.handle,
+        firstEntryId: plan.firstEntryId,
+        lastEntryId: plan.lastEntryId
+      }
+    })
+  );
+  manager.appendContextEdit(ids[4]!, { content: [{ type: 'text', text: 'shortened' }] });
+  manager.appendContextEdit(ids[7]!, null);
+  assert.deepEqual(completeCutShortFolds(manager.getBranch()), []);
 });
 
 test('a stamp on one result of a parallel batch folds the whole batch', () => {

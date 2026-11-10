@@ -25,6 +25,12 @@ export const FOLD_REQUEST_TYPE = 'episodes-fold-request';
  */
 export const FOLD_APPLIED_TYPE = 'episodes-fold-applied';
 /**
+ * Written first in a fold's batch, with the fold's handle and the targets of its edits in the
+ * order they follow. It tells a fold cut short from one that never took effect, and which of its
+ * edits landed.
+ */
+export const FOLD_STARTED_TYPE = 'episodes-fold-started';
+/**
  * Key under which a fold called from a codemode script stores its FoldDetails on the script's
  * tool result. That result stays in context as the fold's note, as a fold result does for a
  * top-level call; the script's own details stay alongside.

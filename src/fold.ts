@@ -16,6 +16,7 @@ import {
   FOLD_APPLIED_TYPE,
   FOLD_DETAILS_KEY,
   FOLD_REQUEST_TYPE,
+  FOLD_STARTED_TYPE,
   FOLD_TOOL,
   type FoldDetails,
   foldEntryDetails,
@@ -210,37 +211,48 @@ function entryEdit(
 }
 
 /**
- * The rest of the edits of folds cut short partway: a note without the applied marker, some of
- * whose span an edit after it already hid. Pi writes a fold's edits one at a time, from the end
- * of the span, so a crash can stop it midway; its remaining edits and its marker complete it.
- * A note that a later fold hid, or whose span no edit touched, is left alone.
+ * The rest of the edits of folds cut short partway. An applied fold writes a start entry naming
+ * its edit targets, then its edits in that order, then the applied marker; Pi writes them one at
+ * a time, so a crash can stop the batch midway. A start entry without a marker: the targets after
+ * the edits that landed still need their edits, then the marker. Only edits right after the
+ * start entry count as landed, so another extension's edit is never taken for the fold's own.
+ * A fold whose note a later fold hid is left alone: the later fold stands for its span.
  */
 export function completeCutShortFolds(
-  branch: readonly SessionEntry[],
-  entries: readonly ProjectedSessionEntry[]
+  branch: readonly SessionEntry[]
 ): (ContextEditEntryDraft | { type: 'custom'; customType: string; data: { handle: string } })[] {
   const applied = appliedFolds(branch);
-  return branch.flatMap((note, index) => {
-    const details = foldEntryDetails(note);
-    if (!details || applied.has(details.handle)) return [];
-    const first = branch.findIndex((entry) => entry.id === details.firstEntryId);
-    const last = branch.findIndex((entry) => entry.id === details.lastEntryId);
-    if (first < 0 || last < first || last >= index) return [];
-    const span = new Set(branch.slice(first, last + 1).map((entry) => entry.id));
-    const edited = new Set(
-      branch
-        .slice(index + 1)
-        .flatMap((entry) => (entry.type === 'context_edit' ? [entry.targetId] : []))
-    );
-    if (edited.has(note.id) || ![...span].some((id) => edited.has(id))) return [];
-    const rest = entries
-      .filter((entry) => span.has(entry.sourceEntry.id) && !edited.has(entry.sourceEntry.id))
-      .flatMap((entry) => entryEdit(entry, details.handle) ?? [])
-      .reverse();
-    return [
-      ...rest,
-      { type: 'custom' as const, customType: FOLD_APPLIED_TYPE, data: { handle: details.handle } }
-    ];
+  const byId = new Map(branch.map((entry) => [entry.id, entry]));
+  return branch.flatMap((start, index) => {
+    if (start.type !== 'custom' || start.customType !== FOLD_STARTED_TYPE) return [];
+    const { handle, targets } = (start.data ?? {}) as { handle?: unknown; targets?: unknown };
+    if (typeof handle !== 'string' || applied.has(handle) || !Array.isArray(targets)) return [];
+    let landed = 0;
+    while (landed < targets.length) {
+      const entry = branch[index + 1 + landed];
+      if (entry?.type !== 'context_edit' || entry.targetId !== targets[landed]) break;
+      landed++;
+    }
+    const later = branch.slice(index + 1);
+    const note = branch.find((entry) => foldEntryDetails(entry)?.handle === handle);
+    if (
+      note &&
+      later.some((entry) => entry.type === 'context_edit' && entry.targetId === note.id)
+    ) {
+      return [];
+    }
+    const rest = targets.slice(landed).flatMap((id): ContextEditEntryDraft[] => {
+      const source = typeof id === 'string' ? byId.get(id) : undefined;
+      if (!source) return [];
+      if (source.type === 'message' && source.message.role === 'user') {
+        const capped = capUserContent(source.message.content, handle);
+        return capped
+          ? [{ type: 'context_edit', targetId: id, replacement: { content: capped } }]
+          : [];
+      }
+      return [{ type: 'context_edit', targetId: id, replacement: null }];
+    });
+    return [...rest, { type: 'custom' as const, customType: FOLD_APPLIED_TYPE, data: { handle } }];
   });
 }
 
@@ -761,10 +773,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         state.pendingFolds.delete(result.toolCallId);
         return [pending];
       });
-    const repairs = completeCutShortFolds(
-      ctx.sessionManager.getBranch(),
-      event.context.contextEntries
-    );
+    const repairs = completeCutShortFolds(ctx.sessionManager.getBranch());
     if (applied.length === 0 && repairs.length === 0) return undefined;
 
     for (const fold of applied) {
@@ -781,6 +790,11 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         // context, and no applied note; a marker written first would leave the rest of the span
         // stuck behind a note no fold can reach past.
         ...applied.flatMap((fold) => [
+          {
+            type: 'custom' as const,
+            customType: FOLD_STARTED_TYPE,
+            data: { handle: fold.handle, targets: fold.edits.map((edit) => edit.targetId) }
+          },
           ...fold.edits,
           { type: 'custom' as const, customType: FOLD_APPLIED_TYPE, data: { handle: fold.handle } }
         ])
