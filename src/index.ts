@@ -1,6 +1,17 @@
 import { relative, resolve } from 'node:path';
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import { appliedFolds, FORK_TOOL, type ThreadRecord, threadRecords } from './archive.js';
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ToolResultEvent
+} from '@earendil-works/pi-coding-agent';
+import {
+  appliedFolds,
+  archiveDir,
+  FOLD_TOOL,
+  FORK_TOOL,
+  type ThreadRecord,
+  threadRecords
+} from './archive.js';
 import { registerAsk } from './ask.js';
 import { cacheAnchor, placeAnchor } from './cache.js';
 import { registerCompactionNotice } from './compaction.js';
@@ -11,6 +22,7 @@ import { registerFork } from './fork.js';
 import { ForkRegistry, registerForksView } from './forks-view.js';
 import { FILE_TOOLS } from './messages.js';
 import { registerNudge } from './nudge.js';
+import { CAPPED_KEY, capOutput } from './output.js';
 import { CODEMODE_CALLS, EPISODES_SECTION } from './prompt.js';
 import { registerRecall } from './recall.js';
 import { registerReminder } from './reminder.js';
@@ -21,6 +33,11 @@ import { refreshStatus } from './ui.js';
 
 const STALE_STAMP = /\s*\[t\d+\]\s*$/;
 const MAX_SURFACED_THREADS = 2;
+/**
+ * Results the output cap leaves whole: the extension's own, which are bounded or are the note,
+ * and reads, whose text is already in a file the model can read a slice of.
+ */
+const UNCAPPED_TOOLS = new Set([FOLD_TOOL, FORK_TOOL, 'recall', 'ask', 'read']);
 
 /** Threads to point at from a tool result that touched one of their files. */
 interface Cue {
@@ -115,7 +132,9 @@ export default function episodes(pi: ExtensionAPI): void {
   // A script that never returned, for example when the run was aborted, leaves its cues.
   pi.on('agent_settled', () => scriptCues.clear());
   pi.on('session_start', () => scriptCues.clear());
-  pi.on('tool_result', (event, ctx) => {
+  pi.on('tool_result', async (event, ctx) => {
+    // Not awaited for a script's inner calls, whose cues must be collected in call order.
+    const capped = event.parentToolCallId ? undefined : await cap(event, ctx);
     // A fork's child calls tools under the fork's call too; its reads are not the parent's.
     const cues =
       event.parentToolCallId || event.toolName === FORK_TOOL
@@ -134,14 +153,52 @@ export default function episodes(pi: ExtensionAPI): void {
     }
 
     const lines = cues.flatMap((cue) => surface(cue, event.toolCallId));
-    if (lines.length === 0) return undefined;
-    const content = [...event.content, { type: 'text' as const, text: lines.join('\n') }];
+    if (lines.length === 0 && !capped) return undefined;
+    const content = [
+      ...(capped?.content ?? event.content),
+      ...(lines.length > 0 ? [{ type: 'text' as const, text: lines.join('\n') }] : [])
+    ];
+    // A cut result no longer matches its structured output, which pi then drops.
+    if (capped) return { content, details: capped.details };
     // Replacing content alone would drop structured output for programmatic callers.
     return event.structuredContent === undefined
       ? { content }
       : { content, structuredContent: event.structuredContent };
   });
 
+  /**
+   * The result cut to a preview, when it is large and the model will see it. A script's inner
+   * calls keep their output for the script, errors stay whole, and a session without a file
+   * has nowhere to keep the rest. Any failure leaves the result as it is.
+   */
+  async function cap(event: ToolResultEvent, ctx: ExtensionContext) {
+    const settings = episodesSettings(pi.getSettings());
+    const dir = archiveDir(ctx.sessionManager);
+    const details = event.details;
+    if (
+      !settings.outputCap ||
+      !dir ||
+      event.parentToolCallId ||
+      event.isError ||
+      UNCAPPED_TOOLS.has(event.toolName) ||
+      // Details that are not an object could not also say where the rest is.
+      (details !== undefined &&
+        (typeof details !== 'object' || details === null || Array.isArray(details)))
+    ) {
+      return undefined;
+    }
+    try {
+      const cut = await capOutput(
+        event.content,
+        dir,
+        settings.outputCapChars,
+        settings.outputCapKeepChars
+      );
+      return cut && { content: cut.content, details: { ...details, [CAPPED_KEY]: cut.capped } };
+    } catch {
+      return undefined;
+    }
+  }
   function cueFor(absolute: string, threads: readonly ThreadRecord[]): Cue | undefined {
     const matched = threads.filter(
       (record) =>

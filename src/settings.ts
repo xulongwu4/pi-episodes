@@ -19,6 +19,14 @@ export interface EpisodesSettings {
    */
   foldNudge: boolean;
   foldNudgeTokens: number;
+  /**
+   * Cut a tool result of `outputCapChars` characters or more down to about
+   * `outputCapKeepChars` before it enters the context, and keep all of it in a file next to
+   * the session.
+   */
+  outputCap: boolean;
+  outputCapChars: number;
+  outputCapKeepChars: number;
 }
 
 const DEFAULTS: EpisodesSettings = {
@@ -28,7 +36,10 @@ const DEFAULTS: EpisodesSettings = {
   compactionNotice: true,
   cacheAnchor: true,
   foldNudge: true,
-  foldNudgeTokens: 50_000
+  foldNudgeTokens: 50_000,
+  outputCap: true,
+  outputCapChars: 16_000,
+  outputCapKeepChars: 6_000
 };
 
 function flag(value: unknown, fallback: boolean): boolean {
@@ -48,6 +59,9 @@ export function episodesSettings(settings: object): EpisodesSettings {
     compactionNotice: flag(raw.compactionNotice, DEFAULTS.compactionNotice),
     cacheAnchor: flag(raw.cacheAnchor, DEFAULTS.cacheAnchor),
     foldNudge: flag(raw.foldNudge, DEFAULTS.foldNudge),
-    foldNudgeTokens: positive(raw.foldNudgeTokens, DEFAULTS.foldNudgeTokens)
+    foldNudgeTokens: positive(raw.foldNudgeTokens, DEFAULTS.foldNudgeTokens),
+    outputCap: flag(raw.outputCap, DEFAULTS.outputCap),
+    outputCapChars: positive(raw.outputCapChars, DEFAULTS.outputCapChars),
+    outputCapKeepChars: positive(raw.outputCapKeepChars, DEFAULTS.outputCapKeepChars)
   };
 }

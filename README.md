@@ -85,6 +85,12 @@ Left alone, the model folds late or not at all: the prompt is its only reason to
 { "episodes": { "foldNudge": false, "foldNudgeTokens": 50000 } }
 ```
 
+A tool result of 16,000 characters or more is cut before it enters the context: the model gets about 6,000 of them, the start and the end two to one, around a line naming a file next to the session that holds all of it. The result is stored that way, so nothing already cached changes. `recall` searches the whole text once the result is folded. Results of `read` are left whole, since the file is already there to read a slice of, and so are errors, the results of the extension's own tools, and the calls a codemode script makes, which the script needs in full. Sessions without a file (`--no-session`) are not capped.
+
+```json
+{ "episodes": { "outputCap": false, "outputCapChars": 16000, "outputCapKeepChars": 6000 } }
+```
+
 <br />
 
 ## Tools
@@ -142,6 +148,7 @@ context per request  ▃▄▅▆▇▂▃▄▅▆▂▃▄▅▆▇▂▃
 folds 2, median ~18k, notes ~1k (1 span picked by you)
 fold errors 1, next fold succeeded after 1
 context ~41k folded, ~380k fewer tokens sent since, compactions 0
+outputs capped 3, ~21k kept out of context
 cache missed after fold avg ~24k, anchor placed 2/2, anchor to span start avg ~3k
 recall 3 (1 empty), ask 1, stale 1 (re-read 1)
 cues 2, followed 1 (1 read-only)
@@ -171,6 +178,7 @@ To measure what the cache anchor saves, turn it off with `{ "episodes": { "cache
 | Measurement events and run metadata | The session file, as `episodes-event` and `episodes-meta` custom entries, which are never sent to the model |
 | Fork transcripts | `<session>.episodes/<handle>.json` next to the session file, or memory for `--no-session` |
 | Recall overflow | `<session>.episodes/recall-<time>-<query>.txt`, or the OS temp directory for `--no-session` |
+| Tool results cut on arrival | `<session>.episodes/output-<hash>.txt`, named by the hash of the text; the result's `details.episodesOutput` holds the path |
 | Recall search index | Memory only: built on the first ranked `recall` of a session from the archive, then added to as threads are archived |
 | Working tree snapshots | A private git index and object store in the OS temp directory, using the repository's objects read-only; removed when the session ends. The repository's index, stash and `.git/objects` are never written |
 

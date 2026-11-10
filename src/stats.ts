@@ -12,6 +12,7 @@ import {
 import { COMPACTION_NOTICE_TYPE } from './compaction.js';
 import { type EpisodeEvent, EVENT_TYPE } from './events.js';
 import { NUDGE_TYPE } from './nudge.js';
+import { cappedOutput } from './output.js';
 import { EPISODES_SECTION } from './prompt.js';
 import { REMINDER_TYPE } from './reminder.js';
 import { isStampBlock } from './stamps.js';
@@ -76,6 +77,8 @@ export interface EpisodeStats {
     refused: number;
     cost: number;
   };
+  /** Tool results cut on arrival, and the estimated tokens that kept out of context. */
+  outputs: { capped: number; tokens: number };
   compactions: number;
   reminders: number;
   nudges: number;
@@ -164,6 +167,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
     stale: { shown: 0, reread: 0 },
     cues: { shown: 0, followed: 0, readOnly: 0, capped: 0 },
     forks: { count: 0, turns: 0, folds: 0, failed: 0, refused: 0, cost: 0 },
+    outputs: { capped: 0, tokens: 0 },
     compactions: 0,
     reminders: 0,
     nudges: 0,
@@ -289,6 +293,12 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
     }
     if (found.role !== 'toolResult') return;
     stats.overhead.cues += tokensOf(textChars(found, (text) => text.startsWith('[episodes] ')));
+    const capped = cappedOutput(found.details);
+    const preview = capped && found.content[capped.block];
+    if (capped && preview?.type === 'text') {
+      stats.outputs.capped++;
+      stats.outputs.tokens += tokensOf(Math.max(0, capped.chars - preview.text.length));
+    }
 
     const details = found.details;
     const fold = foldNoteDetails(found);
@@ -428,6 +438,11 @@ export function statsLines(stats: EpisodeStats): string[] {
   if (folds.count > 0 || stats.compactions > 0) {
     lines.push(
       `context ~${k(folds.tokens)} folded, ~${k(folds.saved)} fewer tokens sent since, compactions ${stats.compactions}`
+    );
+  }
+  if (stats.outputs.capped > 0) {
+    lines.push(
+      `outputs capped ${stats.outputs.capped}, ~${k(stats.outputs.tokens)} kept out of context`
     );
   }
   if (folds.uncachedAfter.length > 0 || folds.anchorKnown > 0) {

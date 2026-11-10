@@ -43,7 +43,12 @@ function conversation(context: TranscriptContext): Message[] {
 
 async function createSession(
   steps: Step[],
-  options: { git?: boolean; persist?: boolean; keepRecentTokens?: number } = {}
+  options: {
+    git?: boolean;
+    persist?: boolean;
+    keepRecentTokens?: number;
+    episodes?: Record<string, unknown>;
+  } = {}
 ) {
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-session-'));
   if (options.git) execFileSync('git', ['init', '-q'], { cwd: dir });
@@ -88,7 +93,8 @@ async function createSession(
         ...(options.keepRecentTokens === undefined
           ? {}
           : { keepRecentTokens: options.keepRecentTokens })
-      }
+      },
+      ...(options.episodes ? { episodes: options.episodes } : {})
     })
   });
   await session.bindExtensions({});
@@ -583,6 +589,87 @@ test('a note names the skill files read inside its span', async () => {
     await mkdir(join(harness.dir, 'skills/tdd'), { recursive: true });
     await writeFile(join(harness.dir, 'skills/tdd/SKILL.md'), 'Write the test first.\n');
     await harness.session.prompt('use the skill');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+test('a large tool result arrives cut, and recall searches all of it', async () => {
+  let handle = '';
+  const harness = await createSession(
+    [
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('bash', { command: 'seq -f "row %g of the table" 1 600' })
+        ),
+      (context) => {
+        const output = text(conversation(context).at(-1)!);
+        assert.match(output, /^row 1 of the table\n/);
+        assert.match(
+          output,
+          /\[episodes\] \d+ of \d+ characters left out here\. All of this output is in /
+        );
+        assert.match(output, /row 600 of the table\n+\[t2\]$/);
+        assert.doesNotMatch(output, /row 300 of/);
+        assert.ok(output.length < 1000);
+        return fauxAssistantMessage(
+          fauxToolCall('fold', { since: 't2', note: 'Printed the table.' })
+        );
+      },
+      (context) => {
+        handle = /ep-[0-9a-f]{8}/.exec(text(conversation(context).at(-1)!))![0];
+        return fauxAssistantMessage(fauxToolCall('recall', { query: '"row 300 of the table"' }));
+      },
+      (context) => {
+        // The line was never in context; it is found in what the result was cut from.
+        assert.equal(
+          text(conversation(context).at(-1)!).split('\n')[0],
+          `${handle} t2 toolResult: row 300 of the table`
+        );
+        return fauxAssistantMessage('done');
+      }
+    ],
+    { persist: true, episodes: { outputCapChars: 2000, outputCapKeepChars: 600 } }
+  );
+
+  try {
+    await harness.session.prompt('print the table');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+
+    const stats = episodeStats(harness.session.sessionManager.getBranch(), harness.dir);
+    assert.equal(stats.outputs.capped, 1);
+    assert.ok(stats.outputs.tokens > 2000);
+    assert.equal(stats.recall.count, 1);
+    const lines = statsLines(stats);
+    assert.ok(lines.some((line) => /^outputs capped 1, ~\dk kept out of context$/.test(line)));
+
+    const sessions = join(harness.dir, 'sessions');
+    const archive = (await readdir(sessions)).find((name) => name.endsWith('.episodes'))!;
+    const files = await readdir(join(sessions, archive));
+    assert.ok(files.some((name) => /^output-[0-9a-f]{16}\.txt$/.test(name)));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('an output cap that is off leaves large results whole', async () => {
+  const harness = await createSession(
+    [
+      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'seq 1 3000' })),
+      (context) => {
+        const output = text(conversation(context).at(-1)!);
+        assert.match(output, /\n1500\n/);
+        assert.doesNotMatch(output, /left out here/);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    { persist: true, episodes: { outputCap: false, outputCapChars: 2000, outputCapKeepChars: 600 } }
+  );
+
+  try {
+    await harness.session.prompt('count');
     if (harness.failures[0]) throw harness.failures[0];
     assert.equal(harness.pending(), 0);
   } finally {

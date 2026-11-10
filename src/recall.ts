@@ -5,6 +5,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { archiveDir, type Thread, ThreadIndex } from './archive.js';
 import { messageText } from './messages.js';
+import { withFullOutput } from './output.js';
 import { excerpt, RecallIndex, type RecallMatch, type SearchableThread } from './search.js';
 import { readStamp, stampLabel } from './stamps.js';
 import type { EpisodeState } from './state.js';
@@ -156,6 +157,13 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
       } else {
         threads = await index.onBranch();
       }
+      // What a tool result was cut from when it arrived is part of the record.
+      threads = await Promise.all(
+        threads.map(async (thread) => ({
+          ...thread,
+          messages: await Promise.all(thread.messages.map(withFullOutput))
+        }))
+      );
 
       if (threads.length === 0) {
         return {
