@@ -237,7 +237,8 @@ test('a fold with until removes old turns and keeps the work after them', async 
   const harness = await createSession(
     [
       () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo one > a.txt' })),
-      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo two' })),
+      // Longer than one turn is read back whole, shorter than a range is.
+      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'seq -f "two %g" 1 1500' })),
       () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo three > c.txt; echo 3' })),
       () =>
         fauxAssistantMessage(fauxToolCall('fold', { since: 't2', until: 't3', note: 'one, two' })),
@@ -252,19 +253,35 @@ test('a fold with until removes old turns and keeps the work after them', async 
         // The disk changes are the span's, not those of the turns kept after it.
         assert.match(note, /A a\.txt/);
         assert.doesNotMatch(note, /c\.txt/);
-        return fauxAssistantMessage(fauxToolCall('recall', { query: '"echo two"' }));
+        return fauxAssistantMessage(fauxToolCall('recall', { query: '"two 1500"' }));
       },
       (context) => {
         const found = text(conversation(context).at(-1)!);
-        assert.match(found, /ep-[0-9a-f]{8} .*echo two/);
+        assert.match(found, /ep-[0-9a-f]{8} .*two 1500/);
         const handle = /ep-[0-9a-f]{8}/.exec(found)![0];
-        return fauxAssistantMessage(fauxToolCall('recall', { handle, turn: 't2-t3' }));
+        return fauxAssistantMessage(fauxToolCall('recall', { handle, turn: ' t2-t3 ' }));
       },
       (context) => {
-        // Both turns of the span, each message under its own turn.
+        // Both turns of the span, each message under its own turn, and all of them.
         const back = text(conversation(context).at(-1)!);
         assert.match(back, /^ep-[0-9a-f]{8} t2 toolResult \(bash\), \d+ chars\n/);
-        assert.match(back, /\n\nep-[0-9a-f]{8} t3 toolResult \(bash\), \d+ chars\ntwo\n/);
+        assert.match(back, /\n\nep-[0-9a-f]{8} t3 toolResult \(bash\), \d+ chars\ntwo 1\n/);
+        assert.match(back, /\ntwo 1500\n/);
+        assert.doesNotMatch(back, /more characters/);
+        const handle = /ep-[0-9a-f]{8}/.exec(back)![0];
+        return fauxAssistantMessage(fauxToolCall('recall', { handle, turn: 't3' }));
+      },
+      (context) => {
+        const back = text(conversation(context).at(-1)!);
+        assert.match(back, /more characters\. All of t3 is in /);
+        const handle = /ep-[0-9a-f]{8}/.exec(back)![0];
+        // A turn of blanks is no turn: the query runs.
+        return fauxAssistantMessage(
+          fauxToolCall('recall', { handle, turn: ' ', query: '"two 1499"' })
+        );
+      },
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /ep-[0-9a-f]{8} t3 toolResult.*two 1499/);
         return fauxAssistantMessage('ok');
       }
     ],

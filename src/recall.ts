@@ -190,10 +190,11 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const query = params.query ?? '';
-      if (!params.turn && !query.trim()) {
+      const asked = params.turn?.trim();
+      if (!asked && !query.trim()) {
         throw new Error('recall needs a query, or a handle and a turn to read that turn back.');
       }
-      if (params.turn && !params.handle) {
+      if (asked && !params.handle) {
         throw new Error('turn needs the handle of the thread it is in.');
       }
       const index = new ThreadIndex(ctx.sessionManager, state.forkArchives);
@@ -220,15 +221,15 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
         };
       }
 
-      if (params.turn) {
+      if (asked) {
         const thread = threads[0]!;
-        const [first, last, ...more] = params.turn.split('-').map(parseStamp);
-        const ranged = params.turn.includes('-');
+        const [first, last, ...more] = asked.split('-').map(parseStamp);
+        const ranged = asked.includes('-');
         const valid =
           first !== undefined && more.length === 0 && (!ranged || (last ?? -1) >= first);
         const messages = valid ? turnMessages(thread, first, last) : [];
         if (messages.length === 0) {
-          throw new Error(`No turn ${params.turn} in ${thread.handle} (${thread.label}).`);
+          throw new Error(`No turn ${asked} in ${thread.handle} (${thread.label}).`);
         }
         const from = stampLabel(first!);
         const turn = last === undefined || last === first ? from : `${from}-${stampLabel(last)}`;
