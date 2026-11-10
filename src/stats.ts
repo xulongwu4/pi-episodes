@@ -115,9 +115,10 @@ function weighted(values: readonly { value: number | undefined; weight: number }
  * The rates the session's own requests show. Costs come from pi's price table for the model
  * that answered. Each model's rates are worked out from its own requests, since one model's
  * cached tokens say nothing next to another's input price, and requests without a recorded
- * cost are left out, since their tokens would count as free. With several models the rates
- * are the mix, weighted by the tokens each was sent. A cache read recorded at no cost is a
- * rate of zero, not an unknown one.
+ * cost are left out, since their tokens would count as free. With several models the input
+ * price is the mix by the tokens each was sent, and each rate the mix by those tokens at the
+ * model's input price, so that rate times input price is the mean price of such a token. A
+ * cache read recorded at no cost is a rate of zero, not an unknown one.
  */
 export function cacheRates(usages: readonly PricedUsage[]): CacheRates {
   const models = new Map<string, Record<'input' | 'output' | 'read' | 'write', number[]>>();
@@ -158,9 +159,11 @@ export function cacheRates(usages: readonly PricedUsage[]): CacheRates {
       }
     ];
   });
+  const inputPrice = weighted(rates.map((model) => ({ value: model.price, weight: model.weight })));
+  // A rate is a share of the input price, so a model counts by its tokens at its price: the
+  // mixed rate times the mixed input price is then the mean of what the models charge.
   const mix = (pick: (model: (typeof rates)[number]) => number | undefined) =>
-    weighted(rates.map((model) => ({ value: pick(model), weight: model.weight })));
-  const inputPrice = mix((model) => model.price);
+    weighted(rates.map((model) => ({ value: pick(model), weight: model.weight * model.price })));
   const priced = inputPrice === undefined ? {} : { inputPrice };
   const output = mix((model) => model.output) ?? 0;
   const cached = mix((model) => model.cached);

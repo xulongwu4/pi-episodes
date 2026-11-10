@@ -101,9 +101,15 @@ test('rates keep each model apart and leave out requests without a cost', () => 
     model,
     cost: { input: input * price, output: 0, cacheRead: cacheRead * price * read, cacheWrite: 0 }
   });
-  const near = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-9);
+  const near = (actual: number, expected: number) =>
+    assert.ok(Math.abs(actual - expected) < 1e-9 * expected, `${actual}`);
   // Both models bill cached input at a tenth; one mostly read from cache, the other did not.
   near(cacheRates([sent('a', 1e-6, 100, 100_000), sent('b', 1e-4, 100_000, 100)]).cached, 0.1);
+  // Models with different prices and discounts, sent as much: rate times input price is the
+  // mean price of a cached token, $25.05 per million here.
+  const mixed = cacheRates([sent('a', 1e-6, 1000, 1000), sent('b', 1e-4, 1000, 1000, 0.5)]);
+  near(mixed.inputPrice!, 50.5e-6);
+  near(mixed.cached * mixed.inputPrice!, 25.05e-6);
   // Tokens of a request with no recorded cost are not input that cost nothing.
   const free = {
     ...sent('a', 0, 9000, 0),
