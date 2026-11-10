@@ -32,6 +32,20 @@ export function cappedOutput(details: unknown): CappedOutput | undefined {
     : undefined;
 }
 
+/**
+ * Where another extension kept the text of a result it cut on arrival, as tool-result-offload
+ * records it: the file, and the hash of the text to check the file against.
+ */
+function offloadedOutput(details: unknown): { path: string; sha256: string } | undefined {
+  if (typeof details !== 'object' || details === null) return undefined;
+  const offload = (details as Record<string, unknown>).offload as
+    | { path?: unknown; sha256?: unknown }
+    | undefined;
+  return typeof offload?.path === 'string' && typeof offload.sha256 === 'string'
+    ? { path: offload.path, sha256: offload.sha256 }
+    : undefined;
+}
+
 // Cut at a line break when one is in the nearer half, so the preview does not end mid-line.
 function head(text: string, chars: number): string {
   const end = text.lastIndexOf('\n', chars);
@@ -100,23 +114,30 @@ export async function capOutput(
 
 /**
  * The message with the text its preview was cut from put back, for searching and reading
- * back an archived thread. Unchanged when it was not cut or its file is gone.
+ * back an archived thread, whether this extension cut it or tool-result-offload did.
+ * Unchanged when it was not cut, its file is gone, or the file is not the text the other
+ * extension recorded.
  */
 export async function withFullOutput(message: AgentMessage): Promise<AgentMessage> {
   if (message.role !== 'toolResult') return message;
   const capped = cappedOutput(message.details);
-  if (!capped) return message;
+  const offloaded = capped ? undefined : offloadedOutput(message.details);
+  const path = capped?.path ?? offloaded?.path;
+  if (path === undefined) return message;
   // The preview names its file. A handler that ran after the cut can have put a block before
   // it, so the recorded index is only where to look first.
-  const at = [capped.block, ...message.content.keys()].find((index) => {
+  const at = [...(capped ? [capped.block] : []), ...message.content.keys()].find((index) => {
     const block = message.content[index];
-    return block?.type === 'text' && block.text.includes(capped.path);
+    return block?.type === 'text' && block.text.includes(path);
   });
   if (at === undefined) return message;
   let text: string;
   try {
-    text = await readFile(capped.path, 'utf8');
+    text = await readFile(path, 'utf8');
   } catch {
+    return message;
+  }
+  if (offloaded && createHash('sha256').update(text).digest('hex') !== offloaded.sha256) {
     return message;
   }
   return {

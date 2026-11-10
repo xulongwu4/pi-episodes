@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -160,6 +160,47 @@ test('the full text is put back for search, under the stamp', async () => {
     assert.equal(await withFullOutput(message), message);
     const plain = result('c2', 'bash', 'ok', 8);
     assert.equal(await withFullOutput(plain), plain);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the text another extension offloaded is put back when its file matches the record', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    // As tool-result-offload leaves a script's result: the status block, then one preview.
+    const sha256 = createHash('sha256').update(long).digest('hex');
+    const path = join(dir, `${sha256}.txt`);
+    await writeFile(path, long);
+    const header = {
+      type: 'text' as const,
+      text: 'Script completed\nWall time 0.1 seconds\nOutput:\n'
+    };
+    const preview = `line 0\n\n[tool-result-offload: 9 of 10 chars omitted. This result in full (sha256 ${sha256.slice(0, 12)}): ${path} — grep it.]\n\nline 9`;
+    const message: Extract<AgentMessage, { role: 'toolResult' }> = {
+      role: 'toolResult',
+      toolCallId: 'c1',
+      toolName: 'codemode',
+      content: withStamp([header, { type: 'text', text: preview }], 7),
+      details: { offload: { path, sha256, chars: long.length } },
+      isError: false,
+      timestamp: 0
+    };
+    const full = await withFullOutput(message);
+    assert.ok(full.role === 'toolResult');
+    assert.deepEqual(full.content.slice(0, 2), [header, { type: 'text', text: long }]);
+    assert.equal(readStamp(full), 7);
+
+    // A record without the hash, or a result that no longer names the file, is left alone.
+    const unhashed = { ...message, details: { offload: { path } } };
+    assert.equal(await withFullOutput(unhashed), unhashed);
+    const replaced = { ...message, content: withStamp([header], 7) };
+    assert.equal(await withFullOutput(replaced), replaced);
+    // A file that is not the recorded text is not the output.
+    await writeFile(path, 'something else');
+    assert.equal(await withFullOutput(message), message);
+    await rm(path);
+    assert.equal(await withFullOutput(message), message);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
