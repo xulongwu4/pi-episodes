@@ -768,11 +768,31 @@ test('stats read the session: folds, rejections, cues followed, and the drop aft
     assert.equal(after, 4);
     assert.ok(stats.requests[after]!.tokens < stats.requests[after - 1]!.tokens);
     assert.ok(stats.folds.saved > 0);
+    // Each fold with what it cost on its first request and how long it has been in effect.
+    assert.deepEqual(
+      stats.folds.each.map((fold) => [fold.handle === handle, fold.requests]),
+      [
+        [true, 4],
+        [false, 1]
+      ]
+    );
+    assert.deepEqual(
+      stats.folds.each.map((fold) => fold.uncachedAfter),
+      stats.folds.uncachedAfter
+    );
+    assert.ok(stats.folds.each.every((fold) => fold.net > 0));
     assert.ok(stats.overhead.stamps > 0);
     const lines = statsLines(stats);
     assert.match(lines[0]!, /^context per request {2}[▁▂▃▄▅▆▇█]{8}$/);
     assert.ok(lines.some((line) => /^folds 2, .*1 right before a final reply/.test(line)));
     assert.ok(lines.includes('fold errors 1, next fold succeeded after 1'));
+    assert.ok(
+      lines.some((line) =>
+        /^fold cost break-even after median \d+ request\(s\), [0-2]\/2 folds past it \(cached input counted at 10%\)$/.test(
+          line
+        )
+      )
+    );
     assert.ok(lines.includes('cues 1, followed 1 (1 read-only)'));
     assert.ok(handle);
   } finally {
