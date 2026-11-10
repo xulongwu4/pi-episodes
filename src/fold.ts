@@ -38,7 +38,10 @@ const MAX_LISTED_CHANGES = 40;
 
 export interface FoldPlan {
   handle: string;
-  /** Stamp of the last message that stays before the span, if any. */
+  /**
+   * Stamp of the last message before the span, if any, whether or not it is still in context:
+   * the working tree at that stamp is what the span started from.
+   */
   anchorStamp: number | undefined;
   /** Stamps inside the span before its first response, in order. */
   laterStamps: number[];
@@ -527,7 +530,9 @@ export function planFold(
 
   let anchorStamp: number | undefined;
   for (let index = startIndex - 1; index >= 0 && anchorStamp === undefined; index--) {
-    anchorStamp = entries[index]!.messages.map(readStamp).findLast((stamp) => stamp !== undefined);
+    // An earlier fold that ended at an until can have removed the turn before this span.
+    const before = entryMessage(entries[index]!);
+    anchorStamp = before && readStamp(before);
   }
 
   return {

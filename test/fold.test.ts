@@ -367,6 +367,15 @@ test('a fold with until removes the turns up to it and leaves the later ones', (
   assertPaired(view);
 });
 
+test('a span starts from the turn before it, also when an earlier fold removed that turn', () => {
+  const { manager } = session(buildLoop);
+  const entries = () => manager.buildSessionProjection().entries;
+  assert.equal(planFold(entries(), 'f1', 3, { until: 3 }).anchorStamp, 2);
+  // The read leaves the context; the tree it left is still where the build began.
+  apply(manager, planFold(entries(), 'f1', 2, { until: 2 }).edits);
+  assert.equal(planFold(entries(), 'f1', 3, { until: 3 }).anchorStamp, 2);
+});
+
 test('until on one result of a parallel batch ends the span after the whole batch', () => {
   const { manager, ids } = session([
     user('go', 1),

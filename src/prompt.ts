@@ -36,9 +36,11 @@ instead of ending, as in open-ended exploration, nothing marks a boundary; do no
 yet.
 
 When a finished episode lies behind work you still need verbatim, add until: fold with
-since "t13" and until "t20" removes those turns only, and the turns after [t20] stay. What
-stays after the span is sent uncached once, so do this when the span is larger than what
-stays after it; otherwise wait and fold the whole tail when that work is done too.
+since "t13" and until "t20" removes those turns only, with the other results of the
+response that [t20] answers, and the turns after them stay: the next step then has the
+note and those turns to go on. What stays after the span is sent uncached once, so do this
+when the span is larger than what stays after it; otherwise wait and fold the whole tail
+when that work is done too.
 
 Do not fold right before your final reply to the user; that reply needs the span. If the
 episode was the whole request, fold at the start of the next request, before working on
