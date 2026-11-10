@@ -138,9 +138,77 @@ export interface RequestPoint {
   after?: 'fold' | 'compaction';
 }
 
+/** A request with what is needed to say why its input was not read from cache. */
+export interface SentRequest extends RequestPoint {
+  /** The part of the tokens not read from cache: input plus cache write. */
+  uncached: number;
+  /** When the response was saved, in ms. */
+  at?: number;
+}
+
+/** Providers cache in blocks, so a little of every request misses; less than this is no miss. */
+const MISS_FLOOR_TOKENS = 1024;
+/** Without a request for about this long, a provider drops the prefix it cached. */
+const PAUSE_MS = 5 * 60_000;
+
+/** Input that was not read from cache, by what explains it. */
+export interface UncachedSplit {
+  /** New content: what the context grew by since the request before. */
+  fresh: number;
+  /** The first request after a fold or a compaction: the prefix it changed, sent again. */
+  afterFold: number;
+  afterCompaction: number;
+  /** A prefix sent before and not read back, with no fold or compaction to explain it. */
+  missed: number;
+  missedRequests: number;
+  /** The part of `missed` that came after a pause long enough for the cache to expire. */
+  afterPause: number;
+  afterPauseRequests: number;
+}
+
+/**
+ * Says why input was not read from cache. A request cannot read what it adds, so growth
+ * since the request before is new content; more than that is a prefix the provider had and
+ * did not return, which a fold, a compaction or a long pause explains, or nothing does.
+ */
+export function uncachedSplit(requests: readonly SentRequest[]): UncachedSplit {
+  const split: UncachedSplit = {
+    fresh: 0,
+    afterFold: 0,
+    afterCompaction: 0,
+    missed: 0,
+    missedRequests: 0,
+    afterPause: 0,
+    afterPauseRequests: 0
+  };
+  let previous: SentRequest | undefined;
+  for (const request of requests) {
+    if (request.after === 'fold') split.afterFold += request.uncached;
+    else if (request.after === 'compaction') split.afterCompaction += request.uncached;
+    else {
+      const grown = previous ? Math.max(0, request.tokens - previous.tokens) : request.tokens;
+      const beyond = request.uncached - grown;
+      if (beyond < MISS_FLOOR_TOKENS) split.fresh += request.uncached;
+      else {
+        split.fresh += grown;
+        split.missed += beyond;
+        split.missedRequests++;
+        if (previous?.at !== undefined && request.at !== undefined) {
+          if (request.at - previous.at >= PAUSE_MS) {
+            split.afterPause += beyond;
+            split.afterPauseRequests++;
+          }
+        }
+      }
+    }
+    previous = request;
+  }
+  return split;
+}
+
 export interface EpisodeStats {
   /** Main-thread requests on the branch, oldest first. */
-  requests: RequestPoint[];
+  requests: SentRequest[];
   folds: {
     count: number;
     /** By /fold, with the user picking the span start, or the agent picking it. */
@@ -194,6 +262,8 @@ export interface EpisodeStats {
   };
   /** Tool results cut on arrival, and the estimated tokens that kept out of context. */
   outputs: { capped: number; tokens: number };
+  /** Input not read from cache over the branch, by what explains it. */
+  uncached: UncachedSplit;
   compactions: number;
   reminders: number;
   nudges: number;
@@ -286,6 +356,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
     cues: { shown: 0, followed: 0, readOnly: 0, capped: 0 },
     forks: { count: 0, turns: 0, folds: 0, failed: 0, refused: 0, cost: 0 },
     outputs: { capped: 0, tokens: 0 },
+    uncached: uncachedSplit([]),
     compactions: 0,
     reminders: 0,
     nudges: 0,
@@ -414,7 +485,13 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       const tokens = usage.input + usage.cacheRead + usage.cacheWrite;
       if (tokens === 0) return;
       usages.push(usage);
-      stats.requests.push(mark ? { tokens, after: mark } : { tokens });
+      const at = Date.parse(entry.timestamp);
+      stats.requests.push({
+        tokens,
+        uncached: usage.input + usage.cacheWrite,
+        ...(mark ? { after: mark } : {}),
+        ...(Number.isNaN(at) ? {} : { at })
+      });
       if (mark === 'fold') {
         stats.folds.uncachedAfter.push(usage.input + usage.cacheWrite);
         if (awaiting) {
@@ -510,6 +587,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
   });
 
   stats.folds.rates = cacheRates(usages);
+  stats.uncached = uncachedSplit(stats.requests);
   return stats;
 }
 
@@ -627,6 +705,20 @@ export function statsLines(stats: EpisodeStats): string[] {
     lines.push(`cache ${cache.join(', ')}`);
   }
 
+  const split = stats.uncached;
+  const uncached = split.fresh + split.afterFold + split.afterCompaction + split.missed;
+  if (uncached > 0) {
+    const pauses = split.afterPauseRequests;
+    const causes = [
+      `~${k(split.fresh)} new content`,
+      split.afterFold > 0 ? `~${k(split.afterFold)} after folds` : '',
+      split.afterCompaction > 0 ? `~${k(split.afterCompaction)} after compactions` : '',
+      split.missed > 0
+        ? `~${k(split.missed)} sent before and missed in ${split.missedRequests} request(s), ${pauses > 0 ? `${pauses} of them (~${k(split.afterPause)}) after a pause of 5 min or more` : 'none after a pause of 5 min or more'}`
+        : ''
+    ].filter(Boolean);
+    lines.push(`uncached input ~${k(uncached)}: ${causes.join(', ')}`);
+  }
   const back = [
     stats.recall.count > 0
       ? `recall ${stats.recall.count}${stats.recall.empty || stats.recall.compacted || stats.recall.readBack ? ` (${parts([stats.recall.empty, 'empty'], [stats.recall.compacted, 'in compacted turns'], [stats.recall.readBack, 'read back'])})` : ''}`

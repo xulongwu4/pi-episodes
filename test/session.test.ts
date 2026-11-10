@@ -860,6 +860,16 @@ test('stats read the session: folds, rejections, cues followed, and the drop aft
       stats.folds.uncachedAfter
     );
     assert.ok(stats.folds.each.every((fold) => fold.net > 0));
+    // Every request's uncached input is put down to one cause; a fold's is its first request.
+    const split = stats.uncached;
+    assert.equal(
+      split.afterFold,
+      stats.folds.uncachedAfter.reduce((sum, tokens) => sum + tokens, 0)
+    );
+    assert.equal(
+      split.fresh + split.afterFold + split.afterCompaction + split.missed,
+      stats.requests.reduce((sum, request) => sum + request.uncached, 0)
+    );
     assert.ok(stats.overhead.stamps > 0);
     const lines = statsLines(stats);
     assert.match(lines[0]!, /^context per request {2}[▁▂▃▄▅▆▇█]{8}$/);

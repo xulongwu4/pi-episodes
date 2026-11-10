@@ -15,7 +15,7 @@ import {
 } from './archive.js';
 import { isStampBlock } from './stamps.js';
 import type { EpisodeState } from './state.js';
-import { episodeStats, sparkline } from './stats.js';
+import { episodeStats, type RequestPoint, sparkline } from './stats.js';
 
 export interface RecallDetails {
   query: string;
@@ -248,7 +248,7 @@ export function refreshStatus(
   const forks = records.filter(isForkDetails);
   const archived = folds.reduce((sum, fold) => sum + fold.tokens, 0);
 
-  const points = episodeStats(branch, state.cwd).requests;
+  const points: RequestPoint[] = episodeStats(branch, state.cwd).requests;
   const usage = pending?.usage;
   const tokens = usage ? usage.input + usage.cacheRead + usage.cacheWrite : 0;
   if (tokens > 0) points.push({ tokens });

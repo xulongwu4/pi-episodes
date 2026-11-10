@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { breakEven, cacheRates, episodeStats, sparkline, statsLines } from '../src/stats.js';
+import {
+  breakEven,
+  cacheRates,
+  episodeStats,
+  sparkline,
+  statsLines,
+  uncachedSplit
+} from '../src/stats.js';
 
 test('the graph scales to the largest request shown and keeps the newest', () => {
   const points = [100, 200, 400, 800, 100].map((tokens) => ({ tokens }));
@@ -79,6 +86,38 @@ test('the cache rates are those of the costs the session recorded, or say what t
   assert.ok(
     statsLines(stats).includes(
       'fold cost break-even after median 4 request(s), 1/1 folds past it; ~$0.020 spent on notes and re-sent input, up to ~$0.025 saved since (cached input at 25% of the input price, from recorded costs)'
+    )
+  );
+});
+
+test('uncached input is split by what explains it', () => {
+  const minute = 60_000;
+  const split = uncachedSplit([
+    // Nothing was cached yet: all of it is new.
+    { tokens: 10_000, uncached: 10_000, at: 0 },
+    // Grew by 2,000 and missed a block more, as every request does.
+    { tokens: 12_000, uncached: 2150, at: minute },
+    // Grew by 1,000 and missed 6,000 of what was sent before, with nothing to explain it.
+    { tokens: 13_000, uncached: 7000, at: 2 * minute },
+    // The whole prefix again, after a pause the cache does not outlive.
+    { tokens: 13_500, uncached: 13_500, at: 9 * minute },
+    { tokens: 6000, uncached: 4000, after: 'fold', at: 10 * minute },
+    { tokens: 3000, uncached: 3000, after: 'compaction', at: 11 * minute }
+  ]);
+  assert.deepEqual(split, {
+    fresh: 10_000 + 2150 + 1000 + 500,
+    afterFold: 4000,
+    afterCompaction: 3000,
+    missed: 6000 + 13_000,
+    missedRequests: 2,
+    afterPause: 13_000,
+    afterPauseRequests: 1
+  });
+
+  const lines = statsLines({ ...episodeStats([], '/'), uncached: split });
+  assert.ok(
+    lines.includes(
+      'uncached input ~40k: ~14k new content, ~4k after folds, ~3k after compactions, ~19k sent before and missed in 2 request(s), 1 of them (~13k) after a pause of 5 min or more'
     )
   );
 });
