@@ -1,6 +1,6 @@
 # Measurements
 
-What to measure before believing that folding beats compaction, and how. Nothing here has been run yet.
+What to measure before believing that folding beats compaction, and how. Only section 12 has a result so far.
 
 The order follows the post: try the note before asking the model to notice anything. `/fold` separates the two questions, so note quality comes before boundary detection. Cheap scripted checks come first, so a broken mechanism is not mistaken for a bad model.
 
@@ -220,6 +220,33 @@ Runs vary a lot between attempts. Unless a section says otherwise, run each cond
 **From the stats.** Folds made inside forks, and fork turns and cost.
 
 **Pass.** Lower peak context with no more failed or stopped forks.
+
+<br />
+
+## 12. Output cap
+
+**Question.** Does cutting large tool results on arrival lower cost without lowering the outcome, or does the model spend more getting the cut text back than the cut saved?
+
+**Why.** What is cut is never sent, so the saving looks certain. It is not: a model that needed the middle of an output runs the command again or reads the file, and an earlier comparison of a separate offload extension found cost going up with it.
+
+**Method.** Same task and code, `outputCap` on and off, with the built-in tools and with codemode as the only tool, since a script's result is where large output arrives when `read` is left whole. Script over the session file: results cut and their sizes, later tool calls that name a cut result's file, requests each cut result stayed in context for.
+
+**Report.** Cost, peak context, outcome; results cut and tokens kept out; calls that went back to a cut result's file; the saving worked out from the cut sizes alone, to set against the difference between runs.
+
+**From the stats.** Outputs capped and tokens kept out.
+
+**Pass.** Equal outcome, no more tool calls, and a cost difference in the direction the cut sizes predict.
+
+**Result.** 2026-11-10, gpt-6-luna at low thinking, one session per condition, a 97-turn task, pi 1.4.0, commit 125ea30.
+
+| | Cost | Peak context | Model calls | Results cut | Tokens kept out | Final quiz | Turn checks |
+|---|---|---|---|---|---|---|---|
+| codemode, cap on | $0.194 | 89k | 290 | 36 | ~220k | 12/12 | 218/228 |
+| codemode, cap off | $0.278 | 87k | 421 | | | 12/12 | 143/228 |
+| built-in tools, cap on | $0.305 | 99k | 315 | 3 | ~22k | 12/12 | 223/228 |
+| built-in tools, cap off | $0.378 | 212k | 299 | | | 12/12 | 226/228 |
+
+No call in either capped run named a cut result's file. From the cut sizes alone, with each cut result staying a median of 31 requests, the cap saved about $0.09 under codemode, which is near the $0.08 measured, and under $0.01 with the built-in tools, where `read` returned 51 results of 16,000 characters or more and is not cut. The built-in pair therefore shows how far two runs differ with the cap nearly idle: one cost 24% more than the other. With that much spread, the 43% between the codemode runs cannot be credited to the cap from one pair; one session per condition supports "no harm seen, saving plausible under codemode" and no more. The codemode run without the cap also made 131 more model calls for reasons that have nothing to do with it. Repeat at three sessions per condition before quoting a percentage.
 
 <br />
 
