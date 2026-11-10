@@ -103,7 +103,6 @@ export function registerNudge(pi: ExtensionAPI): void {
   ): string | undefined => {
     const settings = episodesSettings(pi.getSettings());
     if (!settings.foldNudge || !pi.getActiveTools().includes('fold')) return undefined;
-    if (!foldStart(entries)) return undefined;
     // The window of the model that answers, which a routing model does not report itself.
     const usage = ctx.getContextUsage();
     const threshold = nudgeThreshold(settings.foldNudgeTokens, usage?.contextWindow);

@@ -860,6 +860,41 @@ test('close to compaction, once notes take up room, the nudge names a stamp befo
   }
 });
 
+test('close to compaction, work a fold left behind its note is nudged to merge with nothing after the note', async () => {
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(4000)}` }), {
+          stopReason: 'toolUse'
+        }),
+      // The nudge asks to fold from t1; the agent runs one more command, then folds only that.
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo hi' }), {
+          stopReason: 'toolUse'
+        }),
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', { since: 't3', note: `Said hi. ${'detail '.repeat(400)}` }),
+          { stopReason: 'toolUse' }
+        ),
+      (context) => {
+        const last = text(conversation(context).at(-1)!);
+        assert.match(last, /since "t1".*which it merges/);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 2000 },
+    { reserveTokens: 127_000 }
+  );
+  try {
+    await harness.run('go');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test('a long run is nudged at a turn boundary once it grew twice the threshold', async () => {
   const big = 'x'.repeat(800);
   const harness = await createSession(
