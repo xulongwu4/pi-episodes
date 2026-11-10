@@ -409,7 +409,8 @@ test('files a script read are in the fold, and reading one again cues the thread
 
 /**
  * Tools shaped like those of pi-hashline-edit-pro: an edit takes line anchors and names its file
- * only in the structured result, and a search takes the path it searched.
+ * only in the structured result, and a search takes the path it searched. An edit between the
+ * `SAME` anchors changes nothing, and says so.
  */
 const anchorTools: ExtensionFactory = (pi) => {
   pi.registerTool({
@@ -417,11 +418,12 @@ const anchorTools: ExtensionFactory = (pi) => {
     label: 'replace',
     description: 'Replace lines by anchor.',
     parameters: Type.Object({ remove_from: Type.String(), remove_to: Type.String() }),
-    async execute() {
+    async execute(_id, params) {
+      const classification = params.remove_from === SAME.remove_from ? 'noop' : 'applied';
       return {
         content: [{ type: 'text', text: 'Replaced 1 line.' }],
         details: { diff: '+x' },
-        structuredContent: { ok: true, kind: 'edit', path: 'api.ts' }
+        structuredContent: { ok: true, kind: 'edit', classification, path: 'api.ts' }
       };
     }
   });
@@ -436,6 +438,7 @@ const anchorTools: ExtensionFactory = (pi) => {
   });
 };
 const ANCHORS = { remove_from: 'abcde', remove_to: 'abcde' };
+const SAME = { remove_from: 'fghij', remove_to: 'fghij' };
 
 function toolResults(harness: Awaited<ReturnType<typeof createSession>>, toolName: string) {
   return harness.session.sessionManager
@@ -453,6 +456,7 @@ test('an edit by line anchors counts for the file its result names, and a search
       () =>
         fauxAssistantMessage(
           [
+            fauxToolCall('read', { path: 'api.ts' }),
             fauxToolCall('replace', ANCHORS),
             fauxToolCall('grep', { pattern: 'x', path: 'lib.ts' })
           ],
@@ -483,10 +487,12 @@ test('an edit by line anchors counts for the file its result names, and a search
     ['replace', 'grep']
   );
   try {
+    await writeFile(join(harness.dir, 'api.ts'), 'x\n');
     await harness.run('edit it', 'again');
     const [record] = threadRecords(harness.session.sessionManager.getBranch());
     assert.ok(record?.kind === 'fold');
     assert.deepEqual(record.files, [join(harness.dir, 'api.ts')]);
+    // The span read the file too: the edit is what makes it more than read.
     assert.equal(record.readOnly, undefined);
     // The result keeps the tool's own details next to the file.
     assert.deepEqual(toolResults(harness, 'replace')[0]?.details, {
@@ -499,7 +505,8 @@ test('an edit by line anchors counts for the file its result names, and a search
 });
 
 test('an edit by line anchors from a script is in the fold, and the next one cues the thread', async () => {
-  const edit = `await tools.replace(${JSON.stringify(ANCHORS)}); text("edited");`;
+  const call = `await tools.replace(${JSON.stringify(ANCHORS)});`;
+  const edit = `${call} ${call} text("edited");`;
   const harness = await createSession(
     'only',
     [
@@ -528,6 +535,40 @@ test('an edit by line anchors from a script is in the fold, and the next one cue
     assert.equal(record.readOnly, undefined);
     const details = toolResults(harness, 'codemode')[0]?.details as Record<string, unknown>;
     assert.deepEqual(details[FILES_KEY], [{ name: 'replace', path: 'api.ts' }]);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('an edit by line anchors that changed nothing leaves the file as only read', async () => {
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(
+          [fauxToolCall('read', { path: 'api.ts' }), fauxToolCall('replace', SAME)],
+          { stopReason: 'toolUse' }
+        ),
+      () =>
+        fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'Looked at the api.' }), {
+          stopReason: 'toolUse'
+        }),
+      () => fauxAssistantMessage('noted')
+    ],
+    [anchorTools],
+    {},
+    {},
+    undefined,
+    [],
+    ['replace', 'grep']
+  );
+  try {
+    await writeFile(join(harness.dir, 'api.ts'), 'x\n');
+    await harness.run('look at it');
+    const [record] = threadRecords(harness.session.sessionManager.getBranch());
+    assert.ok(record?.kind === 'fold');
+    assert.deepEqual(record.readOnly, [join(harness.dir, 'api.ts')]);
+    assert.deepEqual(toolResults(harness, 'replace')[0]?.details, { diff: '+x' });
   } finally {
     await harness.cleanup();
   }

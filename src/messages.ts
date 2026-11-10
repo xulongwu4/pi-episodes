@@ -38,7 +38,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * The file a call of a file tool touched. pi's tools name it in their arguments. An anchor tool
  * takes line anchors and names the file only in its structured result, which the session does
  * not keep: `fromResult` then says the path is found later only if it is recorded. A move
- * between two files names the one it moved to.
+ * between two files names the one it moved to. A result that says it failed or changed nothing
+ * names no file.
  */
 export function fileTouch(
   name: string,
@@ -47,17 +48,27 @@ export function fileTouch(
 ): { path: string; fromResult: boolean } | undefined {
   if (!FILE_TOOLS.has(name)) return undefined;
   if (typeof args?.path === 'string' && args.path) return { path: args.path, fromResult: false };
-  const path = WRITE_TOOLS.has(name) && isRecord(structured) ? structured.path : undefined;
+  const path =
+    WRITE_TOOLS.has(name) &&
+    isRecord(structured) &&
+    structured.ok !== false &&
+    structured.classification !== 'noop'
+      ? structured.path
+      : undefined;
   return typeof path === 'string' && path ? { path, fromResult: true } : undefined;
 }
 
-/** `details` with these files recorded; undefined when the details cannot hold them. */
+/** `details` with these files recorded, each once; undefined when the details cannot hold them. */
 export function withFiles(
   details: unknown,
   files: readonly FileTouch[]
 ): Record<string, unknown> | undefined {
   if (details !== undefined && !isRecord(details)) return undefined;
-  return { ...details, [FILES_KEY]: files };
+  const once = files.filter(
+    (file, index) =>
+      files.findIndex((other) => other.name === file.name && other.path === file.path) === index
+  );
+  return { ...details, [FILES_KEY]: once };
 }
 
 function recordedFiles(details: unknown): FileTouch[] {

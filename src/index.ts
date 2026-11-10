@@ -155,7 +155,11 @@ export default function episodes(pi: ExtensionAPI): void {
         ? []
         : (scriptFiles.get(event.toolCallId) ?? []);
     scriptFiles.delete(event.toolCallId);
-    const touch = fileTouch(event.toolName, event.input, event.structuredContent);
+    const touch = fileTouch(
+      event.toolName,
+      event.input,
+      event.isError ? undefined : event.structuredContent
+    );
     if (touch) {
       const root = event.parentToolCallId ? state.rootCall(event.toolCallId) : undefined;
       if (touch.fromResult) {
