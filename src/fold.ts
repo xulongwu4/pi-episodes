@@ -44,6 +44,8 @@ export interface FoldPlan {
   laterStamps: number[];
   firstEntryId: string;
   lastEntryId: string;
+  /** Stamp of the first turn that stays after the span, when the span stops before the call. */
+  keptFrom: number | undefined;
   /** Messages leaving the context. */
   omitted: AgentMessage[];
   /** Everything the span held, for file tracking. */
@@ -149,6 +151,30 @@ function spanStart(
     (entry, at) => at < index && callsTool(entry, message.toolCallId)
   );
   return caller < 0 ? index : caller;
+}
+
+/**
+ * Where the turn after the entry at `index` starts, and its stamp: the end of a span whose
+ * last turn is that entry. A tool result made next to that entry's own, by the same response,
+ * is not a later turn, so no call is left without its results. Undefined when no turn follows
+ * before `limit`.
+ */
+function turnAfter(
+  entries: readonly ProjectedSessionEntry[],
+  index: number,
+  limit: number
+): { stamp: number; index: number } | undefined {
+  for (let at = index + 1; at < limit; at++) {
+    for (const message of entries[at]!.messages) {
+      const stamp = readStamp(message);
+      if (stamp === undefined || (message.role !== 'user' && message.role !== 'toolResult')) {
+        continue;
+      }
+      const start = spanStart(entries, at, message);
+      if (start > index) return { stamp, index: start };
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -289,6 +315,8 @@ export interface FoldOptions {
    * called fold. Defaults to the fold call itself.
    */
   callerId?: string;
+  /** The last turn inside the span; later turns stay. Without it the span runs up to the call. */
+  until?: number;
 }
 
 /** A fold the tool refused, with why, so rejections can be counted by cause. */
@@ -306,7 +334,8 @@ export class FoldError extends Error {
  * the episode; when that is a tool result, the span starts at the response that made the
  * call, so the episode is folded from its turn boundary and no call loses its result. The
  * span ends before the response that called fold: that response and the fold result stay,
- * so the context still ends on a tool result.
+ * so the context still ends on a tool result. With `until` the span ends where the turn after
+ * that one starts, and the turns from there to the call stay too.
  */
 export function planFold(
   entries: readonly ProjectedSessionEntry[],
@@ -389,13 +418,51 @@ export function planFold(
     throw new FoldError(reason, `A fold cannot reach behind ${what}. ${pick}`);
   }
 
-  const span = entries.slice(startIndex, foldIndex);
+  let endIndex = foldIndex;
+  let keptFrom: number | undefined;
+  if (options.until !== undefined) {
+    const until = options.until;
+    if (until < since) {
+      throw new FoldError(
+        'bad-stamp',
+        `until ${stampLabel(until)} is before since ${stampLabel(since)}.`
+      );
+    }
+    const untilIndex = entries.findIndex((entry) =>
+      entry.messages.some((message) => readStamp(message) === until)
+    );
+    if (untilIndex < 0) {
+      throw latestStamp !== undefined && until > latestStamp
+        ? new FoldError(
+            'no-such-stamp',
+            `${stampLabel(until)} does not exist; the latest stamp is ${stampLabel(latestStamp)}.`
+          )
+        : new FoldError(
+            'gone',
+            `${stampLabel(until)} is no longer in your context: it was compacted or already folded.`
+          );
+    }
+    if (untilIndex >= foldIndex) {
+      throw new FoldError('not-before-call', `${stampLabel(until)} is not before this fold call.`);
+    }
+    const next = turnAfter(entries, untilIndex, foldIndex);
+    if (next) {
+      endIndex = next.index;
+      keptFrom = next.stamp;
+    }
+  }
+
+  const span = entries.slice(startIndex, endIndex);
+  const range =
+    options.until === undefined
+      ? `from ${stampLabel(since)}`
+      : `from ${stampLabel(since)} to ${stampLabel(options.until)}`;
   if (
     !span.some((entry) => entry.messages.length > 0 && entryMessage(entry)?.role === 'assistant')
   ) {
     throw new FoldError(
       'nothing-to-fold',
-      `Nothing to fold from ${stampLabel(since)}: the span holds no responses.`
+      `Nothing to fold ${range}: the span holds no responses.`
     );
   }
 
@@ -449,6 +516,7 @@ export function planFold(
     laterStamps,
     firstEntryId: first.sourceEntry.id,
     lastEntryId: last.sourceEntry.id,
+    keptFrom,
     omitted,
     spanMessages: span.flatMap((entry) => entry.messages),
     before: entries.slice(0, startIndex).flatMap((entry) => entry.messages),
@@ -522,6 +590,8 @@ export function renderNote(options: {
   changes: readonly DiskChange[] | undefined;
   touched: readonly string[];
   keptUserTurns: readonly string[];
+  /** First turn kept after the span, when the fold stopped before the call. */
+  keptFrom?: string | undefined;
   covers?: readonly { handle: string; headline: string }[];
   /** Skill files read inside the span. */
   skills?: readonly string[];
@@ -542,6 +612,9 @@ export function renderNote(options: {
     );
   }
 
+  if (options.keptFrom) {
+    lines.push('', `The turns from ${options.keptFrom} on were not folded and stay above.`);
+  }
   if (options.covers?.length) {
     lines.push(
       '',
@@ -566,8 +639,14 @@ export function renderNote(options: {
 const FoldParams = Type.Object({
   since: Type.String({
     description:
-      'Stamp of the first message inside the episode, such as "t13", usually the result of its first tool call. The fold starts at the response that made that call and runs up to this call.'
+      'Stamp of the first message inside the episode, such as "t13", usually the result of its first tool call. The fold starts at the response that made that call and runs up to this call, or to the end of the turn `until` names.'
   }),
+  until: Type.Optional(
+    Type.String({
+      description:
+        'Stamp of the last turn inside the span, such as "t20", when the turns after it must stay verbatim. Leave it out to fold up to this call. What stays after the span is sent uncached once.'
+    })
+  ),
   note: Type.String({
     description:
       'Replaces the span. First line: the question and how it ended. Then changed, learned (with conditions), decided and rejected (with why), handled user messages by stamp, open (with the next step). Quote exact paths, symbols, commands and error strings.'
@@ -600,7 +679,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     name: FOLD_TOOL,
     label: 'Fold',
     description:
-      'Fold a finished episode: remove the span starting at `since` from your context, archive it, and keep `note` in its place. User messages from the span stay. Call it as the only tool in the response, once the next step no longer depends on the span beyond the note, and not right before your final reply. From a codemode script, call only fold in that script and print its result.',
+      'Fold a finished episode: remove the span starting at `since` from your context, archive it, and keep `note` in its place. User messages from the span stay. With `until` the span ends with that turn and later turns stay. Call it as the only tool in the response, once the next step no longer depends on the span beyond the note, and not right before your final reply. From a codemode script, call only fold in that script and print its result.',
     promptSnippet: 'Fold a finished episode into a note; the span is archived and stays reachable',
     parameters: FoldParams,
     executionMode: 'sequential',
@@ -642,6 +721,13 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
             `since must be a turn stamp such as "t12", got "${params.since}".`
           );
         }
+        const until = params.until?.trim() ? parseStamp(params.until) : undefined;
+        if (params.until?.trim() && until === undefined) {
+          throw new FoldError(
+            'bad-stamp',
+            `until must be a turn stamp such as "t20", got "${params.until}".`
+          );
+        }
         if (!note) {
           throw new FoldError(
             'empty-note',
@@ -650,6 +736,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         }
         plan = planFold(entries, toolCallId, since, {
           latestStamp: state.nextStamp - 1,
+          ...(until === undefined ? {} : { until }),
           callerId: scriptCall ?? toolCallId
         });
       } catch (error) {
@@ -662,6 +749,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       const lastStamp = plan.spanMessages.map(readStamp).findLast((stamp) => stamp !== undefined);
       const untilLabel =
         lastStamp !== undefined && lastStamp !== since ? stampLabel(lastStamp) : undefined;
+      const keptFrom = plan.keptFrom === undefined ? undefined : stampLabel(plan.keptFrom);
       const touched = touchedPaths(plan.spanMessages, state.cwd);
       const files = new Set(touched);
 
@@ -670,7 +758,12 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       const snapshots = state.snapshots;
       const anchorPlaced = state.anchorPlaced;
       if (snapshots) {
-        treeAfter = await snapshots.snapshot();
+        // A span that stops before the call ends with the tree at its last stamp: what the
+        // turns kept after it changed is not the episode's.
+        treeAfter =
+          plan.keptFrom === undefined || lastStamp === undefined
+            ? await snapshots.snapshot()
+            : await snapshots.treeAt(lastStamp);
         // The span starts from the tree at its last stamp before the first response, such as
         // the user's prompt; the anchor before the span can be from an earlier run, and files
         // the user edited between runs are not the episode's changes.
@@ -700,6 +793,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         files: [...files]
       };
       if (plan.covers.length > 0) details.covers = plan.covers.map((fold) => fold.handle);
+      if (keptFrom) details.keptFrom = keptFrom;
       if (treeAfter) details.treeAfter = treeAfter;
       const open = openItems(note);
       if (open) details.open = open;
@@ -731,6 +825,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         changes,
         touched,
         keptUserTurns: plan.keptUserTurns,
+        keptFrom,
         covers: plan.covers,
         skills: skillPaths(plan.spanMessages, state.cwd),
         cwd: state.cwd

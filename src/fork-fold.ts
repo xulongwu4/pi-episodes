@@ -81,10 +81,15 @@ export class ForkFolds {
     args: unknown,
     messages: readonly AgentMessage[]
   ): Promise<AgentToolResult<FoldDetails>> {
-    const params = args as { since?: unknown; note?: unknown };
+    const params = args as { since?: unknown; until?: unknown; note?: unknown };
     const since = typeof params.since === 'string' ? parseStamp(params.since) : undefined;
     if (since === undefined) {
       throw new Error(`since must be a turn stamp such as "t12", got "${String(params.since)}".`);
+    }
+    const bounded = typeof params.until === 'string' && params.until.trim() !== '';
+    const last = bounded ? parseStamp(params.until as string) : undefined;
+    if (bounded && last === undefined) {
+      throw new Error(`until must be a turn stamp such as "t20", got "${String(params.until)}".`);
     }
     const note = typeof params.note === 'string' ? params.note.trim() : '';
     if (!note) {
@@ -97,7 +102,8 @@ export class ForkFolds {
     const plan = planFold(entries, toolCallId, since, {
       latestStamp: this.state.nextStamp - 1,
       floorIndex: this.parentEntries.length + this.siblings,
-      applied: this.applied
+      applied: this.applied,
+      ...(last === undefined ? {} : { until: last })
     });
 
     const byId = new Map(entries.map((entry) => [entry.sourceEntry.id, entry]));
@@ -133,6 +139,8 @@ export class ForkFolds {
       files: touched
     };
     if (plan.covers.length > 0) record.covers = plan.covers.map((fold) => fold.handle);
+    const keptFrom = plan.keptFrom === undefined ? undefined : stampLabel(plan.keptFrom);
+    if (keptFrom) record.keptFrom = keptFrom;
     const open = openItems(note);
     if (open) record.open = open;
     this.folds.push({
@@ -157,6 +165,7 @@ export class ForkFolds {
             changes: undefined,
             touched,
             keptUserTurns: plan.keptUserTurns,
+            keptFrom,
             covers: plan.covers,
             skills: skillPaths(plan.spanMessages, this.state.cwd),
             cwd: this.state.cwd

@@ -35,6 +35,11 @@ the episode is still open or the note is missing something. When the question dr
 instead of ending, as in open-ended exploration, nothing marks a boundary; do not fold
 yet.
 
+When a finished episode lies behind work you still need verbatim, add until: fold with
+since "t13" and until "t20" removes those turns only, and the turns after [t20] stay. What
+stays after the span is sent uncached once, so do this when the span is larger than what
+stays after it; otherwise wait and fold the whole tail when that work is done too.
+
 Do not fold right before your final reply to the user; that reply needs the span. If the
 episode was the whole request, fold at the start of the next request, before working on
 it. Call fold as the only tool in its response, and say there in one line what you return
@@ -83,8 +88,8 @@ for another agent, give it the user's requests and the diff, not your reasoning.
 
 /** Appended when fold, recall and ask are called from codemode scripts, out of the model's view. */
 export const CODEMODE_CALLS = /* md */ `
-From a codemode script: tools.fold({ since: "t13", note }), tools.recall({ query, handle?,
-regex?, limit? }) (limit 30 by default, at most 200; the rest go to a file),
-tools.recall({ handle, turn }) for one turn verbatim, and tools.ask({ handle, question }).
-Print what they return.
+From a codemode script: tools.fold({ since: "t13", until?, note }),
+tools.recall({ query, handle?, regex?, limit? }) (limit 30 by default, at most 200; the
+rest go to a file), tools.recall({ handle, turn }) for one turn verbatim, and
+tools.ask({ handle, question }). Print what they return.
 `.trim();

@@ -62,6 +62,8 @@ export interface FoldDetails {
   /** The note's open items, for the reminder after the fold. */
   open?: string;
   keptUserTurns: string[];
+  /** First stamp kept after the span, when the fold stopped before the call that made it. */
+  keptFrom?: string;
   /** Handles of earlier folds whose notes were inside the span. */
   covers?: string[];
   /** Absolute paths touched or changed inside the span. */

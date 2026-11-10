@@ -289,6 +289,76 @@ test('a stamp on one result of a parallel batch folds the whole batch', () => {
   assertPaired(manager.buildSessionProjection().messages);
 });
 
+test('a fold with until removes the turns up to it and leaves the later ones', () => {
+  const { manager, ids } = session(buildLoop);
+  const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2, { until: 3 });
+
+  assert.equal(plan.firstEntryId, ids[1]);
+  assert.equal(plan.lastEntryId, ids[4]);
+  assert.equal(plan.keptFrom, 4);
+  assert.equal(plan.omitted.length, 4);
+  assert.deepEqual(plan.keptUserTurns, []);
+
+  apply(manager, plan.edits);
+  manager.appendMessage(result('f1', 'fold', 'note', 6));
+  const view = manager.buildSessionProjection().messages;
+  assert.deepEqual(roles(view), [
+    'user',
+    'user',
+    'assistant',
+    'toolResult',
+    'assistant',
+    'toolResult'
+  ]);
+  assert.deepEqual(view.map(readStamp), [1, 4, undefined, 5, undefined, 6]);
+  assertPaired(view);
+});
+
+test('until on one result of a parallel batch ends the span after the whole batch', () => {
+  const { manager, ids } = session([
+    user('go', 1),
+    assistant(call('a', 'read', { path: 'a.ts' }), call('b', 'read', { path: 'b.ts' })),
+    result('a', 'read', 'a', 2),
+    result('b', 'read', 'b', 3),
+    assistant(call('c', 'bash')),
+    result('c', 'bash', 'out', 4),
+    assistant(call('f', 'fold'))
+  ]);
+
+  const plan = planFold(manager.buildSessionProjection().entries, 'f', 2, { until: 2 });
+  assert.equal(plan.lastEntryId, ids[3]);
+  assert.equal(plan.keptFrom, 4);
+
+  apply(manager, plan.edits);
+  manager.appendMessage(result('f', 'fold', 'note'));
+  assertPaired(manager.buildSessionProjection().messages);
+});
+
+test('until on the last turn before the call is a fold up to the call', () => {
+  const { manager, ids } = session(buildLoop);
+  const entries = manager.buildSessionProjection().entries;
+  const plan = planFold(entries, 'f1', 3, { until: 5 });
+  assert.equal(plan.keptFrom, undefined);
+  assert.equal(plan.lastEntryId, ids[7]);
+  assert.deepEqual(plan.edits, planFold(entries, 'f1', 3).edits);
+});
+
+test('rejects an until that is before since, missing, or holds no responses', () => {
+  const entries = session(buildLoop).manager.buildSessionProjection().entries;
+  assert.throws(() => planFold(entries, 'f1', 3, { until: 2 }), /until t2 is before since t3/);
+  assert.throws(
+    () => planFold(entries, 'f1', 2, { until: 9, latestStamp: 5 }),
+    /t9 does not exist; the latest stamp is t5/
+  );
+  assert.throws(
+    () => planFold(entries, 'f1', 2, { until: 9, latestStamp: 12 }),
+    /t9 is no longer in your context/
+  );
+  assert.throws(
+    () => planFold(entries, 'f1', 4, { until: 4 }),
+    /Nothing to fold from t4 to t4: the span holds no responses/
+  );
+});
 function earlierFold(applied: boolean) {
   const note = {
     ...result('f0', 'fold', 'first note', 3),
@@ -449,6 +519,7 @@ test('renders the note with disk changes, kept turns and the handle', () => {
     changes: [{ status: 'M', path: '/repo/src/client/api.ts' }],
     touched: [],
     keptUserTurns: ['t4'],
+    keptFrom: 't10',
     skills: ['/home/me/skills/tdd/SKILL.md'],
     cwd: '/repo'
   });
@@ -456,6 +527,7 @@ test('renders the note with disk changes, kept turns and the handle', () => {
   assert.match(text, /^\[fold ep-12345678: 4 messages, t2-t9, ~41k tokens, archived\]/);
   assert.match(text, /Changed on disk \(working tree diff\):\nM src\/client\/api\.ts/);
   assert.match(text, /stay above with their stamps: t4\./);
+  assert.match(text, /The turns from t10 on were not folded and stay above\./);
   assert.match(
     text,
     /Skills read inside the span, .*: \/home\/me\/skills\/tdd\/SKILL\.md\. Read a skill again/

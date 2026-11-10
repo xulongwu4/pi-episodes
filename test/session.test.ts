@@ -233,6 +233,44 @@ test('a fold that reaches behind the previous note merges it', async () => {
   }
 });
 
+test('a fold with until removes old turns and keeps the work after them', async () => {
+  const harness = await createSession(
+    [
+      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo one > a.txt' })),
+      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo two' })),
+      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo three > c.txt; echo 3' })),
+      () =>
+        fauxAssistantMessage(fauxToolCall('fold', { since: 't2', until: 't3', note: 'one, two' })),
+      (context) => {
+        const view = conversation(context);
+        const results = view.filter((message) => message.role === 'toolResult');
+        assert.equal(results.length, 2);
+        assert.match(text(results[0]!), /^3\n/);
+        const note = text(results[1]!);
+        assert.match(note, /^\[fold ep-[0-9a-f]{8}: 4 messages, t2-t3, /);
+        assert.match(note, /The turns from t4 on were not folded and stay above\./);
+        // The disk changes are the span's, not those of the turns kept after it.
+        assert.match(note, /A a\.txt/);
+        assert.doesNotMatch(note, /c\.txt/);
+        return fauxAssistantMessage(fauxToolCall('recall', { query: '"echo two"' }));
+      },
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /ep-[0-9a-f]{8} .*echo two/);
+        return fauxAssistantMessage('ok');
+      }
+    ],
+    { git: true }
+  );
+
+  try {
+    await harness.session.prompt('go');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test('/fold asks for a fold and ends the run on it', async () => {
   const harness = await createSession([
     () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo build passed' })),
@@ -557,6 +595,38 @@ test('a fork folds its own work, and recall and ask reach the fold inside it', a
       assert.match(text(messages.at(-1)!), /What failed\?/);
       assert.ok(messages.some((message) => /error TS9999/.test(text(message))));
       return fauxAssistantMessage('A type error, TS9999.');
+    },
+    () => fauxAssistantMessage('done')
+  ]);
+
+  try {
+    await harness.session.prompt('make it build in a fork');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a fork folds with until and keeps its later work', async () => {
+  let stamp = '';
+  const harness = await createSession([
+    () => fauxAssistantMessage(fauxToolCall('fork', { task: 'Make the build pass.' })),
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo "old bulk"' })),
+    (context) => {
+      stamp = /\[(t\d+)\]$/.exec(text(conversation(context).at(-1)!))![1]!;
+      return fauxAssistantMessage(fauxToolCall('bash', { command: 'echo "live work"' }));
+    },
+    () => fauxAssistantMessage(fauxToolCall('fold', { since: stamp, until: stamp, note: 'old' })),
+    (context) => {
+      const messages = conversation(context);
+      assert.ok(!messages.some((message) => /^old bulk/.test(text(message))));
+      assert.ok(messages.some((message) => /^live work/.test(text(message))));
+      assert.match(
+        text(messages.at(-1)!),
+        /The turns from t\d+ on were not folded and stay above\./
+      );
+      return fauxAssistantMessage('Build passes.\n- Open: none.');
     },
     () => fauxAssistantMessage('done')
   ]);

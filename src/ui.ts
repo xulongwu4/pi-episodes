@@ -94,9 +94,10 @@ function markdownPreview(text: string, expanded: boolean, count: number, theme: 
 }
 
 export const foldRenderers = {
-  renderCall(args: { since?: string; note?: string }, theme: Theme): Text {
+  renderCall(args: { since?: string; until?: string; note?: string }, theme: Theme): Text {
     const since = args.since ? theme.fg('accent', args.since) : theme.fg('dim', '...');
-    return title(theme, 'fold', `${theme.fg('muted', 'from')} ${since}`);
+    const until = args.until ? ` ${theme.fg('muted', 'to')} ${theme.fg('accent', args.until)}` : '';
+    return title(theme, 'fold', `${theme.fg('muted', 'from')} ${since}${until}`);
   },
 
   renderResult(
