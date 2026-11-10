@@ -46,6 +46,21 @@ function offloadedOutput(details: unknown): { path: string; sha256: string } | u
     : undefined;
 }
 
+/** How a preview made here names its file; a preview is found again by it. */
+function named(path: string): string {
+  return `All of this output is in ${path};`;
+}
+
+/** One cut of a result: the file with the text, and how to tell the preview that names it. */
+interface Cut {
+  path: string;
+  /** The hash the file's text must have, when the record gives one. */
+  sha256?: string;
+  /** Where the preview was when it was made. */
+  block?: number;
+  names(text: string): boolean;
+}
+
 // Cut at a line break when one is in the nearer half, so the preview does not end mid-line.
 function head(text: string, chars: number): string {
   const end = text.lastIndexOf('\n', chars);
@@ -105,7 +120,7 @@ export async function capOutput(
   const start = head(text, Math.floor((keep * 2) / 3));
   const end = tail(text, Math.floor(keep / 3));
   const omitted = text.length - start.length - end.length;
-  const preview = `${start}\n\n[episodes] ${omitted} of ${text.length} characters left out here. All of this output is in ${path}; grep it or read a slice, not the whole file. recall searches it once it is folded.\n\n${end}`;
+  const preview = `${start}\n\n[episodes] ${omitted} of ${text.length} characters left out here. ${named(path)} grep it or read a slice, not the whole file. recall searches it once it is folded.\n\n${end}`;
   return {
     content: [...content.slice(0, from), { type: 'text', text: preview }, ...content.slice(to + 1)],
     capped: { path, chars: text.length, block: from }
@@ -113,35 +128,76 @@ export async function capOutput(
 }
 
 /**
+ * The index of the preview a cut left. The path alone does not tell it: a later handler can
+ * add a block that mentions the file, so the preview is the block with the cutter's own words
+ * around the path. Where the preview was made is tried first; several such blocks otherwise
+ * are not told apart, and none is taken.
+ */
+function previewAt(content: readonly Block[], cut: Cut): number | undefined {
+  const found = [...content.keys()].filter((index) => {
+    const block = content[index];
+    return block?.type === 'text' && cut.names(block.text);
+  });
+  if (cut.block !== undefined && found.includes(cut.block)) return cut.block;
+  return found.length === 1 ? found[0] : undefined;
+}
+
+async function cutText(cut: Cut): Promise<string | undefined> {
+  try {
+    const text = await readFile(cut.path, 'utf8');
+    const intact =
+      cut.sha256 === undefined || createHash('sha256').update(text).digest('hex') === cut.sha256;
+    return intact ? text : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * The message with the text its preview was cut from put back, for searching and reading
- * back an archived thread, whether this extension cut it or tool-result-offload did.
- * Unchanged when it was not cut, its file is gone, or the file is not the text the other
- * extension recorded.
+ * back an archived thread, whether this extension cut it or tool-result-offload did. When
+ * both did, one cut the other's preview: the preview in the message is put back first, and
+ * the text that brings holds the preview of the other. Unchanged when it was not cut, its
+ * file is gone, or the file is not the text the other extension recorded.
  */
 export async function withFullOutput(message: AgentMessage): Promise<AgentMessage> {
   if (message.role !== 'toolResult') return message;
   const capped = cappedOutput(message.details);
-  const offloaded = capped ? undefined : offloadedOutput(message.details);
-  const path = capped?.path ?? offloaded?.path;
-  if (path === undefined) return message;
-  // The preview names its file. A handler that ran after the cut can have put a block before
-  // it, so the recorded index is only where to look first.
-  const at = [...(capped ? [capped.block] : []), ...message.content.keys()].find((index) => {
-    const block = message.content[index];
-    return block?.type === 'text' && block.text.includes(path);
-  });
-  if (at === undefined) return message;
-  let text: string;
-  try {
-    text = await readFile(path, 'utf8');
-  } catch {
-    return message;
+  const offloaded = offloadedOutput(message.details);
+  let cuts: Cut[] = [
+    ...(capped
+      ? [
+          {
+            path: capped.path,
+            block: capped.block,
+            names: (text: string) =>
+              text.includes('[episodes] ') && text.includes(named(capped.path))
+          }
+        ]
+      : []),
+    ...(offloaded
+      ? [
+          {
+            ...offloaded,
+            names: (text: string) =>
+              text.includes('[tool-result-offload: ') && text.includes(offloaded.path)
+          }
+        ]
+      : [])
+  ];
+  let content: Block[] = message.content;
+  for (let left = cuts.length; left > 0; left--) {
+    let restored: Cut | undefined;
+    for (const cut of cuts) {
+      const at = previewAt(content, cut);
+      const text = at === undefined ? undefined : await cutText(cut);
+      if (text === undefined) continue;
+      content = content.map((block, index) => (index === at ? { type: 'text', text } : block));
+      restored = cut;
+      break;
+    }
+    if (!restored) break;
+    cuts = cuts.filter((cut) => cut !== restored);
   }
-  if (offloaded && createHash('sha256').update(text).digest('hex') !== offloaded.sha256) {
-    return message;
-  }
-  return {
-    ...message,
-    content: message.content.map((block, index) => (index === at ? { type: 'text', text } : block))
-  };
+  return content === message.content ? message : { ...message, content };
 }

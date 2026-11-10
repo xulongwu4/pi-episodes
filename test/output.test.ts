@@ -205,3 +205,84 @@ test('the text another extension offloaded is put back when its file matches the
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+/** A preview as tool-result-offload writes it, with the file it keeps the text in. */
+async function offloaded(dir: string, text: string, keep: number) {
+  const sha256 = createHash('sha256').update(text).digest('hex');
+  const path = join(dir, `${sha256}.txt`);
+  await writeFile(path, text);
+  const head = text.slice(0, Math.floor((keep * 2) / 3));
+  const tail = text.slice(text.length - Math.floor(keep / 3));
+  const preview = `${head}\n\n[tool-result-offload: some chars omitted. This result in full (sha256 ${sha256.slice(0, 12)}): ${path} — grep it.]\n\n${tail}`;
+  return { preview, details: { path, sha256, chars: text.length } };
+}
+
+type ToolResult = Extract<AgentMessage, { role: 'toolResult' }>;
+
+function toolResult(
+  content: ToolResult['content'],
+  details: NonNullable<ToolResult['details']>
+): ToolResult {
+  return {
+    role: 'toolResult',
+    toolCallId: 'c1',
+    toolName: 'codemode',
+    content,
+    details,
+    isError: false,
+    timestamp: 0
+  };
+}
+
+test('a result that both extensions cut gets all of its text back, whichever cut first', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    // The other extension first: this one cut its preview, and its words are out of sight.
+    const first = await offloaded(dir, long, 3000);
+    const second = await capOutput([{ type: 'text', text: first.preview }], dir, 1000, 300);
+    assert.ok(second);
+    const twice = toolResult(withStamp(second.content, 7), {
+      offload: first.details,
+      [CAPPED_KEY]: { ...second.capped }
+    });
+    assert.doesNotMatch(JSON.stringify(twice.content), /tool-result-offload/);
+    const full = await withFullOutput(twice);
+    assert.ok(full.role === 'toolResult');
+    assert.deepEqual(full.content[0], { type: 'text', text: long });
+    assert.equal(readStamp(full), 7);
+
+    // This extension first: the other one cut its preview.
+    const cut = await capOutput([{ type: 'text', text: long }], dir, 4000, 3000);
+    assert.ok(cut?.content[0]?.type === 'text');
+    const outer = await offloaded(dir, cut.content[0].text, 600);
+    assert.doesNotMatch(outer.preview, /\[episodes\]/);
+    const reversed = toolResult(withStamp([{ type: 'text', text: outer.preview }], 7), {
+      [CAPPED_KEY]: { ...cut.capped },
+      offload: outer.details
+    });
+    const whole = await withFullOutput(reversed);
+    assert.ok(whole.role === 'toolResult');
+    assert.deepEqual(whole.content[0], { type: 'text', text: long });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a block that only mentions the file of a cut is not taken for its preview', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    const cut = await offloaded(dir, long, 600);
+    const note = { type: 'text' as const, text: `Saved a copy at ${cut.details.path}.` };
+    const preview = { type: 'text' as const, text: cut.preview };
+    const message = toolResult(withStamp([note, preview], 7), { offload: cut.details });
+    const full = await withFullOutput(message);
+    assert.ok(full.role === 'toolResult');
+    assert.deepEqual(full.content.slice(0, 2), [note, { type: 'text', text: long }]);
+
+    // Two blocks that read as the preview are not told apart: neither is replaced.
+    const doubled = toolResult(withStamp([preview, preview], 7), { offload: cut.details });
+    assert.equal(await withFullOutput(doubled), doubled);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
