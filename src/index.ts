@@ -20,7 +20,7 @@ import { recordEvent, recordMeta } from './events.js';
 import { codemodeOnly, registerFold } from './fold.js';
 import { registerFork } from './fork.js';
 import { ForkRegistry, registerForksView } from './forks-view.js';
-import { FILE_TOOLS } from './messages.js';
+import { type FileTouch, fileTouch, withFiles } from './messages.js';
 import { registerNudge } from './nudge.js';
 import { CAPPED_KEY, capOutput } from './output.js';
 import { CODEMODE_CALLS, EPISODES_SECTION } from './prompt.js';
@@ -129,9 +129,17 @@ export default function episodes(pi: ExtensionAPI): void {
   // codemode script made has a result the model may never see, so its cue waits for the
   // script's own result.
   const scriptCues = new Map<string, Cue[]>();
+  // Files the calls of a script changed without naming them in their arguments. The session
+  // keeps the arguments of those calls and not their results, so the script's result records
+  // them for the fold that covers it.
+  const scriptFiles = new Map<string, FileTouch[]>();
   // A script that never returned, for example when the run was aborted, leaves its cues.
-  pi.on('agent_settled', () => scriptCues.clear());
-  pi.on('session_start', () => scriptCues.clear());
+  const forget = () => {
+    scriptCues.clear();
+    scriptFiles.clear();
+  };
+  pi.on('agent_settled', forget);
+  pi.on('session_start', forget);
   pi.on('tool_result', async (event, ctx) => {
     // Not awaited for a script's inner calls, whose cues must be collected in call order.
     const capped = event.parentToolCallId ? undefined : await cap(event, ctx);
@@ -141,29 +149,46 @@ export default function episodes(pi: ExtensionAPI): void {
         ? []
         : (scriptCues.get(event.toolCallId) ?? []);
     scriptCues.delete(event.toolCallId);
-    const path = event.input.path;
-    if (FILE_TOOLS.has(event.toolName) && typeof path === 'string' && path) {
-      const cue = cueFor(resolve(state.cwd, path), threadRecords(ctx.sessionManager.getBranch()));
-      if (cue && event.parentToolCallId) {
-        const root = state.rootCall(event.toolCallId);
-        scriptCues.set(root, [...(scriptCues.get(root) ?? []), cue]);
-        return undefined;
+    // A fork's child keeps its files in its own results, which the fork reads them from.
+    const files =
+      event.parentToolCallId || event.toolName === FORK_TOOL
+        ? []
+        : (scriptFiles.get(event.toolCallId) ?? []);
+    scriptFiles.delete(event.toolCallId);
+    const touch = fileTouch(event.toolName, event.input, event.structuredContent);
+    if (touch) {
+      const root = event.parentToolCallId ? state.rootCall(event.toolCallId) : undefined;
+      if (touch.fromResult) {
+        const file = { name: event.toolName, path: touch.path };
+        files.push(file);
+        if (root) scriptFiles.set(root, [...(scriptFiles.get(root) ?? []), file]);
       }
-      if (cue) cues.push(cue);
+      const cue = cueFor(
+        resolve(state.cwd, touch.path),
+        threadRecords(ctx.sessionManager.getBranch())
+      );
+      if (cue && root) scriptCues.set(root, [...(scriptCues.get(root) ?? []), cue]);
+      else if (cue) cues.push(cue);
     }
 
     const lines = cues.flatMap((cue) => surface(cue, event.toolCallId));
-    if (lines.length === 0 && !capped) return undefined;
+    const details =
+      files.length > 0 ? withFiles(capped?.details ?? event.details, files) : capped?.details;
+    if (lines.length === 0 && !capped) return details && { details };
     const content = [
       ...(capped?.content ?? event.content),
       ...(lines.length > 0 ? [{ type: 'text' as const, text: lines.join('\n') }] : [])
     ];
     // A cut result no longer matches its structured output, which pi then drops.
-    if (capped) return { content, details: capped.details };
+    if (capped) return { content, details };
     // Replacing content alone would drop structured output for programmatic callers.
-    return event.structuredContent === undefined
-      ? { content }
-      : { content, structuredContent: event.structuredContent };
+    return {
+      content,
+      ...(details ? { details } : {}),
+      ...(event.structuredContent === undefined
+        ? {}
+        : { structuredContent: event.structuredContent })
+    };
   });
 
   /**

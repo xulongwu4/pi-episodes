@@ -2,7 +2,72 @@ import { basename, resolve } from 'node:path';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ImageContent, TextContent } from '@earendil-works/pi-ai';
 
-export const FILE_TOOLS = new Set(['read', 'edit', 'write']);
+const READ_TOOLS = new Set(['read']);
+/**
+ * Tools that change a file: pi's own, and the anchor tools of pi-hashline-edit-pro. grep is not
+ * one, nor a file tool at all: its path is where it searched.
+ */
+const WRITE_TOOLS = new Set([
+  'edit',
+  'write',
+  'replace',
+  'replace_match',
+  'insert',
+  'copy',
+  'move',
+  'undo_last_change'
+]);
+export const FILE_TOOLS = new Set([...READ_TOOLS, ...WRITE_TOOLS]);
+
+/**
+ * Details key of a tool result for the files its call changed without naming them in its
+ * arguments, and for a script's result the files its calls changed that way.
+ */
+export const FILES_KEY = 'episodesFiles';
+
+export interface FileTouch {
+  name: string;
+  path: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The file a call of a file tool touched. pi's tools name it in their arguments. An anchor tool
+ * takes line anchors and names the file only in its structured result, which the session does
+ * not keep: `fromResult` then says the path is found later only if it is recorded. A move
+ * between two files names the one it moved to.
+ */
+export function fileTouch(
+  name: string,
+  args: Record<string, unknown> | undefined,
+  structured: unknown
+): { path: string; fromResult: boolean } | undefined {
+  if (!FILE_TOOLS.has(name)) return undefined;
+  if (typeof args?.path === 'string' && args.path) return { path: args.path, fromResult: false };
+  const path = WRITE_TOOLS.has(name) && isRecord(structured) ? structured.path : undefined;
+  return typeof path === 'string' && path ? { path, fromResult: true } : undefined;
+}
+
+/** `details` with these files recorded; undefined when the details cannot hold them. */
+export function withFiles(
+  details: unknown,
+  files: readonly FileTouch[]
+): Record<string, unknown> | undefined {
+  if (details !== undefined && !isRecord(details)) return undefined;
+  return { ...details, [FILES_KEY]: files };
+}
+
+function recordedFiles(details: unknown): FileTouch[] {
+  const files = isRecord(details) ? details[FILES_KEY] : undefined;
+  if (!Array.isArray(files)) return [];
+  return files.filter(
+    (file): file is FileTouch =>
+      isRecord(file) && typeof file.name === 'string' && typeof file.path === 'string'
+  );
+}
 
 function blocksText(content: string | readonly (TextContent | ImageContent)[]): string {
   if (typeof content === 'string') {
@@ -54,7 +119,8 @@ export function estimateTokens(messages: readonly AgentMessage[]): number {
 /**
  * Absolute paths that file tools read or wrote in these messages, including calls a codemode
  * script made. Pi records those on the script's result with bounded arguments, so a call whose
- * arguments were dropped for size is missed.
+ * arguments were dropped for size is missed. A path that was not in the arguments is the one
+ * recorded with the result.
  */
 export function touchedPaths(
   messages: readonly AgentMessage[],
@@ -69,6 +135,7 @@ export function touchedPaths(
   for (const message of messages) {
     if (message.role === 'toolResult') {
       for (const call of message.nestedCalls?.calls ?? []) add(call.name, call.arguments);
+      for (const file of recordedFiles(message.details)) add(file.name, { path: file.path });
       continue;
     }
     if (message.role !== 'assistant') continue;
@@ -78,9 +145,6 @@ export function touchedPaths(
   }
   return [...paths];
 }
-
-const READ_TOOLS = new Set(['read']);
-const WRITE_TOOLS = new Set(['edit', 'write']);
 
 /** Skill files these messages read. Pi has no skill tool: loading a skill is reading its SKILL.md. */
 export function skillPaths(messages: readonly AgentMessage[], cwd: string): string[] {

@@ -23,6 +23,7 @@ import {
   SessionManager,
   SettingsManager
 } from '@earendil-works/pi-coding-agent';
+import { Type } from 'typebox';
 import {
   appliedFolds,
   FOLD_APPLIED_TYPE,
@@ -33,6 +34,7 @@ import {
 import { cacheAnchor } from '../src/cache.js';
 import { foldableTurns, foldStart } from '../src/fold.js';
 import episodes from '../src/index.js';
+import { FILES_KEY } from '../src/messages.js';
 import { nudgeGrowth, nudgeThreshold } from '../src/nudge.js';
 import { episodeStats } from '../src/stats.js';
 
@@ -75,7 +77,9 @@ async function createSession(
   /** Entries to resume from, as after a restart. */
   entries?: Parameters<typeof SessionManager.inMemory>[2],
   /** Extensions whose handlers run before those of episodes. */
-  before: ExtensionFactory[] = []
+  before: ExtensionFactory[] = [],
+  /** Tools of `extensions` to make active. */
+  tools: string[] = []
 ) {
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-codemode-'));
   const faux = fauxProvider();
@@ -121,6 +125,7 @@ async function createSession(
       'recall',
       'ask',
       'fork',
+      ...tools,
       ...(mode === 'off' ? [] : ['codemode'])
     ],
     sessionManager: SessionManager.inMemory(dir, undefined, entries),
@@ -397,6 +402,162 @@ test('files a script read are in the fold, and reading one again cues the thread
     assert.ok(record?.kind === 'fold');
     assert.deepEqual(record.files, [join(dir, 'api.ts')]);
     assert.deepEqual(record.readOnly, [join(dir, 'api.ts')]);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+/**
+ * Tools shaped like those of pi-hashline-edit-pro: an edit takes line anchors and names its file
+ * only in the structured result, and a search takes the path it searched.
+ */
+const anchorTools: ExtensionFactory = (pi) => {
+  pi.registerTool({
+    name: 'replace',
+    label: 'replace',
+    description: 'Replace lines by anchor.',
+    parameters: Type.Object({ remove_from: Type.String(), remove_to: Type.String() }),
+    async execute() {
+      return {
+        content: [{ type: 'text', text: 'Replaced 1 line.' }],
+        details: { diff: '+x' },
+        structuredContent: { ok: true, kind: 'edit', path: 'api.ts' }
+      };
+    }
+  });
+  pi.registerTool({
+    name: 'grep',
+    label: 'grep',
+    description: 'Search files.',
+    parameters: Type.Object({ pattern: Type.String(), path: Type.String() }),
+    async execute() {
+      return { content: [{ type: 'text', text: 'no hits' }], details: undefined };
+    }
+  });
+};
+const ANCHORS = { remove_from: 'abcde', remove_to: 'abcde' };
+
+function toolResults(harness: Awaited<ReturnType<typeof createSession>>, toolName: string) {
+  return harness.session.sessionManager
+    .getBranch()
+    .flatMap((entry) => (entry.type === 'message' ? [entry.message] : []))
+    .flatMap((message) =>
+      message.role === 'toolResult' && message.toolName === toolName ? [message] : []
+    );
+}
+
+test('an edit by line anchors counts for the file its result names, and a search does not', async () => {
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxToolCall('replace', ANCHORS),
+            fauxToolCall('grep', { pattern: 'x', path: 'lib.ts' })
+          ],
+          { stopReason: 'toolUse' }
+        ),
+      () =>
+        fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'Edited the api.' }), {
+          stopReason: 'toolUse'
+        }),
+      (context) => {
+        const note = text(conversation(context).at(-1)!);
+        assert.match(note, /api\.ts/);
+        assert.doesNotMatch(note, /lib\.ts/);
+        return fauxAssistantMessage('noted');
+      },
+      () => fauxAssistantMessage(fauxToolCall('replace', ANCHORS), { stopReason: 'toolUse' }),
+      (context) => {
+        const result = text(conversation(context).at(-1)!);
+        assert.match(result, /\[episodes\] api\.ts was also touched in folded span ep-[0-9a-f]{8}/);
+        return fauxAssistantMessage('ok');
+      }
+    ],
+    [anchorTools],
+    {},
+    {},
+    undefined,
+    [],
+    ['replace', 'grep']
+  );
+  try {
+    await harness.run('edit it', 'again');
+    const [record] = threadRecords(harness.session.sessionManager.getBranch());
+    assert.ok(record?.kind === 'fold');
+    assert.deepEqual(record.files, [join(harness.dir, 'api.ts')]);
+    assert.equal(record.readOnly, undefined);
+    // The result keeps the tool's own details next to the file.
+    assert.deepEqual(toolResults(harness, 'replace')[0]?.details, {
+      diff: '+x',
+      [FILES_KEY]: [{ name: 'replace', path: 'api.ts' }]
+    });
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('an edit by line anchors from a script is in the fold, and the next one cues the thread', async () => {
+  const edit = `await tools.replace(${JSON.stringify(ANCHORS)}); text("edited");`;
+  const harness = await createSession(
+    'only',
+    [
+      () => script(edit),
+      () => script('text(await tools.fold({ since: "t1", note: "Edited the api." }));'),
+      () => fauxAssistantMessage('noted'),
+      () => script(edit),
+      (context) => {
+        const result = text(conversation(context).at(-1)!);
+        assert.match(result, /\[episodes\] api\.ts was also touched in folded span ep-[0-9a-f]{8}/);
+        return fauxAssistantMessage('ok');
+      }
+    ],
+    [anchorTools],
+    {},
+    {},
+    undefined,
+    [],
+    ['replace', 'grep']
+  );
+  try {
+    await harness.run('edit it', 'again');
+    const [record] = threadRecords(harness.session.sessionManager.getBranch());
+    assert.ok(record?.kind === 'fold');
+    assert.deepEqual(record.files, [join(harness.dir, 'api.ts')]);
+    assert.equal(record.readOnly, undefined);
+    const details = toolResults(harness, 'codemode')[0]?.details as Record<string, unknown>;
+    assert.deepEqual(details[FILES_KEY], [{ name: 'replace', path: 'api.ts' }]);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('an edit by line anchors in a fork is among the files of the fork', async () => {
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('fork', { task: 'Edit.' }), { stopReason: 'toolUse' }),
+      () => fauxAssistantMessage(fauxToolCall('replace', ANCHORS), { stopReason: 'toolUse' }),
+      () => fauxAssistantMessage('Changed: api.ts. Learned: nothing.'),
+      () => fauxAssistantMessage('ok')
+    ],
+    [anchorTools],
+    {},
+    {},
+    undefined,
+    [],
+    ['replace', 'grep']
+  );
+  try {
+    await harness.run('go');
+    const [record] = threadRecords(harness.session.sessionManager.getBranch());
+    assert.ok(record?.kind === 'fork');
+    assert.deepEqual(record.files, [join(harness.dir, 'api.ts')]);
+    // The files of the child are its own, not the fork call's.
+    const details = toolResults(harness, 'fork')[0]?.details as Record<string, unknown>;
+    assert.equal(details[FILES_KEY], undefined);
   } finally {
     await harness.cleanup();
   }
