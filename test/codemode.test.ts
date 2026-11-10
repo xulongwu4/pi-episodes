@@ -28,11 +28,12 @@ import {
   appliedFolds,
   FOLD_APPLIED_TYPE,
   FOLD_DETAILS_KEY,
+  FOLD_STARTED_TYPE,
   ThreadIndex,
   threadRecords
 } from '../src/archive.js';
 import { cacheAnchor } from '../src/cache.js';
-import { foldableTurns, foldStart } from '../src/fold.js';
+import { foldableTurns, foldStart, USER_TEXT_CAP } from '../src/fold.js';
 import episodes from '../src/index.js';
 import { FILES_KEY } from '../src/messages.js';
 import { nudgeGrowth, nudgeThreshold } from '../src/nudge.js';
@@ -1516,6 +1517,73 @@ test('a fold is refused while an earlier one is cut short, and works after the t
     assert.equal(hits.length, 1);
   } finally {
     await resumed.cleanup();
+  }
+});
+
+test('a fold leaves a user message that an earlier turn-end handler edits at its boundary', async () => {
+  const paste = 'p'.repeat(USER_TEXT_CAP * 2);
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo out' }), {
+          stopReason: 'toolUse'
+        }),
+      () =>
+        fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'n' }), {
+          stopReason: 'toolUse'
+        }),
+      (context) => {
+        const sent = conversation(context).map(text).join('\n');
+        assert.match(sent, /redacted/);
+        assert.doesNotMatch(sent, /pppp/);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    [],
+    {},
+    {},
+    undefined,
+    [
+      (pi) => {
+        pi.on('turn_end', (event, ctx) => {
+          const branch = ctx.sessionManager.getBranch();
+          const folded = branch.some(
+            (entry) =>
+              entry.type === 'message' &&
+              entry.message.role === 'toolResult' &&
+              entry.message.toolName === 'fold'
+          );
+          const pasted = branch.find(
+            (entry) => entry.type === 'message' && entry.message.role === 'user'
+          );
+          if (!folded || !pasted) return undefined;
+          return {
+            entries: [
+              ...event.entries,
+              {
+                type: 'context_edit' as const,
+                targetId: pasted.id,
+                replacement: { content: [{ type: 'text' as const, text: 'redacted' }] }
+              }
+            ]
+          };
+        });
+      }
+    ]
+  );
+  try {
+    await harness.run(paste);
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(threadRecords(branch).length, 1);
+    // The start entry holds what the fold wrote, so completing it would not write the cut either.
+    const started = branch.find(
+      (entry) => entry.type === 'custom' && entry.customType === FOLD_STARTED_TYPE
+    );
+    const planned = (started as { data: { edits: { replacement: unknown }[] } }).data.edits;
+    assert.ok(planned.length > 0 && planned.every((edit) => edit.replacement === null));
+  } finally {
+    await harness.cleanup();
   }
 });
 

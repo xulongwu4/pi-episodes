@@ -954,6 +954,15 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       });
     const repairs = completeCutShortFolds(branch, event.entries);
     if (applied.length === 0 && repairs.length === 0) return undefined;
+    // The cut of a user message only saves tokens, so an edit an earlier handler queued for
+    // that message stands, as it does when a cut-short fold is completed.
+    const edited = new Set(
+      (event.entries as readonly PendingDraft[]).flatMap((draft) =>
+        draft.type === 'context_edit' && draft.targetId !== undefined ? [draft.targetId] : []
+      )
+    );
+    const editsOf = (fold: { edits: readonly ContextEditEntryDraft[] }) =>
+      fold.edits.filter((edit) => edit.replacement === null || !edited.has(edit.targetId));
 
     for (const fold of applied) {
       ctx.ui.notify(
@@ -972,9 +981,9 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
           {
             type: 'custom' as const,
             customType: FOLD_STARTED_TYPE,
-            data: { handle: fold.handle, edits: fold.edits }
+            data: { handle: fold.handle, edits: editsOf(fold) }
           },
-          ...fold.edits,
+          ...editsOf(fold),
           { type: 'custom' as const, customType: FOLD_APPLIED_TYPE, data: { handle: fold.handle } }
         ])
       ]
