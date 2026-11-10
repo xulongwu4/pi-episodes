@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createMatcher, grepThreads } from '../src/recall.js';
+import { createMatcher, formatTurn, grepThreads, turnMessages } from '../src/recall.js';
 import { assistant, call, result, user } from './helpers.js';
 
 const thread = {
@@ -37,4 +37,23 @@ test('returns every match so the caller can cap and spill the rest', () => {
   const matches = grepThreads([thread, { ...thread, handle: 'ep-2' }], createMatcher('e', false));
   assert.ok(matches.length > 3);
   assert.deepEqual(new Set(matches.map((match) => match.handle)), new Set(['ep-1', 'ep-2']));
+});
+
+test('a turn read back is its stamped message and the responses up to the next stamp', () => {
+  // The turn a match names: the assistant line above was attributed to t4.
+  const turn = turnMessages(thread, 4);
+  assert.deepEqual(
+    turn.map((message) => message.role),
+    ['user', 'assistant']
+  );
+  assert.deepEqual(
+    turnMessages(thread, 3).map((message) => message.role),
+    ['toolResult']
+  );
+  assert.deepEqual(turnMessages(thread, 9), []);
+
+  assert.equal(
+    formatTurn('ep-1', 't3', turnMessages(thread, 3)),
+    'ep-1 t3 toolResult (bash), 45 chars\nok\nsrc/client/api.ts(12,5): error TS2322\n[t3]'
+  );
 });

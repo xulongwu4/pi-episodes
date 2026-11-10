@@ -1,18 +1,21 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
+import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { archiveDir, type Thread, ThreadIndex } from './archive.js';
 import { messageText } from './messages.js';
 import { withFullOutput } from './output.js';
 import { excerpt, RecallIndex, type RecallMatch, type SearchableThread } from './search.js';
-import { readStamp, stampLabel } from './stamps.js';
+import { parseStamp, readStamp, stampLabel } from './stamps.js';
 import type { EpisodeState } from './state.js';
 import { type RecallDetails, recallRenderers } from './ui.js';
 
 const DEFAULT_LIMIT = 30;
 const MAX_LIMIT = 200;
+/** How much of a turn read back by its stamp goes into context; the rest goes to a file. */
+const READ_BACK_CHARS = 8000;
 
 export function createMatcher(
   query: string,
@@ -65,17 +68,36 @@ export function formatMatch(match: RecallMatch): string {
   return `${match.handle} ${match.turn ?? '-'} ${match.role}: ${match.line}`;
 }
 
-/** Matches past the limit go to a file the agent can grep or read in part, not into context. */
-async function spill(
-  dir: string | undefined,
-  query: string,
-  matches: readonly RecallMatch[]
-): Promise<string> {
+/**
+ * The messages a turn stands for in recall's matches: the one carrying the stamp and the
+ * responses after it, up to the next stamp.
+ */
+export function turnMessages(thread: SearchableThread, stamp: number): AgentMessage[] {
+  const start = thread.messages.findIndex((message) => readStamp(message) === stamp);
+  if (start < 0) return [];
+  const end = thread.messages.findIndex(
+    (message, index) => index > start && readStamp(message) !== undefined
+  );
+  return thread.messages.slice(start, end < 0 ? undefined : end);
+}
+
+/** A turn as it was, each message under a line saying whose it is and how long. */
+export function formatTurn(handle: string, turn: string, messages: readonly AgentMessage[]) {
+  return messages
+    .map((message) => {
+      const text = messageText(message);
+      const tool = message.role === 'toolResult' ? ` (${message.toolName})` : '';
+      return `${handle} ${turn} ${message.role}${tool}, ${text.length} chars\n${text}`;
+    })
+    .join('\n\n');
+}
+
+/** What does not fit the result goes to a file the agent can grep or read in part. */
+async function spill(dir: string | undefined, name: string, text: string): Promise<string> {
   const target = dir ?? join(tmpdir(), 'pi-episodes');
   await mkdir(target, { recursive: true });
-  const name = `recall-${Date.now()}-${query.replace(/[^a-z0-9]+/gi, '-').slice(0, 40)}.txt`;
   const file = join(target, name);
-  await writeFile(file, `${matches.map(formatMatch).join('\n')}\n`);
+  await writeFile(file, `${text}\n`);
   return file;
 }
 
@@ -115,12 +137,20 @@ export async function staleness(
 }
 
 const RecallParams = Type.Object({
-  query: Type.String({
-    description:
-      'Words to find, such as an error code, symbol, path or a few words of what happened. Wrap it in double quotes to match that exact text instead.'
-  }),
+  query: Type.Optional(
+    Type.String({
+      description:
+        'Words to find, such as an error code, symbol, path or a few words of what happened. Wrap it in double quotes to match that exact text instead. Not needed with turn.'
+    })
+  ),
   handle: Type.Optional(
     Type.String({ description: 'Only search this archived thread, such as "ep-1a2b3c4d".' })
+  ),
+  turn: Type.Optional(
+    Type.String({
+      description:
+        'With handle, instead of searching: return what that turn held, verbatim. Use the turn a match named, such as "t14".'
+    })
   ),
   regex: Type.Optional(
     Type.Boolean({
@@ -141,13 +171,20 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
     name: 'recall',
     label: 'Recall',
     description:
-      'Search the archived threads (folded spans and finished forks): tool outputs, your own messages and reasoning, commands and their arguments. Ranked by relevance: messages holding every word come first, in any order, and rare words such as error codes weigh more than common ones. Returns the best line of each match with the thread handle and turn it came from; matches past the limit go to a file. A "quoted" query or regex matches exact text per line instead. Cheap, no model call. Query for the specific thing you need; it is not a way to read a span back.',
+      'Search the archived threads (folded spans and finished forks): tool outputs, your own messages and reasoning, commands and their arguments. Ranked by relevance: messages holding every word come first, in any order, and rare words such as error codes weigh more than common ones. Returns the best line of each match with the thread handle and turn it came from; matches past the limit go to a file. A "quoted" query or regex matches exact text per line instead. Cheap, no model call. Query for the specific thing you need. When the line of a match is not enough, pass its handle and turn without a query to get that turn verbatim; it is not a way to read a whole span back.',
     promptSnippet: 'Search archived threads (folded spans, forks) by keyword or exact text',
     parameters: RecallParams,
     renderCall: recallRenderers.renderCall,
     renderResult: recallRenderers.renderResult,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const query = params.query ?? '';
+      if (!params.turn && !query.trim()) {
+        throw new Error('recall needs a query, or a handle and a turn to read that turn back.');
+      }
+      if (params.turn && !params.handle) {
+        throw new Error('turn needs the handle of the thread it is in.');
+      }
       const index = new ThreadIndex(ctx.sessionManager, state.forkArchives);
       let threads: Thread[];
       if (params.handle) {
@@ -168,17 +205,56 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
       if (threads.length === 0) {
         return {
           content: [{ type: 'text', text: 'Nothing is archived on this branch yet.' }],
-          details: { query: params.query, threads: 0, shown: 0, total: 0 }
+          details: { query, threads: 0, shown: 0, total: 0 }
         };
       }
 
-      const quoted = /^"(.+)"$/s.exec(params.query.trim())?.[1];
+      if (params.turn) {
+        const thread = threads[0]!;
+        const stamp = parseStamp(params.turn);
+        const messages = stamp === undefined ? [] : turnMessages(thread, stamp);
+        if (stamp === undefined || messages.length === 0) {
+          throw new Error(`No turn ${params.turn} in ${thread.handle} (${thread.label}).`);
+        }
+        const turn = stampLabel(stamp);
+        const text = formatTurn(thread.handle, turn, messages);
+        const details: RecallDetails = {
+          query,
+          threads: 1,
+          shown: messages.length,
+          total: messages.length,
+          hits: [thread.handle],
+          turn,
+          chars: text.length
+        };
+        const stale = await staleness(state, [thread]);
+        if (stale.length > 0) {
+          details.stale = stale.map(({ handle, files }) => ({ handle, files }));
+        }
+        const lines = stale.map((note) => note.line);
+        if (text.length > READ_BACK_CHARS) {
+          const file = await spill(
+            archiveDir(ctx.sessionManager),
+            `${thread.handle}-${turn}.txt`,
+            text
+          );
+          lines.push(
+            text.slice(0, READ_BACK_CHARS).toWellFormed(),
+            `... ${text.length - READ_BACK_CHARS} more characters. The whole turn is in ${file}; grep it or read a slice rather than the whole file.`
+          );
+          details.file = file;
+        } else {
+          lines.push(text);
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }], details };
+      }
+      const quoted = /^"(.+)"$/s.exec(query.trim())?.[1];
       let all: RecallMatch[];
       let partial = false;
       if (params.regex || quoted !== undefined) {
         let matcher: ReturnType<typeof createMatcher>;
         try {
-          matcher = createMatcher(params.regex ? params.query : quoted!, params.regex === true);
+          matcher = createMatcher(params.regex ? query : quoted!, params.regex === true);
         } catch (error) {
           throw new Error(`Invalid regular expression: ${(error as Error).message}`);
         }
@@ -188,7 +264,7 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
         state.recallIndex ??= new RecallIndex();
         state.recallIndex.add(threads);
         ({ matches: all, partial } = state.recallIndex.search(
-          params.query,
+          query,
           new Set(threads.map((thread) => thread.handle))
         ));
       }
@@ -197,7 +273,7 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
       const matches = all.slice(0, limit);
       const total = all.length;
       const details: RecallDetails = {
-        query: params.query,
+        query,
         threads: threads.length,
         shown: matches.length,
         total
@@ -207,7 +283,7 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
           content: [
             {
               type: 'text',
-              text: `No match for "${params.query}" in ${threads.length} archived thread(s): ${threads.map((thread) => thread.handle).join(', ')}.`
+              text: `No match for "${query}" in ${threads.length} archived thread(s): ${threads.map((thread) => thread.handle).join(', ')}.`
             }
           ],
           details
@@ -229,7 +305,11 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
         ...matches.map(formatMatch)
       ];
       if (total > matches.length) {
-        const file = await spill(archiveDir(ctx.sessionManager), params.query, all);
+        const file = await spill(
+          archiveDir(ctx.sessionManager),
+          `recall-${Date.now()}-${query.replace(/[^a-z0-9]+/gi, '-').slice(0, 40)}.txt`,
+          all.map(formatMatch).join('\n')
+        );
         lines.push(
           `... ${total - matches.length} more matches. All ${total} are in ${file}; grep it or read a slice rather than the whole file. A narrower query is usually better.`
         );

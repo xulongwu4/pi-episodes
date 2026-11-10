@@ -64,12 +64,14 @@ at the end of a message.
 
 Going back: the archive is the record, the note only its cue. recall searches the archived
 spans, forks and compacted turns on this branch by keyword, best match first, and is
-cheap; quote the query to match exact text. Query for the specific thing you need, it is
-not a way to read a span back. Run one recall before retrying something a note says was
-rejected, before editing a file a note points at, before acting on an error string or
-symbol you have seen before, and before saying "we already checked that". ask resumes an
-archived thread to answer one judgment question, such as why something was done; it
-re-reads the whole thread, usually uncached, so prefer recall when a search will do.
+cheap; quote the query to match exact text. Query for the specific thing you need. When a
+match's line is not enough, recall with its handle and turn and no query returns that turn
+verbatim; it is not a way to read a whole span back. Run one recall before retrying
+something a note says was rejected, before editing a file a note points at, before acting
+on an error string or symbol you have seen before, and before saying "we already checked
+that". ask resumes an archived thread to answer one judgment question, such as why
+something was done; it re-reads the whole thread, usually uncached, so prefer recall when a
+search will do.
 
 Prefer working inline and folding after. Use fork when you know up front that the work is
 long and self-contained, or for independent parts that do not edit the same files; forks
@@ -82,6 +84,7 @@ for another agent, give it the user's requests and the diff, not your reasoning.
 /** Appended when fold, recall and ask are called from codemode scripts, out of the model's view. */
 export const CODEMODE_CALLS = /* md */ `
 From a codemode script: tools.fold({ since: "t13", note }), tools.recall({ query, handle?,
-regex?, limit? }) (limit 30 by default, at most 200; the rest go to a file), and
-tools.ask({ handle, question }). Print what they return.
+regex?, limit? }) (limit 30 by default, at most 200; the rest go to a file),
+tools.recall({ handle, turn }) for one turn verbatim, and tools.ask({ handle, question }).
+Print what they return.
 `.trim();

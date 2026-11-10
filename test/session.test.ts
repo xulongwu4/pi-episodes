@@ -595,7 +595,7 @@ test('a note names the skill files read inside its span', async () => {
     await harness.cleanup();
   }
 });
-test('a large tool result arrives cut, and recall searches all of it', async () => {
+test('a large tool result arrives cut, and recall searches and reads back all of it', async () => {
   let handle = '';
   const harness = await createSession(
     [
@@ -627,6 +627,26 @@ test('a large tool result arrives cut, and recall searches all of it', async () 
           text(conversation(context).at(-1)!).split('\n')[0],
           `${handle} t2 toolResult: row 300 of the table`
         );
+        return fauxAssistantMessage(fauxToolCall('recall', { handle, turn: 't2' }));
+      },
+      (context) => {
+        const back = text(conversation(context).at(-1)!);
+        assert.match(
+          back,
+          new RegExp(
+            `^${handle} t2 toolResult \\(bash\\), \\d+ chars\nrow 1 of the table\nrow 2 of`
+          )
+        );
+        assert.match(back, /row 300 of the table\n/);
+        assert.doesNotMatch(back, /row 600 of/);
+        assert.match(
+          back,
+          new RegExp(`more characters\\. The whole turn is in .*${handle}-t2\\.txt`)
+        );
+        return fauxAssistantMessage(fauxToolCall('recall', { handle, turn: 't9' }));
+      },
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), new RegExp(`No turn t9 in ${handle} `));
         return fauxAssistantMessage('done');
       }
     ],
@@ -641,14 +661,18 @@ test('a large tool result arrives cut, and recall searches all of it', async () 
     const stats = episodeStats(harness.session.sessionManager.getBranch(), harness.dir);
     assert.equal(stats.outputs.capped, 1);
     assert.ok(stats.outputs.tokens > 2000);
-    assert.equal(stats.recall.count, 1);
+    assert.equal(stats.recall.count, 2);
+    assert.equal(stats.recall.readBack, 1);
     const lines = statsLines(stats);
     assert.ok(lines.some((line) => /^outputs capped 1, ~\dk kept out of context$/.test(line)));
+    assert.ok(lines.includes('recall 2 (1 read back)'));
 
     const sessions = join(harness.dir, 'sessions');
     const archive = (await readdir(sessions)).find((name) => name.endsWith('.episodes'))!;
     const files = await readdir(join(sessions, archive));
     assert.ok(files.some((name) => /^output-[0-9a-f]{16}\.txt$/.test(name)));
+    const whole = await readFile(join(sessions, archive, `${handle}-t2.txt`), 'utf8');
+    assert.match(whole, /row 600 of the table/);
   } finally {
     await harness.cleanup();
   }

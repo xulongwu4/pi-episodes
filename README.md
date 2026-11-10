@@ -98,7 +98,7 @@ A tool result of 16,000 characters or more is cut before it enters the context: 
 | Tool | What it does | Cost |
 | --- | --- | --- |
 | `fold(since, note)` | Replaces the span starting at `since` with `note` and archives it. | One tool call. With Anthropic, the cache is rewritten from the newest fold note or user message before the span (see [Prompt caching](#prompt-caching)). |
-| `recall(query)` | Searches the archived spans, forks and compacted turns on the current branch: tool outputs, the agent's own messages and reasoning, tool arguments. Results are ranked with BM25+ ([MiniSearch](https://github.com/lucaong/minisearch)): messages holding every word first, in any order, rare words such as error codes weighing more than common ones, with prefixes and small typos tolerated on plain words but never on codes or paths. A `"quoted"` query or `regex: true` matches exact text per line instead. Returns the best line of each match with its handle and turn. With a handle, it searches that thread on any branch. Matches past the limit (30 by default, 200 at most) are written to a file next to the fork transcripts, so a broad query costs a path, not the context. | No model call. |
+| `recall(query)` | Searches the archived spans, forks and compacted turns on the current branch: tool outputs, the agent's own messages and reasoning, tool arguments. Results are ranked with BM25+ ([MiniSearch](https://github.com/lucaong/minisearch)): messages holding every word first, in any order, rare words such as error codes weighing more than common ones, with prefixes and small typos tolerated on plain words but never on codes or paths. A `"quoted"` query or `regex: true` matches exact text per line instead. Returns the best line of each match with its handle and turn. With a handle, it searches that thread on any branch. Matches past the limit (30 by default, 200 at most) are written to a file next to the fork transcripts, so a broad query costs a path, not the context. `recall(handle, turn)` with no query returns one turn verbatim instead, the message carrying that stamp and the responses up to the next one: up to 8,000 characters, the rest in a file. | No model call. |
 | `ask(handle, question)` | Resumes an archived fold or fork with everything it held, asks one question, returns only the answer. Compacted turns cannot be asked: they filled the window when they were compacted. | One model call over the thread's context, cached if the provider still has it. |
 | `fork(task)` | Runs a copy of the agent, starting from its current context, until the task is done, and returns its final note plus what changed on disk. Tool calls go through the parent's tools, hooks and permissions. | The child's prefix is the parent's, so it reads from the parent's cache while that is alive; each child turn re-reads the whole prefix at the cached price, and parallel forks each write their own tail. |
 
@@ -150,7 +150,7 @@ fold errors 1, next fold succeeded after 1
 context ~41k folded, ~380k fewer tokens sent since, compactions 0
 outputs capped 3, ~21k kept out of context
 cache missed after fold avg ~24k, anchor placed 2/2, anchor to span start avg ~3k
-recall 3 (1 empty), ask 1, stale 1 (re-read 1)
+recall 3 (1 empty, 1 read back), ask 1, stale 1 (re-read 1)
 cues 2, followed 1 (1 read-only)
 forks 1, 6 turns, $0.12
 added by the extension ~2k (stamps ~1k, cues ~0, reminders and notices ~1k), prompt ~1k per request
@@ -178,6 +178,7 @@ To measure what the cache anchor saves, turn it off with `{ "episodes": { "cache
 | Measurement events and run metadata | The session file, as `episodes-event` and `episodes-meta` custom entries, which are never sent to the model |
 | Fork transcripts | `<session>.episodes/<handle>.json` next to the session file, or memory for `--no-session` |
 | Recall overflow | `<session>.episodes/recall-<time>-<query>.txt`, or the OS temp directory for `--no-session` |
+| Turns read back that are over 8,000 characters | `<session>.episodes/<handle>-<turn>.txt`, or the OS temp directory for `--no-session` |
 | Tool results cut on arrival | `<session>.episodes/output-<hash>.txt`, named by the hash of the text; the result's `details.episodesOutput` holds the path |
 | Recall search index | Memory only: built on the first ranked `recall` of a session from the archive, then added to as threads are archived |
 | Working tree snapshots | A private git index and object store in the OS temp directory, using the repository's objects read-only; removed when the session ends. The repository's index, stash and `.git/objects` are never written |

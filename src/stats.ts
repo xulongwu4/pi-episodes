@@ -64,7 +64,8 @@ export interface EpisodeStats {
     /** Only where the provider takes breakpoints; elsewhere there is no anchor to measure. */
     gapTokens: number[];
   };
-  recall: { count: number; empty: number; compacted: number };
+  /** `readBack`: calls that returned a turn verbatim instead of searching. */
+  recall: { count: number; empty: number; compacted: number; readBack: number };
   ask: { count: number };
   stale: { shown: number; reread: number };
   cues: { shown: number; followed: number; readOnly: number; capped: number };
@@ -162,7 +163,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       anchored: 0,
       gapTokens: []
     },
-    recall: { count: 0, empty: 0, compacted: 0 },
+    recall: { count: 0, empty: 0, compacted: 0, readBack: 0 },
     ask: { count: 0 },
     stale: { shown: 0, reread: 0 },
     cues: { shown: 0, followed: 0, readOnly: 0, capped: 0 },
@@ -355,6 +356,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       const recall = details as RecallDetails | undefined;
       stats.recall.count++;
       if (recall?.total === 0) stats.recall.empty++;
+      if (recall?.turn) stats.recall.readBack++;
       if (recall?.hits?.some((handle) => handle.startsWith('cp-'))) stats.recall.compacted++;
       countStale(recall?.stale, index);
     } else if (found.toolName === 'ask') {
@@ -458,7 +460,7 @@ export function statsLines(stats: EpisodeStats): string[] {
 
   const back = [
     stats.recall.count > 0
-      ? `recall ${stats.recall.count}${stats.recall.empty || stats.recall.compacted ? ` (${parts([stats.recall.empty, 'empty'], [stats.recall.compacted, 'in compacted turns'])})` : ''}`
+      ? `recall ${stats.recall.count}${stats.recall.empty || stats.recall.compacted || stats.recall.readBack ? ` (${parts([stats.recall.empty, 'empty'], [stats.recall.compacted, 'in compacted turns'], [stats.recall.readBack, 'read back'])})` : ''}`
       : '',
     stats.ask.count > 0 ? `ask ${stats.ask.count}` : '',
     stats.stale.shown > 0 ? `stale ${stats.stale.shown} (re-read ${stats.stale.reread})` : ''
