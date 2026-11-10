@@ -145,6 +145,12 @@ test('the full text is put back for search, under the stamp', async () => {
     const moved = await withFullOutput({ ...message, content: [notice, ...message.content] });
     assert.ok(moved.role === 'toolResult');
     assert.deepEqual(moved.content.slice(0, 2), [notice, { type: 'text', text: long }]);
+    // A cue added when the result was final sits between the preview and the stamp.
+    const cue = { type: 'text' as const, text: '[episodes] a cue' };
+    const cued = await withFullOutput({ ...message, content: withStamp([...cut.content, cue], 7) });
+    assert.ok(cued.role === 'toolResult');
+    assert.deepEqual(cued.content.slice(0, 2), [{ type: 'text', text: long }, cue]);
+    assert.equal(readStamp(cued), 7);
     // Without the preview nothing is put back.
     const replaced = { ...message, content: withStamp([notice], 7) };
     assert.equal(await withFullOutput(replaced), replaced);
