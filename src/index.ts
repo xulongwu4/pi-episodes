@@ -92,6 +92,9 @@ export default function episodes(pi: ExtensionAPI): void {
 
   // Stamps are written when the message is persisted, never later, so they never change
   // bytes that are already cached.
+  // The lines of the cues for a result, added when its message is final: a result handler of
+  // another extension can replace the content, as pi-hashline-edit-pro does with its diff.
+  const resultCues = new Map<string, string[]>();
   pi.on('message_end', (event, ctx) => {
     const message = event.message;
     // The graph moves with each response, not only at the end of a turn.
@@ -102,7 +105,13 @@ export default function episodes(pi: ExtensionAPI): void {
     // Results of a tool batch are saved after every call in it finished, so the tree is final
     // for this stamp. Not awaited: tool calls wait for it below.
     state.snapshots?.recordAt(stamp);
-    return { message: { ...message, content: withStamp(message.content, stamp) } };
+    let content = message.content;
+    if (message.role === 'toolResult') {
+      const lines = resultCues.get(message.toolCallId);
+      resultCues.delete(message.toolCallId);
+      if (lines) content = [...message.content, { type: 'text', text: lines.join('\n') }];
+    }
+    return { message: { ...message, content: withStamp(content, stamp) } };
   });
 
   // The anchor comes from the model's view, not the raw branch: after a compaction the
@@ -136,6 +145,7 @@ export default function episodes(pi: ExtensionAPI): void {
   // A script that never returned, for example when the run was aborted, leaves its cues.
   const forget = () => {
     scriptCues.clear();
+    resultCues.clear();
     scriptFiles.clear();
   };
   pi.on('agent_settled', forget);
@@ -176,23 +186,12 @@ export default function episodes(pi: ExtensionAPI): void {
     }
 
     const lines = cues.flatMap((cue) => surface(cue, event.toolCallId));
+    if (lines.length > 0) resultCues.set(event.toolCallId, lines);
     const details =
       files.length > 0 ? withFiles(capped?.details ?? event.details, files) : capped?.details;
-    if (lines.length === 0 && !capped) return details && { details };
-    const content = [
-      ...(capped?.content ?? event.content),
-      ...(lines.length > 0 ? [{ type: 'text' as const, text: lines.join('\n') }] : [])
-    ];
     // A cut result no longer matches its structured output, which pi then drops.
-    if (capped) return { content, details };
-    // Replacing content alone would drop structured output for programmatic callers.
-    return {
-      content,
-      ...(details ? { details } : {}),
-      ...(event.structuredContent === undefined
-        ? {}
-        : { structuredContent: event.structuredContent })
-    };
+    if (capped) return { content: capped.content, details };
+    return details && { details };
   });
 
   /**

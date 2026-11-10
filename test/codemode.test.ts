@@ -540,6 +540,50 @@ test('an edit by line anchors from a script is in the fold, and the next one cue
   }
 });
 
+/** As pi-hashline-edit-pro does, replaces the result of an edit with its diff. */
+const diffResult: ExtensionFactory = (pi) => {
+  pi.on('tool_result', (event) => {
+    if (event.toolName !== 'replace' || event.structuredContent === undefined) return undefined;
+    return {
+      content: [{ type: 'text' as const, text: '+x' }],
+      structuredContent: event.structuredContent
+    };
+  });
+};
+
+for (const order of ['before', 'after'] as const) {
+  test(`a cue stays on an edit whose result a handler ${order} episodes replaces`, async () => {
+    const harness = await createSession(
+      'off',
+      [
+        () => fauxAssistantMessage(fauxToolCall('replace', ANCHORS), { stopReason: 'toolUse' }),
+        () =>
+          fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'Edited the api.' }), {
+            stopReason: 'toolUse'
+          }),
+        () => fauxAssistantMessage('noted'),
+        () => fauxAssistantMessage(fauxToolCall('replace', ANCHORS), { stopReason: 'toolUse' }),
+        (context) => {
+          const result = text(conversation(context).at(-1)!);
+          assert.match(result, /^\+x\n\[episodes\] api\.ts was also touched in folded span/);
+          return fauxAssistantMessage('ok');
+        }
+      ],
+      order === 'after' ? [anchorTools, diffResult] : [anchorTools],
+      {},
+      {},
+      undefined,
+      order === 'before' ? [diffResult] : [],
+      ['replace', 'grep']
+    );
+    try {
+      await harness.run('edit it', 'again');
+    } finally {
+      await harness.cleanup();
+    }
+  });
+}
+
 test('an edit by line anchors that changed nothing leaves the file as only read', async () => {
   const harness = await createSession(
     'off',
