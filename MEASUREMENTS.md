@@ -277,6 +277,8 @@ With the built-in tools the cap is nearly idle: `read` returned 51 results of 16
 
 The nudge first named the stamp of the note before the unfolded work, which made the fold cover ten more notes than it had to; it now names the first stamp after that note, `t404` here. Three of the six tries with `t239` had the sentence about a valid start and three did not, so that sentence was dropped. Why the model would not fold from `t1` was not found; that message holds values the task says to remember and not to write down, which may be why. The numbers are from one session and one model: they show that the stamp matters there, not how often.
 
+The rule for when this nudge fires was corrected in review (6bb4293), and the replays were run again with it, one request each. At turn 195 the nudge named `t404` and the model folded from it in 2 of 2 tries (123k each); at turn 170 in 1 of 1 (87k). At turn 150, where 52k of unfolded work sat behind the latest note, the earlier rule sent no nudge, because one had been sent before that note and little was added after it; the corrected rule sent one, and the model folded from `t404` (66k) after one script of its own that failed.
+
 The original run also called fold 104 times with the stamp of the message it was answering, a span with nothing in it, and never tried again. The refusal now names the stamp the unfolded work starts at. Three of the replays got that refusal: the model folded from the named stamp in one and went on without folding in two.
 
 <br />
