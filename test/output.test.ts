@@ -45,7 +45,8 @@ test('a large result keeps its start and end and names the file with all of it',
       path: cut.capped.path,
       chars: long.length,
       block: 0,
-      preview: block.text.length
+      preview: block.text.length,
+      head: block.text.indexOf('\n\n[episodes] ')
     });
     assert.equal(await readFile(cut.capped.path, 'utf8'), long);
   } finally {
@@ -314,6 +315,84 @@ test('what a handler added between two cuts stays when both are put back', async
     const whole = await withFullOutput(reversed);
     assert.ok(whole.role === 'toolResult');
     assert.deepEqual(whole.content[0], { type: 'text', text: `${long}\n${warning}` });
+
+    // A block added before the first preview: that preview closes the block it comes back in.
+    const led = await capOutput(
+      [
+        { type: 'text', text: 'a notice' },
+        { type: 'text', text: first.preview }
+      ],
+      dir,
+      1000,
+      300
+    );
+    assert.ok(led);
+    const after = await withFullOutput(
+      toolResult(led.content, { offload: first.details, [CAPPED_KEY]: { ...led.capped } })
+    );
+    assert.ok(after.role === 'toolResult');
+    assert.deepEqual(after.content, [{ type: 'text', text: `a notice\n${long}` }]);
+
+    // With blocks added on both sides, the preview neither opens nor closes the block: the
+    // record says where it is, and without that the preview stays as the model saw it.
+    const around = `a notice\n${cut.content[0].text}\n${warning}`;
+    const wrapped = await offloaded(dir, around, 600);
+    const details = { [CAPPED_KEY]: { ...cut.capped }, offload: wrapped.details };
+    const inside = await withFullOutput(
+      toolResult([{ type: 'text', text: wrapped.preview }], details)
+    );
+    assert.ok(inside.role === 'toolResult');
+    assert.deepEqual(inside.content, [{ type: 'text', text: `a notice\n${long}\n${warning}` }]);
+    const { head: _, ...unplaced } = cut.capped;
+    const kept = await withFullOutput(
+      toolResult([{ type: 'text', text: wrapped.preview }], { ...details, [CAPPED_KEY]: unplaced })
+    );
+    assert.ok(kept.role === 'toolResult');
+    assert.deepEqual(kept.content, [{ type: 'text', text: around }]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a preview of repeated lines is put back where it stands', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    // The same row before and after the one that matters, and a handler adds that row again:
+    // the start and the end of the output fit around the line in more than one way.
+    const rows = (count: number) => Array.from({ length: count }, () => 'PASS test').join('\n');
+    const log = `${rows(300)}\nFAIL the one that matters\n${rows(300)}`;
+    const first = await offloaded(dir, log, 600);
+    const second = await capOutput(
+      [
+        { type: 'text', text: first.preview },
+        { type: 'text', text: 'PASS test' }
+      ],
+      dir,
+      600,
+      300
+    );
+    assert.ok(second);
+    const full = await withFullOutput(
+      toolResult(second.content, { offload: first.details, [CAPPED_KEY]: { ...second.capped } })
+    );
+    assert.ok(full.role === 'toolResult');
+    assert.deepEqual(full.content, [{ type: 'text', text: `${log}\nPASS test` }]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a preview cut inside a character still gets its text back', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    const faces = '😀'.repeat(50);
+    const cut = await capOutput([{ type: 'text', text: faces }], dir, 10, 5);
+    assert.ok(cut?.content[0]?.type === 'text');
+    // Half a character was kept at each end, and reads as the replacement character.
+    assert.match(cut.content[0].text, /^😀\uFFFD\n\n\[episodes\] [^\n]*\n\n\uFFFD$/);
+    const full = await withFullOutput(toolResult(cut.content, { [CAPPED_KEY]: { ...cut.capped } }));
+    assert.ok(full.role === 'toolResult');
+    assert.deepEqual(full.content, [{ type: 'text', text: faces }]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -335,13 +414,22 @@ test('a block that only mentions the file of a cut is not taken for its preview'
     assert.equal(await withFullOutput(doubled), doubled);
     // Text around the line that is not the start and the end of the output is no preview.
     assert.match(cut.preview, /^line 0 of the build log\nline 1 of/);
-    const other = { type: 'text' as const, text: cut.preview.replace('line 1 of', 'line 9 of') };
-    const altered = toolResult(withStamp([other], 7), { offload: cut.details });
-    assert.equal(await withFullOutput(altered), altered);
-    // Nor are two previews in one block.
+    assert.match(cut.preview, /\nline 398 of the build log\nline 399 of the build log$/);
+    for (const [was, now] of [
+      ['line 1 of', 'line 9 of'],
+      ['line 398 of', 'line 000 of']
+    ] as const) {
+      const other = { type: 'text' as const, text: cut.preview.replace(was, now) };
+      const altered = toolResult(withStamp([other], 7), { offload: cut.details });
+      assert.equal(await withFullOutput(altered), altered);
+    }
+    // Of two previews in one block, one is put back, and no character is lost.
     const joined = { type: 'text' as const, text: `${cut.preview}\n${cut.preview}` };
-    const twice = toolResult(withStamp([joined], 7), { offload: cut.details });
-    assert.equal(await withFullOutput(twice), twice);
+    const twice = await withFullOutput(
+      toolResult(withStamp([joined], 7), { offload: cut.details })
+    );
+    assert.ok(twice.role === 'toolResult');
+    assert.deepEqual(twice.content[0], { type: 'text', text: `${long}\n${cut.preview}` });
     // The line of a preview without the start and the end of the text around it is not one.
     const line = cut.preview.slice(
       cut.preview.indexOf('\n\n['),

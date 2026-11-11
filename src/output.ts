@@ -18,6 +18,8 @@ export interface CappedOutput {
   block: number;
   /** Length of the preview when it was made; another extension can cut it further. */
   preview?: number;
+  /** Length of the start of the text that the preview opens with. */
+  head?: number;
 }
 
 type Block = TextContent | ImageContent;
@@ -29,7 +31,9 @@ export function cappedOutput(details: unknown): CappedOutput | undefined {
     | undefined;
   return typeof capped?.path === 'string' &&
     typeof capped.chars === 'number' &&
-    typeof capped.block === 'number'
+    typeof capped.block === 'number' &&
+    ['undefined', 'number'].includes(typeof capped.preview) &&
+    ['undefined', 'number'].includes(typeof capped.head)
     ? (capped as CappedOutput)
     : undefined;
 }
@@ -60,6 +64,8 @@ interface Cut {
   sha256?: string;
   /** Where the preview was when it was made. */
   block?: number;
+  /** How much of the start of the text the preview opens with, when the record says. */
+  head?: number | undefined;
   /**
    * The line a preview has in place of the middle, with the blank lines around it. It names
    * the file in the cutter's own words, and its first group is how many characters it says
@@ -134,7 +140,13 @@ export async function capOutput(
   const preview = `${start}\n\n[episodes] ${omitted} of ${text.length} characters left out here. ${named(path)} grep it or read a slice, not the whole file. recall searches it once it is folded.\n\n${end}`;
   return {
     content: [...content.slice(0, from), { type: 'text', text: preview }, ...content.slice(to + 1)],
-    capped: { path, chars: text.length, block: from, preview: preview.length }
+    capped: {
+      path,
+      chars: text.length,
+      block: from,
+      preview: preview.length,
+      head: start.length
+    }
   };
 }
 
@@ -147,28 +159,27 @@ function sameCut(shown: string, part: string): boolean {
  * The text of a block with the preview of `full` in it replaced by `full`. A preview is the
  * start and the end of the text around the marker, as many characters as the marker says were
  * not left out. Only that much is replaced: a block can hold more than the preview, once
- * another cut that took in the preview and a block after it has been undone. Undefined when
- * the block holds no such preview, or the text fits in more than one way.
+ * another cut that took in the preview and a block next to it has been undone. The start is
+ * as long as the record says; without that the preview is taken to open the block, or to
+ * close it, which is where a cut that joined it with another block leaves it. When the text
+ * fits in more than one way, its start or its end repeats, and each way keeps every character
+ * of the block and of the text. Undefined when the text fits in none of them.
  */
-function putBack(text: string, marker: RegExp, full: string): string | undefined {
-  const fits: string[] = [];
+function putBack(text: string, marker: RegExp, full: string, head?: number): string | undefined {
   for (const match of text.matchAll(marker)) {
     const before = match.index;
     const after = before + match[0].length;
     const kept = full.length - Number(match[1]);
-    for (let start = Math.min(kept, before); start >= 0; start--) {
+    for (const start of [head, before, kept - (text.length - after)]) {
+      if (start === undefined) continue;
       const end = kept - start;
-      if (end > text.length - after) break;
-      // The first and the last character of a preview are those of the text: most places
-      // are ruled out by them.
-      if (start > 0 && text[before - start] !== full[0]) continue;
-      if (end > 0 && text[after + end - 1] !== full.at(-1)) continue;
+      if (start < 0 || start > before || end < 0 || end > text.length - after) continue;
       if (!sameCut(text.slice(before - start, before), full.slice(0, start))) continue;
       if (!sameCut(text.slice(after, after + end), full.slice(full.length - end))) continue;
-      fits.push(text.slice(0, before - start) + full + text.slice(after + end));
+      return text.slice(0, before - start) + full + text.slice(after + end);
     }
   }
-  return fits.length === 1 ? fits[0] : undefined;
+  return undefined;
 }
 
 async function cutText(cut: Cut): Promise<string | undefined> {
@@ -197,7 +208,7 @@ async function restored(content: readonly Block[], cut: Cut): Promise<Block[] | 
   const full = await cutText(cut);
   if (full === undefined) return undefined;
   const fits = marked.flatMap(({ index, text }) => {
-    const whole = putBack(text, cut.marker, full);
+    const whole = putBack(text, cut.marker, full, cut.head);
     return whole === undefined ? [] : [{ index, text: whole }];
   });
   const fit =
@@ -226,6 +237,7 @@ export async function withFullOutput(message: AgentMessage): Promise<AgentMessag
           {
             path: capped.path,
             block: capped.block,
+            head: capped.head,
             marker: new RegExp(
               `\\n\\n\\[episodes\\] (\\d+) of \\d+ characters left out here\\. ${literal(named(capped.path))}[^\\n]*\\n\\n`,
               'g'
