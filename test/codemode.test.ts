@@ -1419,14 +1419,14 @@ test('a fold that only merges notes does not bring the nudge for left-behind wor
       stopReason: 'toolUse'
     });
   const asked = /tokens of work that later folds did not cover/;
-  const merged = `Said xx. ${'detail '.repeat(170)}`;
+  const merged = `Said xx. ${'detail '.repeat(290)}`;
   const quiet = (context: TranscriptContext) =>
     assert.equal(conversation(context).at(-1)!.role, 'toolResult');
   // 2200 tokens of work stay behind a note, over the threshold of 2000: left there by a fold
   // from a later stamp and asked about at once, or kept with until and not asked about in
   // the run. Either way the agent then folds twice from the stamp of the newest note, which
-  // covers that note and nothing else. Its call and its note, of 300 tokens each, are over a
-  // quarter of the threshold together, and are not work.
+  // covers that note and nothing else. Its call and its note, of 500 tokens each, are each a
+  // quarter of the threshold, and are not work.
   for (const until of [false, true]) {
     const harness = await createSession(
       'off',
