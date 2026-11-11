@@ -1311,6 +1311,104 @@ test('the nudge for work left behind a note counts what a fold from its stamp re
   }
 });
 
+test('a fold that answers a nudge and leaves its work behind is followed by a nudge for that work', async () => {
+  const harness = await createSession(
+    'off',
+    [
+      // 2200 tokens with its output, over the threshold of 2000.
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(4400)}` }), {
+          stopReason: 'toolUse'
+        }),
+      () => fauxAssistantMessage('one'),
+      // Asked to fold from t1, the agent runs one more command and folds only that.
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /tokens of work built up/);
+        return fauxAssistantMessage(fauxToolCall('bash', { command: 'echo hi' }), {
+          stopReason: 'toolUse'
+        });
+      },
+      () =>
+        fauxAssistantMessage(fauxToolCall('fold', { since: 't4', note: 'Said hi.' }), {
+          stopReason: 'toolUse'
+        }),
+      // Nothing was added since that nudge, but the fold left the work it asked about.
+      (context) => {
+        const last = text(conversation(context).at(-1)!);
+        assert.match(last, /About 2k tokens of work that later folds did not cover .* from t2 on/);
+        return fauxAssistantMessage('two');
+      },
+      // Declined, it does not come back without more work.
+      (context) => {
+        assert.equal(conversation(context).at(-1)!.role, 'user');
+        return fauxAssistantMessage('three');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 2000 }
+  );
+  try {
+    await harness.run('first', 'second', 'third');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(episodeStats(branch, harness.dir).nudges, 2);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('turns a fold kept with until are asked about at the next prompt, or once the run has grown', async () => {
+  const bash = (chars: number) => () =>
+    fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(chars)}` }), {
+      stopReason: 'toolUse'
+    });
+  const asked = /About 2k tokens of work that later folds did not cover .* from t3 on/;
+  // The agent folds its first command and keeps the second, of 2200 tokens with its output,
+  // for its next step: over the threshold of 2000. That step adds nothing, or 600 tokens,
+  // which is over a quarter of the threshold.
+  for (const more of [false, true]) {
+    const harness = await createSession(
+      'off',
+      [
+        bash(2),
+        bash(4400),
+        () =>
+          fauxAssistantMessage(
+            fauxToolCall('fold', { since: 't2', until: 't2', note: 'Said xx.' }),
+            { stopReason: 'toolUse' }
+          ),
+        // Right after the fold the agent is not asked to fold what it just chose to keep.
+        (context) => {
+          assert.equal(conversation(context).at(-1)!.role, 'toolResult');
+          return more ? bash(1200)() : fauxAssistantMessage('one');
+        },
+        ...(more
+          ? [
+              (context: TranscriptContext) => {
+                assert.match(text(conversation(context).at(-1)!), asked);
+                return fauxAssistantMessage('one');
+              }
+            ]
+          : []),
+        (context) => {
+          const last = text(conversation(context).at(-1)!);
+          if (more) assert.doesNotMatch(last, /tokens of work/);
+          else assert.match(last, asked);
+          return fauxAssistantMessage('two');
+        }
+      ],
+      [],
+      { foldNudgeTokens: 2000 }
+    );
+    try {
+      await harness.run('first', 'second');
+      const branch = harness.session.sessionManager.getBranch();
+      assert.equal(episodeStats(branch, harness.dir).nudges, 1, String(more));
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
 test('a long run is nudged at a turn boundary once it grew twice the threshold', async () => {
   const big = 'x'.repeat(800);
   const harness = await createSession(

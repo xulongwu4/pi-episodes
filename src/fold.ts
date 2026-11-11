@@ -216,11 +216,12 @@ function* stampedStarts(
  * put in, such as a reminder, goes with the work it stands in and starts none: a fold from
  * the stamp before it would cover notes for the sake of a few lines. What stands between a
  * note and the next stamp, such as the reply that followed a fold, is left out: only a fold
- * that covers that note reaches it.
+ * that covers that note reaches it. `kept` says that the latest note's fold stopped at `until`,
+ * so the agent chose to keep the turns before the note.
  */
 export function unfoldedBehindNote(
   entries: readonly ProjectedSessionEntry[]
-): { stamp: number; index: number; work: ProjectedSessionEntry[] } | undefined {
+): { stamp: number; index: number; work: ProjectedSessionEntry[]; kept: boolean } | undefined {
   const applied = appliedFolds(entries.map((entry) => entry.sourceEntry));
   const floor = foldBoundary(entries, false);
   const boundary = foldBoundary(entries);
@@ -263,7 +264,9 @@ export function unfoldedBehindNote(
     }
     work.push(entry);
   }
-  return start && { ...start, work };
+  if (!start) return undefined;
+  const kept = foldNoteDetails(entryMessage(entries[boundary]!))?.keptFrom !== undefined;
+  return { ...start, work, kept };
 }
 
 /**
