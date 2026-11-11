@@ -1753,6 +1753,98 @@ test('what the agent wrote after its folds is asked about with the notes it foll
   }
 });
 
+test('a fold of replies written since a nudge for left-behind work brings that nudge back', async () => {
+  const bash = (output: string) => () =>
+    fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${output}` }), {
+      stopReason: 'toolUse'
+    });
+  const fold = (since: string) => () =>
+    fauxAssistantMessage(fauxToolCall('fold', { since, note: 'Saved it.' }), {
+      stopReason: 'toolUse'
+    });
+  const asked = (context: Parameters<typeof conversation>[0]) => {
+    assert.match(text(conversation(context).at(-1)!), /work that later folds did not cover/);
+    return fauxAssistantMessage('done');
+  };
+  const harness = await createSession(
+    'off',
+    [
+      // The first command stays behind the note of a fold that took only the second.
+      bash('x'.repeat(4800)),
+      bash('tiny'),
+      fold('t3'),
+      asked,
+      // No tool ran since: the work is a reply, and the fold of it leaves the command again.
+      () => fauxAssistantMessage('r'.repeat(500)),
+      fold('t5'),
+      asked
+    ],
+    [],
+    { foldNudgeTokens: 2000 }
+  );
+  try {
+    await harness.run('old task', 'explain', 'save that explanation');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(episodeStats(branch, harness.dir).nudges, 2);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a reply merged away with its note brings the nudge for left-behind work back once', async () => {
+  const asks = /work that later folds did not cover/;
+  const bash = (output: string) => () =>
+    fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${output}` }), {
+      stopReason: 'toolUse'
+    });
+  // A fold from the stamp of the latest note: it merges that note and what follows it.
+  const merge = (asked: boolean) => (context: Parameters<typeof conversation>[0]) => {
+    const messages = conversation(context);
+    assert.equal(asks.test(text(messages.at(-1)!)), asked);
+    const note = messages.findLast(
+      (message) => message.role === 'toolResult' && text(message).includes('[fold ep-')
+    );
+    const since = `t${/\[t(\d+)\]$/.exec(text(note!))![1]}`;
+    return fauxAssistantMessage(fauxToolCall('fold', { since, note: 'Saved it.' }), {
+      stopReason: 'toolUse'
+    });
+  };
+  const done = (asked: boolean) => (context: Parameters<typeof conversation>[0]) => {
+    assert.equal(asks.test(text(conversation(context).at(-1)!)), asked);
+    return fauxAssistantMessage('done');
+  };
+  const harness = await createSession(
+    'off',
+    [
+      // The first command stays behind the note of a fold that took only the second.
+      bash('x'.repeat(4800)),
+      bash('tiny'),
+      () =>
+        fauxAssistantMessage(fauxToolCall('fold', { since: 't3', note: 'Saved it.' }), {
+          stopReason: 'toolUse'
+        }),
+      done(true),
+      // The merge removes the reply written since the nudge: asked once more. The merges
+      // that answer remove notes only, and are not.
+      merge(false),
+      merge(true),
+      merge(false),
+      done(false),
+      done(false)
+    ],
+    [],
+    { foldNudgeTokens: 2000 }
+  );
+  try {
+    await harness.run('old task', 'merge', 'nothing');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(episodeStats(branch, harness.dir).nudges, 2);
+    assert.equal(threadRecords(branch).length, 4);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test('what a script printed next to its fold counts as room its note takes, and leaves with a merge', async () => {
   const bash = (size: number) => () =>
     script(`text(await tools.bash({ command: "echo ${'y'.repeat(size)}" }));`);

@@ -306,10 +306,10 @@ export function unfoldedBehindNote(
  * What became of the work done after the entry at `after`: whether a fold removed some of it,
  * and what of it is still in context. Work is told from folding itself: a note and the
  * response that called its fold are neither, so a fold that only merges notes removes no work
- * and adds none, however long its note. A tool result counts as folded only when an applied
- * fold recorded its removal in the plan it writes before its edits: another extension can
- * remove one too, also inside the span of a fold. A session from before folds wrote that
- * plan shows none.
+ * and adds none, however long its note. A tool result or a response counts as folded only
+ * when an applied fold recorded its removal in the plan it writes before its edits: another
+ * extension can remove one too, also inside the span of a fold. A session from before folds
+ * wrote that plan shows none.
  */
 export function workSince(
   entries: readonly ProjectedSessionEntry[],
@@ -343,7 +343,9 @@ export function workSince(
       continue;
     }
     if (entry.messages.length > 0) left.push(entry);
-    else if (message?.role === 'toolResult') folded ||= removed.has(entry.sourceEntry.id);
+    else if (message?.role === 'toolResult' || message?.role === 'assistant') {
+      folded ||= removed.has(entry.sourceEntry.id);
+    }
   }
   return { folded, left };
 }
