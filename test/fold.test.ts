@@ -573,8 +573,9 @@ test('work behind a note starts at the stamp a fold of it needs, whatever stands
 
   // The reminder behind the second note is no work: a fold from t4 would cover that note.
   assert.deepEqual(left('third', command, 9), { stamp: 8, work: ['message', 'message'] });
-  // One that stands in the work goes with it.
-  assert.deepEqual(left('third', [...command, { customType: 'x' } as never], 9), {
+  // One that stands in the work goes with it; one before the work is not reached by its fold.
+  const reminder = { customType: 'x' } as never;
+  assert.deepEqual(left('third', [reminder, ...command, reminder], 9), {
     stamp: 8,
     work: ['message', 'message', 'custom_message']
   });
