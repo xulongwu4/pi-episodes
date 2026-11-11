@@ -1154,13 +1154,14 @@ test('a nudge on the next prompt leads to a fold from the earliest stamp', async
   }
 });
 
-test('close to compaction, once notes take up room, the nudge names a stamp before them to merge them', async () => {
+test('once notes take up room, the nudge names the earliest of them to merge them, close to compaction or not', async () => {
   const long = `Printed a long line. ${'detail '.repeat(400)}`;
-  // Far from compaction a run is nudged at twice the threshold, and never to merge.
+  // Far from compaction a run is nudged at twice the threshold. The note is at t3.
   for (const [note, since, merges, reserveTokens, size] of [
     ['Printed a long line.', 't4', false, 127_000, 4000],
-    [long, 't1', true, 127_000, 4000],
-    [long, 't4', false, 16_384, 17_000]
+    [long, 't3', true, 127_000, 4000],
+    ['Printed a long line.', 't4', false, 16_384, 17_000],
+    [long, 't3', true, 16_384, 17_000]
   ] as const) {
     const bash = () =>
       fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(size)}` }), {
@@ -1187,6 +1188,11 @@ test('close to compaction, once notes take up room, the nudge names a stamp befo
           const last = nudge(context);
           assert.equal(/since "(t\d+)"/.exec(last)![1], since, note);
           assert.equal(/which it merges/.test(last), merges, note);
+          assert.equal(/early enough to take in all your notes/.test(last), merges, note);
+          // Why it pays: Pi would compact, or the notes are sent with every request.
+          const pressed = reserveTokens > 100_000;
+          assert.equal(/pi would compact soon otherwise/.test(last), merges && pressed, note);
+          assert.equal(/are sent again with every request/.test(last), merges && !pressed, note);
           return fauxAssistantMessage(fauxToolCall('fold', { since, note: 'Both lines.' }), {
             stopReason: 'toolUse'
           });
@@ -1194,7 +1200,8 @@ test('close to compaction, once notes take up room, the nudge names a stamp befo
         () => fauxAssistantMessage('done')
       ],
       [],
-      // Under pressure a quarter of the threshold, 500 tokens, is enough to nudge and to merge.
+      // A quarter of the threshold, 500 tokens, of notes and their calls is enough to merge;
+      // under pressure it is enough to nudge as well.
       { foldNudgeTokens: 2000 },
       { reserveTokens }
     );

@@ -17,6 +17,7 @@ import {
   cutShortFold,
   foldableTurns,
   headline,
+  mergeStart,
   openItems,
   planFold,
   renderNote,
@@ -530,6 +531,51 @@ test('work behind the latest note that no fold removed is found, with the stamp 
   } as Message);
   manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: merged.handle });
   assert.equal(unfoldedBehindNote(entries()), undefined);
+});
+test('a fold that merges the notes starts at the earliest thing a fold removes behind them', () => {
+  const fold = (manager: SessionManager, id: string, since: number, stamp: number) => {
+    manager.appendMessage(assistant(call(id, 'fold')));
+    const plan = planFold(manager.buildSessionProjection().entries, id, since);
+    apply(manager, plan.edits);
+    manager.appendMessage({
+      ...result(id, 'fold', 'note', stamp),
+      details: { kind: 'fold', handle: plan.handle, headline: 'note' }
+    } as Message);
+    manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
+  };
+  const start = (manager: SessionManager) =>
+    mergeStart(manager.buildSessionProjection().entries)?.stamp;
+  const command = (id: string, stamp: number) => [
+    assistant(call(id, 'bash')),
+    result(id, 'bash', 'out', stamp)
+  ];
+
+  const { manager } = session([user('first', 1), ...command('a', 2)]);
+  assert.equal(start(manager), undefined, 'no note stands');
+  fold(manager, 'f1', 1, 3);
+  // The user message stays, so a fold from the note's own stamp removes as much as one from t1.
+  assert.equal(start(manager), 3);
+  manager.appendMessage(assistant('done'));
+  manager.appendMessage(user('second', 4));
+  for (const message of command('b', 5)) manager.appendMessage(message);
+  fold(manager, 'f2', 4, 6);
+  assert.equal(start(manager), 3, 'the earliest note, not the latest');
+
+  // A command left before the earliest note is where it starts.
+  const { manager: left } = session([user('first', 1), ...command('a', 2), ...command('b', 3)]);
+  fold(left, 'f1', 3, 4);
+  assert.equal(start(left), 2);
+
+  // And so is a user message that a fold would cut and none did.
+  const { manager: long } = session([user('x'.repeat(5000), 1), ...command('a', 2)]);
+  fold(long, 'f1', 2, 3);
+  assert.equal(start(long), 1);
+
+  // What stands before the first stamp, as after a compaction that kept the end of a turn,
+  // is out of reach of any fold and does not hide the notes after it.
+  const { manager: tail } = session([assistant('kept'), user('first', 1), ...command('a', 2)]);
+  fold(tail, 'f1', 1, 3);
+  assert.equal(start(tail), 3);
 });
 test('work behind a note starts at the stamp a fold of it needs, whatever stands around it', () => {
   // A fold from `since`, applied, with its note at `stamp`.

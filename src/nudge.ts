@@ -9,6 +9,7 @@ import {
   foldBoundary,
   foldInstruction,
   foldStart,
+  mergeStart,
   renderFoldAsk,
   USER_TEXT_CAP,
   unfoldedBehindNote,
@@ -43,13 +44,13 @@ export function nudgeGrowth(entries: readonly ProjectedSessionEntry[], notes = t
 }
 
 /**
- * Tokens a fold from `start`, by default the earliest stamp after the latest compaction, could
- * remove that sit up to the latest note: earlier notes, and work a fold that started later
- * left behind them.
+ * Tokens a fold from `start`, by default where a fold that merges the notes starts, could
+ * remove that sit up to the latest note: the notes with the calls that wrote them, and work a
+ * fold that started later left behind them.
  */
 export function tokensBehindNote(
   entries: readonly ProjectedSessionEntry[],
-  start = foldStart(entries, false)
+  start = mergeStart(entries)
 ): number {
   const boundary = foldBoundary(entries);
   return start && start.index <= boundary
@@ -131,10 +132,12 @@ function continues(message: AssistantMessage): boolean {
  * A model that folds only its last request would otherwise not be asked about the work
  * before it until pi compacts; and asked then to fold from the first stamp of a long session,
  * one model did not, where it did fold from the stamp its unfolded work started at. Notes
- * alone are merged only close to compaction, which loses the cache too: once a quarter of
- * the threshold sits up to the latest note and no such work does, the nudge names the
- * earliest stamp after the compaction. It is appended, never edited in, so the cached prefix
- * is untouched.
+ * take up room as well: each stays with the call that wrote it, and a session that folds on
+ * every nudge can stay far from compaction, where alone they were merged at first. In one
+ * of 302 turns, 32 notes and their calls were 49k of the 124k tokens in context at the end.
+ * So once a quarter of the threshold sits up to the latest note, the nudge for new work
+ * names `mergeStart`, the earliest note as a rule, and asks for one note in place of all.
+ * It is appended, never edited in, so the cached prefix is untouched.
  */
 export function registerNudge(pi: ExtensionAPI): void {
   const nudge = (
@@ -156,7 +159,7 @@ export function registerNudge(pi: ExtensionAPI): void {
     const left = unfoldedBehindNote(entries);
     const leftTokens = left ? foldableTokens(left.work) : 0;
     const stranded = leftTokens >= (pressed ? threshold / 4 : threshold) ? left : undefined;
-    const behind = pressed || stranded ? tokensBehindNote(entries, stranded) : 0;
+    const behind = tokensBehindNote(entries, stranded);
     const merge = stranded !== undefined || behind >= threshold / 4;
     const growth = nudgeGrowth(entries, !merge);
     const due = stranded
@@ -164,7 +167,7 @@ export function registerNudge(pi: ExtensionAPI): void {
       : growth >= (pressed ? threshold / 4 : (inRun ? 2 : 1) * threshold);
     if (!due) return undefined;
     const when = inRun ? 'the task' : 'this request';
-    const earliest = stranded ?? foldStart(entries, !merge);
+    const earliest = stranded ?? (merge ? mergeStart(entries) : foldStart(entries));
     if (!earliest) return undefined;
     const since = stampLabel(earliest.stamp);
     const k = (tokens: number) => Math.round(tokens / 1000);
@@ -173,9 +176,11 @@ export function registerNudge(pi: ExtensionAPI): void {
       : `About ${k(growth)}k tokens of work built up since the last fold, compaction or message like this one. `;
     const start = stranded
       ? `with since "${since}"`
-      : `with since "${since}", the earliest stamp you can fold from,`;
+      : merge
+        ? `with since "${since}", early enough to take in all your notes,`
+        : `with since "${since}", the earliest stamp you can fold from,`;
     const covering = merge
-      ? `a note covering everything from there, including the notes of ${stranded ? 'the folds made since' : 'earlier folds there'} (about ${k(behind)}k tokens with what they left behind), which it merges into one${pressed ? '; pi would compact soon otherwise' : ''}`
+      ? `a note covering everything from there, including the notes of ${stranded ? 'the folds made since' : 'earlier folds there'} (about ${k(behind)}k tokens with what they left behind), which it merges into one${pressed ? '; pi would compact soon otherwise' : stranded ? '' : ': the notes and the calls that wrote them are sent again with every request'}`
       : 'a note covering everything from there';
     return (
       lead +

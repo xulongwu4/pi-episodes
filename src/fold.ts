@@ -128,7 +128,7 @@ const PREVIEW_WIDTH = 72;
 
 /**
  * Index of the latest compaction, or with `notes` of the latest applied fold note too. No fold
- * reaches back past a compaction; one that reaches back past a note merges it, which the nudge
+ * reaches back past a compaction; one that reaches back to a note merges it, which the nudge
  * asks for only when notes take up room.
  */
 export function foldBoundary(entries: readonly ProjectedSessionEntry[], notes = true): number {
@@ -204,6 +204,35 @@ function* stampedStarts(
       const start = spanStart(entries, index, message);
       if (start > boundary) yield { stamp, index: start };
     }
+  }
+  return undefined;
+}
+
+/**
+ * Where a fold that merges the notes in context starts: at the earliest thing behind the
+ * latest note that a fold removes or cuts, which is the earliest note unless work was left
+ * before it. A fold from an earlier stamp removes no more, since user messages stay; and one
+ * model, asked to fold from the first stamp of a long session, would not, where it did fold
+ * from a stamp further on. Undefined when no note stands after the latest compaction.
+ */
+export function mergeStart(
+  entries: readonly ProjectedSessionEntry[]
+): { stamp: number; index: number } | undefined {
+  const floor = foldBoundary(entries, false);
+  const boundary = foldBoundary(entries);
+  const starts = [...stampedStarts(entries, floor)];
+  for (let index = floor + 1; index <= boundary; index++) {
+    const shown = entries[index]!.messages[0];
+    const folds =
+      shown?.role === 'assistant' ||
+      shown?.role === 'toolResult' ||
+      (shown?.role === 'user' && capUserContent(shown.content, '') !== undefined);
+    if (!folds) continue;
+    // The latest span start that holds this entry; of the results of one response, the first.
+    // No start holds what stands before the first stamp, such as the end of a turn that a
+    // compaction kept without its beginning.
+    const at = starts.findLast((candidate) => candidate.index <= index)?.index;
+    if (at !== undefined) return starts.find((candidate) => candidate.index === at);
   }
   return undefined;
 }

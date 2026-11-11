@@ -1,6 +1,6 @@
 # Measurements
 
-What to measure before believing that folding beats compaction, and how. Only sections 12 and 13 have a result so far.
+What to measure before believing that folding beats compaction, and how. Only sections 12, 13 and 14 have a result so far.
 
 The order follows the post: try the note before asking the model to notice anything. `/fold` separates the two questions, so note quality comes before boundary detection. Cheap scripted checks come first, so a broken mechanism is not mistaken for a bad model.
 
@@ -282,6 +282,24 @@ The rule for when this nudge fires was corrected in review (6bb4293), and the re
 The original run also called fold 104 times with the stamp of the message it was answering, a span with nothing in it, and never tried again. The refusal now names the stamp the unfolded work starts at. Three of the replays got that refusal: the model folded from the named stamp in one and went on without folding in two.
 
 One full run of the 302-turn task with the rule (c0279d4, output cap off, 2026-11-11) did not put this nudge to work. The model answered each of the 29 nudges for new work with a fold from the stamp named, or from the one after it; the work behind the latest note stayed under the threshold, at about 23k tokens by the end, 22k of them tool results; and the nudge for it was never sent. So the rule is tested by the replays only. The run called fold on a span with nothing in it twice, against 104 times in the run above and 2, 4 and 70 times in the three other complete runs of the task under codemode, so the count shows nothing by itself; both calls got the refusal that names a stamp, and neither was followed by a fold from that stamp in the same request. Pi did not compact, the quiz scored 12 of 12, and the cost of $1.115, estimated from list prices, is inside the range of those four runs, $0.882 to $1.407.
+
+<br />
+
+## 14. Room the notes take
+
+**Question.** How much of the context do the notes hold in a long session, and does the model merge them when asked far from compaction?
+
+**Why.** A note stays until a later fold covers it, and so does the response that called its fold, whose argument is the note again. Notes were merged only close to compaction, and a session that folds at every nudge can stay far from it: the one below did for all its 302 turns.
+
+**Method.** For the share: at the end of a session, add up the text still in context by kind (script `/tmp/ctx-composition.py` for the run below). For the merge: the replay of section 13, cut before a turn at which the nudge for new work is due and the notes weigh over a quarter of the threshold.
+
+**Report.** Tokens in context by kind at the end. Per replay: the stamp named, the fold made, the notes covered, the size of the new note, the context before and after.
+
+**Pass.** The model folds from the stamp named in most tries, and one note stands where there were many.
+
+**Result.** 2026-11-11, gpt-6-luna at low thinking, codemode as the only tool, pi 1.4.0, the 302-turn run of section 13 (c0279d4, output cap off), in which the model folded at each of 29 nudges: 39 folds in all, some unasked, of which 32 notes still stood at the end. At the end about 124k tokens of text were in context: tool results 39k, the 302 user messages 31k, 32 notes 29k, the calls of their folds 20k, other responses 2k. Each note was there three times: as the argument of the call, as the script printed it, in JSON, and as the extension added it again because it looked for the plain text (fixed in e4bca6a). The first request after a fold held 6k tokens at turn 12, 36k at turn 100, 76k at turn 205, 110k at turn 256 and 135k at turn 299.
+
+Replayed at turn 143 with the rule of this section (13 notes in context, 24k tokens with their calls, context at 111k of 272k): the nudge named `t19`, the stamp of the earliest note, in 3 of 3 tries, and the model folded from it each time: 75k tokens removed, 13 notes covered, a new note of 463, 505 and 1,014 tokens, and 17k to 19k of context at the next request, where the first request after the fold of the original run at that turn held 57k. The first request after such a fold sent 15.5k tokens uncached in the try that sent it first; the two others found the kept user messages in the cache that one had written, and sent 2k and 4k. The result of the merging fold carries about 700 tokens that the model did not write: the stamps of the 136 user messages kept and the handles of the 13 notes covered. Not measured: a full run with the rule, and what the answers lose when notes are merged every ten folds or so.
 
 <br />
 
