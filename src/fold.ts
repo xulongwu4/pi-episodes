@@ -375,6 +375,16 @@ function entryEdit(
   return undefined;
 }
 
+/**
+ * Whether a script's output holds the note: as text, or inside JSON, which is how a script
+ * prints a value it does not print as it is. Adding the note next to that copy would put it
+ * in context twice, for as long as the note stands.
+ */
+function holdsNote(content: readonly (TextContent | ImageContent)[], note: string): boolean {
+  const text = textOf(content);
+  return text.includes(note) || text.includes(JSON.stringify(note).slice(1, -1));
+}
+
 type PendingDraft = { type: string; targetId?: string; replacement?: unknown };
 
 /** Whether the latest edit of an entry, on the branch or among queued drafts, removes it. */
@@ -1052,7 +1062,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         ? event.details
         : {};
     const details = { ...own, [FOLD_DETAILS_KEY]: script.details };
-    if (textOf(event.content).includes(script.note)) return { details };
+    if (holdsNote(event.content, script.note)) return { details };
     const content = [...event.content, { type: 'text' as const, text: script.note }];
     return event.structuredContent === undefined
       ? { content, details }
@@ -1072,7 +1082,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         // span would leave with nothing in its place.
         const stands = pending?.script
           ? foldNoteDetails(result)?.handle === pending.handle &&
-            textOf(result.content).includes(pending.script.note)
+            holdsNote(result.content, pending.script.note)
           : result.toolName === FOLD_TOOL;
         if (!pending || !stands) return [];
         state.pendingFolds.delete(result.toolCallId);

@@ -254,6 +254,40 @@ test('a script that does not print the fold result still leaves the note in cont
   }
 });
 
+test('a script that prints the fold result as JSON leaves the note in context once', async () => {
+  const harness = await createSession('only', [
+    () => script('text(await tools.bash({ command: "echo long output" }));'),
+    () =>
+      script(
+        'const r = await tools.fold({ since: "t1", note: "Ran \\"it\\"; nothing to keep." }); text(JSON.stringify({ r }));'
+      ),
+    (context) => {
+      const messages = conversation(context);
+      assert.deepEqual(
+        messages.map((message) => message.role),
+        ['user', 'assistant', 'toolResult']
+      );
+      const note = text(messages[2]!);
+      // As the script printed it: the line breaks and quotes of the note escaped.
+      assert.match(
+        note,
+        /\{"r":"\[fold ep-[0-9a-f]{8}: 2 messages, t1-t2,[^\n]*\\n\\nRan \\"it\\"; nothing to keep\./
+      );
+      assert.equal(note.match(/\[fold ep-/g)?.length, 1);
+      assert.equal(note.match(/nothing to keep/g)?.length, 1);
+      assert.match(note, /\[t3\]$/);
+      return fauxAssistantMessage('ok');
+    }
+  ]);
+  try {
+    await harness.run('go');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(episodeStats(branch, harness.dir).folds.count, 1);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test('a fold from a script that then fails does not take effect', async () => {
   const harness = await createSession('only', [
     () => script('text(await tools.bash({ command: "echo kept" }));'),
