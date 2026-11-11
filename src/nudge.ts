@@ -5,7 +5,14 @@ import {
   estimateTokens as estimateMessageTokens,
   type ProjectedSessionEntry
 } from '@earendil-works/pi-coding-agent';
-import { foldBoundary, foldInstruction, foldStart, renderFoldAsk, USER_TEXT_CAP } from './fold.js';
+import {
+  foldBoundary,
+  foldInstruction,
+  foldStart,
+  renderFoldAsk,
+  USER_TEXT_CAP,
+  unfoldedBehindNote
+} from './fold.js';
 import { estimateTokens } from './messages.js';
 import { episodesSettings } from './settings.js';
 import { stampLabel } from './stamps.js';
@@ -35,11 +42,14 @@ export function nudgeGrowth(entries: readonly ProjectedSessionEntry[], notes = t
 }
 
 /**
- * Tokens a fold from the earliest stamp after the latest compaction could remove that sit up
- * to the latest note: earlier notes, and work a fold that started later left behind them.
+ * Tokens a fold from `start`, by default the earliest stamp after the latest compaction, could
+ * remove that sit up to the latest note: earlier notes, and work a fold that started later
+ * left behind them.
  */
-export function tokensBehindNote(entries: readonly ProjectedSessionEntry[]): number {
-  const start = foldStart(entries, false);
+export function tokensBehindNote(
+  entries: readonly ProjectedSessionEntry[],
+  start = foldStart(entries, false)
+): number {
   const boundary = foldBoundary(entries);
   return start && start.index <= boundary
     ? foldableTokens(entries.slice(start.index, boundary + 1))
@@ -86,11 +96,18 @@ function continues(message: AssistantMessage): boolean {
  * twice as much on its own. Once less than `foldNudgeTokens` of room is left before pi compacts,
  * a quarter of it is enough. It names the earliest stamp after the latest note: a fold from a
  * later stamp leaves the work before it in context. A fold that reaches back past notes merges
- * them, and what a later fold left behind them, but rewrites the cache from its start. That
- * pays only where pi would compact, which loses the cache too, so only close to compaction,
- * and once a quarter of the threshold sits up to the latest note, does the nudge name the
- * earliest stamp after the compaction and count that work as well. It is appended, never
- * edited in, so the cached prefix is untouched.
+ * them, and what a later fold left behind them, but rewrites the cache from its start. Two
+ * things make that pay. Work that sits behind the latest note unfolded, left there by folds
+ * from later stamps or kept by `until`, is sent again with every request: once it reaches
+ * `foldNudgeTokens`, or a quarter of that close to compaction, the nudge names the stamp it
+ * starts at, and comes again after each further quarter of the threshold until it is folded.
+ * A model that folds only its last request would otherwise not be asked about the work
+ * before it until pi compacts; and asked then to fold from the first stamp of a long session,
+ * one model did not, where it did fold from the stamp its unfolded work started at. Notes
+ * alone are merged only close to compaction, which loses the cache too: once a quarter of
+ * the threshold sits up to the latest note and no such work does, the nudge names the
+ * earliest stamp after the compaction. It is appended, never edited in, so the cached prefix
+ * is untouched.
  */
 export function registerNudge(pi: ExtensionAPI): void {
   const nudge = (
@@ -109,19 +126,29 @@ export function registerNudge(pi: ExtensionAPI): void {
     const pressed =
       usage?.tokens != null &&
       usage.tokens + incoming + threshold >= usage.contextWindow - reserveTokens(pi, ctx.model);
-    const behind = pressed ? tokensBehindNote(entries) : 0;
-    const merge = behind >= threshold / 4;
+    const left = unfoldedBehindNote(entries);
+    const leftTokens = left ? foldableTokens(left.work) : 0;
+    const stranded = leftTokens >= (pressed ? threshold / 4 : threshold) ? left : undefined;
+    const behind = pressed || stranded ? tokensBehindNote(entries, stranded) : 0;
+    const merge = stranded !== undefined || behind >= threshold / 4;
     const growth = nudgeGrowth(entries, !merge);
-    if (growth < (pressed ? threshold / 4 : factor * threshold)) return undefined;
-    const earliest = foldStart(entries, !merge);
+    if (growth < (pressed || stranded ? threshold / 4 : factor * threshold)) return undefined;
+    const earliest = stranded ?? foldStart(entries, !merge);
     if (!earliest) return undefined;
     const since = stampLabel(earliest.stamp);
+    const k = (tokens: number) => Math.round(tokens / 1000);
+    const lead = stranded
+      ? `About ${k(leftTokens)}k tokens of work that later folds did not cover are still in your context behind their notes, from ${since} on, and are sent again with every request. `
+      : `About ${k(growth)}k tokens of work built up since the last fold, compaction or message like this one. `;
+    const start = stranded
+      ? `with since "${since}"`
+      : `with since "${since}", the earliest stamp you can fold from,`;
     const covering = merge
-      ? `a note covering everything from there, including the notes of earlier folds there (about ${Math.round(behind / 1000)}k tokens with what they left behind), which it merges into one; pi would compact soon otherwise`
+      ? `a note covering everything from there, including the notes of ${stranded ? 'the folds made since' : 'earlier folds there'} (about ${k(behind)}k tokens with what they left behind), which it merges into one${pressed ? '; pi would compact soon otherwise' : ''}`
       : 'a note covering everything from there';
     return (
-      `About ${Math.round(growth / 1000)}k tokens of work built up since the last fold, compaction or message like this one. ` +
-      `If the work since ${since} is finished and ${when} does not need its raw output, fold it first: ${foldInstruction(pi)}, with since "${since}", the earliest stamp you can fold from, and ${covering}; then continue. ` +
+      lead +
+      `If the work since ${since} is finished and ${when} does not need its raw output, fold it first: ${foldInstruction(pi)}, ${start} and ${covering}; then continue. ` +
       'Do not fold from a later stamp instead: the work before it would stay in your context. If that work is still needed, fold once it is done.'
     );
   };

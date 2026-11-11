@@ -209,6 +209,52 @@ function* stampedStarts(
 }
 
 /**
+ * Work that sits behind the latest note and that no fold removed: what a fold from a later
+ * stamp left there, or what a fold with `until` kept. Its entries, without the notes and the
+ * responses that called fold, and the stamp a fold of all of it starts from. User messages
+ * are left out: a fold keeps them. So is what stands between a note and the next stamp, such
+ * as the reply that followed a fold: only a fold that covers that note reaches it.
+ */
+export function unfoldedBehindNote(
+  entries: readonly ProjectedSessionEntry[]
+): { stamp: number; index: number; work: ProjectedSessionEntry[] } | undefined {
+  const applied = appliedFolds(entries.map((entry) => entry.sourceEntry));
+  const floor = foldBoundary(entries, false);
+  const boundary = foldBoundary(entries);
+  const starts = [...stampedStarts(entries, floor)];
+  const calls = new Set<string>();
+  for (const entry of entries.slice(floor + 1, boundary + 1)) {
+    const message = entryMessage(entry);
+    if (message?.role === 'toolResult' && isFoldNote(entry, applied)) calls.add(message.toolCallId);
+  }
+  const work: ProjectedSessionEntry[] = [];
+  let start: { stamp: number; index: number } | undefined;
+  // The first stamp a fold can start from without covering the latest note so far.
+  let next = 0;
+  for (let index = floor + 1; index < boundary; index++) {
+    const entry = entries[index]!;
+    if (isFoldNote(entry, applied)) {
+      while (next < starts.length && starts[next]!.index <= index) next++;
+      continue;
+    }
+    if (entry.messages.length === 0 || next >= starts.length || starts[next]!.index > index) {
+      continue;
+    }
+    const message = entryMessage(entry);
+    const counts =
+      entry.sourceEntry.type === 'custom_message' ||
+      message?.role === 'toolResult' ||
+      (message?.role === 'assistant' &&
+        !message.content.some((block) => block.type === 'toolCall' && calls.has(block.id)));
+    if (!counts) continue;
+    // The latest stamp whose span holds this first entry: an earlier one adds nothing.
+    start ??= starts.findLast((candidate) => candidate.index <= index);
+    work.push(entry);
+  }
+  return start && { ...start, work };
+}
+
+/**
  * Stamped turns a fold can start from, newest first: those after the latest compaction
  * summary, with a one-line preview to recognize them by.
  */

@@ -20,7 +20,8 @@ import {
   openItems,
   planFold,
   renderNote,
-  USER_TEXT_CAP
+  USER_TEXT_CAP,
+  unfoldedBehindNote
 } from '../src/fold.js';
 import { skillPaths, touchedPaths } from '../src/messages.js';
 import { readStamp } from '../src/stamps.js';
@@ -484,6 +485,51 @@ test('a fold from the message being answered names the stamp that folds the work
   );
 });
 
+test('work behind the latest note that no fold removed is found, with the stamp it starts at', () => {
+  const { manager } = session([
+    user('go', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'first', 2),
+    assistant(call('b', 'bash')),
+    result('b', 'bash', 'second', 3),
+    assistant(call('f', 'fold'))
+  ]);
+  const entries = () => manager.buildSessionProjection().entries;
+  assert.equal(unfoldedBehindNote(entries()), undefined);
+
+  // A fold with until keeps the second command; its note lands after it.
+  const plan = planFold(entries(), 'f', 2, { until: 2 });
+  apply(manager, plan.edits);
+  manager.appendMessage({
+    ...result('f', 'fold', 'note', 4),
+    details: { kind: 'fold', handle: plan.handle, headline: 'note' }
+  } as Message);
+  // A note that did not apply is no boundary.
+  assert.equal(unfoldedBehindNote(entries()), undefined);
+  manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
+  const left = unfoldedBehindNote(entries());
+  assert.equal(left?.stamp, 3);
+  // The command and its result, not the response that called fold or the note.
+  assert.deepEqual(
+    left?.work.map((entry) => entry.messages[0]?.role),
+    ['assistant', 'toolResult']
+  );
+
+  // A fold from there covers the note and leaves nothing behind the new one.
+  manager.appendMessage(assistant(call('g', 'fold')));
+  const merged = planFold(entries(), 'g', 3);
+  assert.deepEqual(
+    merged.covers.map((fold) => fold.handle),
+    [plan.handle]
+  );
+  apply(manager, merged.edits);
+  manager.appendMessage({
+    ...result('g', 'fold', 'both', 5),
+    details: { kind: 'fold', handle: merged.handle, headline: 'both' }
+  } as Message);
+  manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: merged.handle });
+  assert.equal(unfoldedBehindNote(entries()), undefined);
+});
 function earlierFold(applied: boolean) {
   const note = {
     ...result('f0', 'fold', 'first note', 3),

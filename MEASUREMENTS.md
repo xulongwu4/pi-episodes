@@ -1,6 +1,6 @@
 # Measurements
 
-What to measure before believing that folding beats compaction, and how. Only section 12 has a result so far.
+What to measure before believing that folding beats compaction, and how. Only sections 12 and 13 have a result so far.
 
 The order follows the post: try the note before asking the model to notice anything. `/fold` separates the two questions, so note quality comes before boundary detection. Cheap scripted checks come first, so a broken mechanism is not mistaken for a bad model.
 
@@ -249,6 +249,35 @@ Runs vary a lot between attempts. Unless a section says otherwise, run each cond
 Under codemode the cap lowered cost by 20% on average ($0.052; the two sets of three do not overlap, the closest pair being $0.011 apart and the farthest $0.084), at the same quiz score and with turn checks no worse. Tool calls, counting each script and the calls inside it, were 526, 524 and 554 with the cap and 736, 407 and 568 without, so the cap did not add calls; the table gives model calls, which is a different count. No call in any capped run named a cut result's file. That does not show the model never went back for cut text another way, by running a command again or reading a source again: calls repeated with the same arguments were 34, 61 and 79 with the cap and 39, 44 and 53 without, which overlap but lean higher with it. What such repeats cost is inside the measured difference. The saving worked out from the cut sizes alone was $0.09 to $0.17 per session, two to three times what was measured: without the cap the fold nudge fires sooner, so a large result does not stay as long as that sum assumes. Peak context is the same either way for the same reason.
 
 With the built-in tools the cap is nearly idle: `read` returned 51 results of 16,000 characters or more in the capped session and is not cut. Those two sessions still differ by 24%, which is the spread between runs and says nothing about the cap. One codemode session without the cap stopped at turn 67 on a provider error (`{"detail":"Bad Request"}`) and was rerun; it is not in the table.
+
+<br />
+
+## 13. Which stamp the nudge names
+
+**Question.** When work sits unfolded behind the latest note, does the model fold it when asked, and does it matter which stamp the request names?
+
+**Why.** A fold from a later stamp leaves the work before it behind its note, where the count for new work never reaches it. Until this was measured the nudge asked about it only close to compaction, and named the earliest stamp of the session, so that one fold would merge every note.
+
+**Method.** Take a session in which this went wrong, cut it before a user turn, and let the model answer that turn again with the nudge under test. Read from the session: the stamp the nudge named, the fold calls that followed and what they removed.
+
+**Report.** Per nudge wording: tries, folds from the stamp named, tokens removed, context before and after.
+
+**Pass.** The model folds from the stamp named in most tries, and the context falls well below the compaction threshold.
+
+**Result.** 2026-11-11, gpt-6-luna at low thinking, codemode as the only tool, pi 1.4.0. The session is a 302-turn benchmark run at commit 5d23dc7 in which the model, from about turn 100, folded only its last request each time. By turn 195 about 64k tokens of unfolded work and 85k with the notes between sat behind the latest note, the context was at 206k of 272k, and in the original run four nudges naming `t1` were not followed: the model folded its last request or a span with nothing in it, wrote that `t1` was "outside the available conversation span", and Pi compacted at turn 208. The final memory quiz of that run scored 5 of 12, against 12 of 12 in the six other complete runs of the task.
+
+| Turn replayed | Stamp named | Tries | Folded from it | Removed | Context after |
+|---|---|---|---|---|---|
+| 195, close to compaction | `t1`, earliest of the session (5d23dc7) | 1 | 0 | nothing | 206k |
+| 195, close to compaction | `t1`, with a sentence saying it is a valid start | 2 | 0 | nothing; 49k in one try, from another stamp | 207k; 141k |
+| 195, close to compaction | `t239`, the note before the unfolded work | 6 | 6 | 134k each | 35k to 39k |
+| 195, close to compaction | `t404`, where the unfolded work starts | 3 | 3 | 123k each | 53k to 58k |
+| 150 and 170, far from compaction | `t239` | 2 | 2 | 80k, 98k | 33k |
+| 170, far from compaction | `t404` | 1 | 1 | 88k | 50k |
+
+The nudge first named the stamp of the note before the unfolded work, which made the fold cover ten more notes than it had to; it now names the first stamp after that note, `t404` here. Three of the six tries with `t239` had the sentence about a valid start and three did not, so that sentence was dropped. Why the model would not fold from `t1` was not found; that message holds values the task says to remember and not to write down, which may be why. The numbers are from one session and one model: they show that the stamp matters there, not how often.
+
+The original run also called fold 104 times with the stamp of the message it was answering, a span with nothing in it, and never tried again. The refusal now names the stamp the unfolded work starts at. Three of the replays got that refusal: the model folded from the named stamp in one and went on without folding in two.
 
 <br />
 

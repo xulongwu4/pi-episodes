@@ -1179,8 +1179,10 @@ test('close to compaction, work a fold left behind its note is nudged to merge w
   const harness = await createSession(
     'off',
     [
+      // 1000 tokens with its output: under the threshold of 2000, over the quarter that is
+      // enough close to compaction.
       () =>
-        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(4000)}` }), {
+        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(2000)}` }), {
           stopReason: 'toolUse'
         }),
       // The nudge asks to fold from t1; the agent runs one more command, then folds only that.
@@ -1194,8 +1196,10 @@ test('close to compaction, work a fold left behind its note is nudged to merge w
           { stopReason: 'toolUse' }
         ),
       (context) => {
+        // It names where that work starts, not the first stamp.
         const last = text(conversation(context).at(-1)!);
-        assert.match(last, /since "t1".*which it merges/);
+        assert.match(last, /About 1k tokens of work that later folds did not cover/);
+        assert.match(last, /since "t2" and .*which it merges into one; pi would compact soon/);
         return fauxAssistantMessage('done');
       }
     ],
@@ -1205,6 +1209,103 @@ test('close to compaction, work a fold left behind its note is nudged to merge w
   );
   try {
     await harness.run('go');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('far from compaction, work a fold left behind its note is nudged from where it starts, until it is folded', async () => {
+  const bash = (chars: number) => () =>
+    fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(chars)}` }), {
+      stopReason: 'toolUse'
+    });
+  // The agent folds only its last command and leaves two behind it, of 1100 or 500 tokens
+  // each with their output; the threshold is 2000 tokens, and a run is nudged at twice that.
+  // Asked right after its fold, it folds from where they start or carries on.
+  for (const [size, folds, nudges] of [
+    [2200, true, 1],
+    [2200, false, 2],
+    [1000, false, 0]
+  ] as const) {
+    const harness = await createSession(
+      'off',
+      [
+        bash(size),
+        bash(size),
+        bash(2),
+        () =>
+          fauxAssistantMessage(fauxToolCall('fold', { since: 't4', note: 'Said xx.' }), {
+            stopReason: 'toolUse'
+          }),
+        (context) => {
+          const last = text(conversation(context).at(-1)!);
+          if (nudges === 0) assert.doesNotMatch(last, /tokens of work/);
+          else {
+            assert.match(last, /About 2k tokens of work that later folds did not cover/);
+            assert.match(last, /with since "t2" and a note .*which it merges into one; then/);
+            assert.doesNotMatch(last, /pi would compact/);
+          }
+          return folds
+            ? fauxAssistantMessage(fauxToolCall('fold', { since: 't2', note: 'All three.' }), {
+                stopReason: 'toolUse'
+              })
+            : fauxAssistantMessage('one');
+        },
+        ...(folds ? [() => fauxAssistantMessage('one')] : []),
+        () => fauxAssistantMessage('two'),
+        // A quarter of the threshold later, the work is still there.
+        bash(2500),
+        () => fauxAssistantMessage('three')
+      ],
+      [],
+      { foldNudgeTokens: 2000 }
+    );
+    try {
+      await harness.run('first', 'second', 'third');
+      const branch = harness.session.sessionManager.getBranch();
+      const label = `${size} ${folds}`;
+      assert.equal(episodeStats(branch, harness.dir).nudges, nudges, label);
+      const records = threadRecords(branch);
+      assert.equal(records.length, folds ? 2 : 1, label);
+      if (folds) assert.equal((records[1] as { covers?: string[] }).covers?.length, 1, label);
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+test('the nudge for work left behind a note counts what a fold from its stamp removes', async () => {
+  const bash = (chars: number) => () =>
+    fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(chars)}` }), {
+      stopReason: 'toolUse'
+    });
+  const fold = (since: string, note: string) => () =>
+    fauxAssistantMessage(fauxToolCall('fold', { since, note }), { stopReason: 'toolUse' });
+  const harness = await createSession(
+    'off',
+    [
+      // A first request, folded whole into a note of 700 tokens.
+      bash(2200),
+      fold('t2', `Printed a long line. ${'detail '.repeat(400)}`),
+      () => fauxAssistantMessage('one'),
+      // A second, of which only the last command is folded.
+      bash(2200),
+      bash(2200),
+      bash(2),
+      fold('t7', 'Said xx.'),
+      (context) => {
+        const last = text(conversation(context).at(-1)!);
+        // The first note and its call, 1400 tokens, lie before t5 and are not counted.
+        assert.match(last, /About 2k tokens of work that later folds did not cover .* from t5 on/);
+        assert.match(last, /since "t5" and .*\(about 2k tokens with what they left behind\)/);
+        return fauxAssistantMessage('two');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 2000 }
+  );
+  try {
+    await harness.run('first', 'second');
   } finally {
     await harness.cleanup();
   }
