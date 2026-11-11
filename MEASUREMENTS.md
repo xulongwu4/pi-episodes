@@ -299,7 +299,17 @@ One full run of the 302-turn task with the rule (c0279d4, output cap off, 2026-1
 
 **Result.** 2026-11-11, gpt-6-luna at low thinking, codemode as the only tool, pi 1.4.0, the 302-turn run of section 13 (c0279d4, output cap off), in which the model folded at each of 29 nudges: 39 folds in all, some unasked, of which 32 notes still stood at the end. At the end about 124k tokens of text were in context: tool results 39k, the 302 user messages 31k, 32 notes 29k, the calls of their folds 20k, other responses 2k. Each note was there three times: as the argument of the call, as the script printed it, in JSON, and as the extension added it again because it looked for the plain text (fixed in e4bca6a). The first request after a fold held 6k tokens at turn 12, 36k at turn 100, 76k at turn 205, 110k at turn 256 and 135k at turn 299.
 
-Replayed at turn 143 with the rule of this section (13 notes in context, 24k tokens with their calls, context at 111k of 272k): the nudge named `t19`, the stamp of the earliest note, in 3 of 3 tries, and the model folded from it each time: 75k tokens removed, 13 notes covered, a new note of 463, 505 and 1,014 tokens, and 17k to 19k of context at the next request, where the first request after the fold of the original run at that turn held 57k. The first request after such a fold sent 15.5k tokens uncached in the try that sent it first; the two others found the kept user messages in the cache that one had written, and sent 2k and 4k. The result of the merging fold carries about 700 tokens that the model did not write: the stamps of the 136 user messages kept and the handles of the 13 notes covered. Not measured: a full run with the rule, and what the answers lose when notes are merged every ten folds or so.
+Replayed with the rule of this section at three turns of that run, the nudge named `t19`, the stamp of the earliest note, every time, and the model folded from it in 9 of 9 tries:
+
+| Turn | Tries | Context before | Notes covered | Removed | New note | Next request | Same point in the run |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 143 | 6 | 111k | 13 | 75k | 463 to 1,014 tokens | 17k to 19k | 57k |
+| 205 | 1 | 135k | 21 | 85k | 548 tokens | 25k | 76k |
+| 256 | 2 | 174k | 26 | 108k | 386 and 524 tokens | 30k | 110k |
+
+"Same point in the run" is the first request after the fold the original run made at that turn. The tries span three versions of the message's wording and of the count that decides when it is sent (the working tree before ac7533f, 61cc80e, f17a2a5); the stamp named and the fold made were the same in all. The first request after such a fold sent 16k tokens uncached at turn 143, 23k at turn 205 and 28k at turn 256, in the tries that no other try had warmed the cache for: the user messages after `t19`, which stay. The result of the merging fold carries text the model did not write, the stamps of the user messages kept and the handles of the notes covered: about 700 tokens at turn 143 (136 messages, 13 notes).
+
+Not measured: a full run with the rule, and what the answers lose when 13 to 26 notes become one of 400 to 1,000 tokens.
 
 <br />
 
