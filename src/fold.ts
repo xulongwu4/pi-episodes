@@ -187,7 +187,14 @@ export function foldStart(
   entries: readonly ProjectedSessionEntry[],
   notes = true
 ): { stamp: number; index: number } | undefined {
-  const boundary = foldBoundary(entries, notes);
+  return stampedStarts(entries, foldBoundary(entries, notes)).next().value;
+}
+
+/** The stamps a fold can start from after the entry at `boundary`, with where each span starts. */
+function* stampedStarts(
+  entries: readonly ProjectedSessionEntry[],
+  boundary: number
+): Generator<{ stamp: number; index: number }, undefined> {
   for (let index = boundary + 1; index < entries.length; index++) {
     for (const message of entries[index]!.messages) {
       const stamp = readStamp(message);
@@ -195,7 +202,7 @@ export function foldStart(
         continue;
       }
       const start = spanStart(entries, index, message);
-      if (start > boundary) return { stamp, index: start };
+      if (start > boundary) yield { stamp, index: start };
     }
   }
   return undefined;
@@ -481,9 +488,22 @@ export function planFold(
   if (
     !span.some((entry) => entry.messages.length > 0 && entryMessage(entry)?.role === 'assistant')
   ) {
+    // The usual slip: since names the message being answered, to fold the request before it.
+    const note = entries.findLastIndex(
+      (entry, index) => index < startIndex && isFoldNote(entry, applied)
+    );
+    const before =
+      options.until === undefined
+        ? stampedStarts(entries, Math.max(boundary, note)).next().value
+        : undefined;
+    const pending =
+      before !== undefined &&
+      entries
+        .slice(before.index, startIndex)
+        .some((entry) => entry.messages.length > 0 && entryMessage(entry)?.role === 'assistant');
     throw new FoldError(
       'nothing-to-fold',
-      `Nothing to fold ${range}: the span holds no responses.`
+      `Nothing to fold ${range}: the span holds no responses.${pending ? ` To fold the work before it, use since "${stampLabel(before.stamp)}": that is where the work not yet folded starts.` : ''}`
     );
   }
 

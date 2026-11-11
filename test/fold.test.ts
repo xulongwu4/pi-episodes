@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
+import type { Message } from '@earendil-works/pi-ai';
 import { convertToLlm, type SessionManager } from '@earendil-works/pi-coding-agent';
 import {
   FOLD_APPLIED_TYPE,
@@ -424,9 +425,65 @@ test('rejects an until that is before since, missing, or holds no responses', ()
   );
   assert.throws(
     () => planFold(entries, 'f1', 4, { until: 4 }),
-    /Nothing to fold from t4 to t4: the span holds no responses/
+    /Nothing to fold from t4 to t4: the span holds no responses\.$/
   );
 });
+
+test('a fold from the message being answered names the stamp that folds the work before it', () => {
+  const entries = (...messages: AgentMessage[]) =>
+    session(messages).manager.buildSessionProjection().entries;
+  const first = [
+    user('first', 1),
+    assistant(call('x', 'bash')),
+    result('x', 'bash', 'out', 2),
+    assistant('done')
+  ];
+  assert.throws(
+    () => planFold(entries(...first, user('second', 3), assistant(call('f1', 'fold'))), 'f1', 3),
+    /Nothing to fold from t3: the span holds no responses\. To fold the work before it, use since "t1"/
+  );
+  // Nothing before it holds a response either.
+  assert.throws(
+    () => planFold(entries(user('first', 1), assistant(call('f1', 'fold'))), 'f1', 1),
+    /Nothing to fold from t1: the span holds no responses\.$/
+  );
+
+  // After a note, the work not yet folded starts behind it; with none, there is no stamp to name.
+  const noted = (...later: AgentMessage[]) => {
+    const { manager } = session([
+      ...first.slice(0, 3),
+      assistant(call('f0', 'fold')),
+      {
+        ...result('f0', 'fold', 'first note', 3),
+        details: { kind: 'fold', handle: 'ep-0', headline: 'first note' }
+      } as AgentMessage
+    ]);
+    manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: 'ep-0' });
+    for (const message of later) manager.appendMessage(message as Message);
+    return manager.buildSessionProjection().entries;
+  };
+  assert.throws(
+    () =>
+      planFold(
+        noted(
+          user('second', 4),
+          assistant(call('y', 'bash')),
+          result('y', 'bash', 'out', 5),
+          assistant('done'),
+          user('third', 6),
+          assistant(call('f1', 'fold'))
+        ),
+        'f1',
+        6
+      ),
+    /the span holds no responses\. To fold the work before it, use since "t4"/
+  );
+  assert.throws(
+    () => planFold(noted(user('second', 4), assistant(call('f1', 'fold'))), 'f1', 4),
+    /Nothing to fold from t4: the span holds no responses\.$/
+  );
+});
+
 function earlierFold(applied: boolean) {
   const note = {
     ...result('f0', 'fold', 'first note', 3),
