@@ -281,6 +281,8 @@ The rule for when this nudge fires was corrected in review (6bb4293), and the re
 
 The original run also called fold 104 times with the stamp of the message it was answering, a span with nothing in it, and never tried again. The refusal now names the stamp the unfolded work starts at. Three of the replays got that refusal: the model folded from the named stamp in one and went on without folding in two.
 
+One full run of the 302-turn task with the rule (c0279d4, output cap off, 2026-11-11) did not put this nudge to work. The model answered each of the 29 nudges for new work with a fold from the stamp named, or from the one after it; the work behind the latest note stayed under the threshold, at about 23k tokens by the end, 22k of them tool results; and the nudge for it was never sent. So the rule is tested by the replays only. The run called fold on a span with nothing in it twice, against 104 times in the run above and 2, 4 and 70 times in the three other complete runs of the task under codemode, so the count shows nothing by itself; both calls got the refusal that names a stamp, and neither was followed by a fold from that stamp in the same request. Pi did not compact, the quiz scored 12 of 12, and the cost of $1.115, estimated from list prices, is inside the range of those four runs, $0.882 to $1.407.
+
 <br />
 
 ## Keeping notes on what was found
