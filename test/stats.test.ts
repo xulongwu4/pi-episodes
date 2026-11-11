@@ -110,6 +110,11 @@ test('rates keep each model apart and leave out requests without a cost', () => 
   const mixed = cacheRates([sent('a', 1e-6, 1000, 1000), sent('b', 1e-4, 1000, 1000, 0.5)]);
   near(mixed.inputPrice!, 50.5e-6);
   near(mixed.cached * mixed.inputPrice!, 25.05e-6);
+  // A model that read nothing from cache does not say what its cached input costs: the
+  // price of a cached token is that of the model that did, not a share of the dearer one's.
+  const partly = cacheRates([sent('a', 1e-6, 1000, 1000), sent('b', 1e-4, 2000, 0)]);
+  near(partly.inputPrice!, 50.5e-6);
+  near(partly.cached * partly.inputPrice!, 0.1e-6);
   // Tokens of a request with no recorded cost are not input that cost nothing.
   const free = {
     ...sent('a', 0, 9000, 0),

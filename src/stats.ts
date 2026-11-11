@@ -117,8 +117,9 @@ function weighted(values: readonly { value: number | undefined; weight: number }
  * cached tokens say nothing next to another's input price, and requests without a recorded
  * cost are left out, since their tokens would count as free. With several models the input
  * price is the mix by the tokens each was sent, and each rate the mix by those tokens at the
- * model's input price, so that rate times input price is the mean price of such a token. A
- * cache read recorded at no cost is a rate of zero, not an unknown one.
+ * model's input price, so that rate times input price is the mean price of such a token over
+ * the models that show one. A cache read recorded at no cost is a rate of zero, not an
+ * unknown one.
  */
 export function cacheRates(usages: readonly PricedUsage[]): CacheRates {
   const models = new Map<string, Record<'input' | 'output' | 'read' | 'write', number[]>>();
@@ -161,9 +162,19 @@ export function cacheRates(usages: readonly PricedUsage[]): CacheRates {
   });
   const inputPrice = weighted(rates.map((model) => ({ value: model.price, weight: model.weight })));
   // A rate is a share of the input price, so a model counts by its tokens at its price: the
-  // mixed rate times the mixed input price is then the mean of what the models charge.
-  const mix = (pick: (model: (typeof rates)[number]) => number | undefined) =>
-    weighted(rates.map((model) => ({ value: pick(model), weight: model.weight * model.price })));
+  // mixed rate times the input price of those models is then the mean of what they charge.
+  // A model that shows no such rate, as one that read nothing from cache, is left out of that
+  // mean and not counted at zero, so the rate is scaled to the input price of all models.
+  const mix = (pick: (model: (typeof rates)[number]) => number | undefined) => {
+    const known = rates.filter((model) => pick(model) !== undefined);
+    const rate = weighted(
+      known.map((model) => ({ value: pick(model), weight: model.weight * model.price }))
+    );
+    const price = weighted(known.map((model) => ({ value: model.price, weight: model.weight })));
+    return rate === undefined || price === undefined || !inputPrice
+      ? rate
+      : rate * (price / inputPrice);
+  };
   const priced = inputPrice === undefined ? {} : { inputPrice };
   const output = mix((model) => model.output) ?? 0;
   const cached = mix((model) => model.cached);
