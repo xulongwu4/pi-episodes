@@ -580,10 +580,13 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
     if (found.role !== 'toolResult') return;
     stats.overhead.cues += tokensOf(textChars(found, (text) => text.startsWith('[episodes] ')));
     const capped = cappedOutput(found.details);
-    const preview = capped && found.content[capped.block];
-    if (capped && preview?.type === 'text') {
+    const block = capped && found.content[capped.block];
+    // The length recorded at the cut: what is there now can be shorter by another cut, or be
+    // another block. Results cut before the length was recorded have only the block.
+    const preview = capped?.preview ?? (block?.type === 'text' ? block.text.length : undefined);
+    if (capped && preview !== undefined) {
       stats.outputs.capped++;
-      stats.outputs.tokens += tokensOf(Math.max(0, capped.chars - preview.text.length));
+      stats.outputs.tokens += tokensOf(Math.max(0, capped.chars - preview));
     }
 
     const details = found.details;

@@ -16,6 +16,8 @@ export interface CappedOutput {
   chars: number;
   /** Index of the content block that holds the preview. */
   block: number;
+  /** Length of the preview when it was made; another extension can cut it further. */
+  preview?: number;
 }
 
 type Block = TextContent | ImageContent;
@@ -123,7 +125,7 @@ export async function capOutput(
   const preview = `${start}\n\n[episodes] ${omitted} of ${text.length} characters left out here. ${named(path)} grep it or read a slice, not the whole file. recall searches it once it is folded.\n\n${end}`;
   return {
     content: [...content.slice(0, from), { type: 'text', text: preview }, ...content.slice(to + 1)],
-    capped: { path, chars: text.length, block: from }
+    capped: { path, chars: text.length, block: from, preview: preview.length }
   };
 }
 

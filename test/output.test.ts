@@ -41,7 +41,12 @@ test('a large result keeps its start and end and names the file with all of it',
     // Only whole lines are shown.
     assert.ok(block.text.split('\n').every((line) => !/^line \d+ of the build$/.test(line)));
     assert.ok(block.text.length < 700);
-    assert.deepEqual(cut.capped, { path: cut.capped.path, chars: long.length, block: 0 });
+    assert.deepEqual(cut.capped, {
+      path: cut.capped.path,
+      chars: long.length,
+      block: 0,
+      preview: block.text.length
+    });
     assert.equal(await readFile(cut.capped.path, 'utf8'), long);
   } finally {
     await rm(dir, { recursive: true, force: true });

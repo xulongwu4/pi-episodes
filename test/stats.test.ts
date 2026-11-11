@@ -225,6 +225,22 @@ test('folds applied together share the request after them, and a compaction ends
   );
 });
 
+test('a capped output counts what the cap left out, whatever the block holds now', () => {
+  const kept = (preview?: number) => {
+    const record = { path: '/s/output-1.txt', chars: 40_000, block: 0 };
+    const cut = {
+      ...result('a', 'bash', 'x'.repeat(6000), 2),
+      details: { episodesOutput: preview === undefined ? record : { ...record, preview } }
+    };
+    const { manager } = session([user('go', 1), assistant(call('a', 'bash')), cut]);
+    return episodeStats(manager.getBranch(), '/repo').outputs;
+  };
+  // Another extension cut the preview of 14,000 characters to 6,000: that is not the cap's.
+  assert.deepEqual(kept(14_000), { capped: 1, tokens: 6500 });
+  // A result cut before the length was recorded has only the block to go by.
+  assert.deepEqual(kept(), { capped: 1, tokens: 8500 });
+});
+
 test('uncached input is split by what explains it', () => {
   const minute = 60_000;
   const split = uncachedSplit([
