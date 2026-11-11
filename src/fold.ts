@@ -216,12 +216,13 @@ function* stampedStarts(
  * put in, such as a reminder, goes with the work it stands in and starts none: a fold from
  * the stamp before it would cover notes for the sake of a few lines. What stands between a
  * note and the next stamp, such as the reply that followed a fold, is left out: only a fold
- * that covers that note reaches it. `kept` says that the latest note's fold stopped at `until`,
- * so the agent chose to keep the turns before the note.
+ * that covers that note reaches it. `keptAt` is the index of the latest note of a fold that
+ * stopped at `until`, where the agent chose to keep turns, or -1: a later fold that covered
+ * that note did not undo the choice.
  */
 export function unfoldedBehindNote(
   entries: readonly ProjectedSessionEntry[]
-): { stamp: number; index: number; work: ProjectedSessionEntry[]; kept: boolean } | undefined {
+): { stamp: number; index: number; work: ProjectedSessionEntry[]; keptAt: number } | undefined {
   const applied = appliedFolds(entries.map((entry) => entry.sourceEntry));
   const floor = foldBoundary(entries, false);
   const boundary = foldBoundary(entries);
@@ -265,8 +266,21 @@ export function unfoldedBehindNote(
     work.push(entry);
   }
   if (!start) return undefined;
-  const kept = foldNoteDetails(entryMessage(entries[boundary]!))?.keptFrom !== undefined;
-  return { ...start, work, kept };
+  const keptAt = entries.findLastIndex((entry, index) => {
+    const details = index > floor ? foldNoteDetails(entryMessage(entry)) : undefined;
+    return details?.keptFrom !== undefined && applied.has(details.handle);
+  });
+  return { ...start, work, keptAt };
+}
+
+/** A tool result that a fold removed and that was work, not the note of a fold it covered. */
+export function isRemovedWork(entry: ProjectedSessionEntry): boolean {
+  const message = entryMessage(entry);
+  return (
+    entry.messages.length === 0 &&
+    message?.role === 'toolResult' &&
+    foldNoteDetails(message) === undefined
+  );
 }
 
 /**

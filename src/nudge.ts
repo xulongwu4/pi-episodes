@@ -9,6 +9,7 @@ import {
   foldBoundary,
   foldInstruction,
   foldStart,
+  isRemovedWork,
   renderFoldAsk,
   USER_TEXT_CAP,
   unfoldedBehindNote
@@ -57,26 +58,28 @@ export function tokensBehindNote(
 }
 
 /**
- * Tokens that count towards the next nudge about work left behind the latest note. A nudge
- * the agent has not answered with a fold is where the count starts again, so one that was
- * declined comes back only after more work. A nudge from before the latest note was about
- * other work, or was answered by a fold that left this work behind: then all of it counts
- * and the nudge is due at once. Inside a run, a fold that stopped at `until` is the agent's own
- * choice to keep those turns for its next steps, and counts like a nudge it declined; the
- * next prompt asks about them.
+ * Whether the nudge about work left behind the latest note is due. The agent last decided
+ * about that work at the latest nudge or, inside a run, at a later fold that stopped at
+ * `until`: its own choice to keep those turns for its next steps, which the next prompt asks
+ * about. With no such point the nudge is due at once. After one, it is due once a fold has
+ * removed work done since and left this work behind again, or once a quarter of the
+ * threshold has built up since. A fold that only merges notes removes no work and does not
+ * bring the nudge back: an agent that answered each nudge that way would be asked without end.
  */
-function growthBehindNote(
+function dueBehindNote(
   entries: readonly ProjectedSessionEntry[],
-  left: { index: number; kept: boolean },
-  inRun: boolean
-): number {
+  left: { keptAt: number },
+  inRun: boolean,
+  quarter: number
+): boolean {
   const nudged = entries.findLastIndex(
     (entry) =>
       entry.sourceEntry.type === 'custom_message' && entry.sourceEntry.customType === NUDGE_TYPE
   );
-  const note = foldBoundary(entries);
-  const answered = nudged > note || (inRun && left.kept);
-  return foldableTokens(entries.slice(answered ? Math.max(nudged, note) + 1 : left.index));
+  const decided = Math.max(nudged, inRun ? left.keptAt : -1);
+  if (decided < 0) return true;
+  const since = entries.slice(decided + 1);
+  return since.some(isRemovedWork) || foldableTokens(since) >= quarter;
 }
 
 function foldableTokens(entries: readonly ProjectedSessionEntry[]): number {
@@ -123,7 +126,7 @@ function continues(message: AssistantMessage): boolean {
  * things make that pay. Work that sits behind the latest note unfolded, left there by folds
  * from later stamps or kept by `until`, is sent again with every request: once it reaches
  * `foldNudgeTokens`, or a quarter of that close to compaction, the nudge names the stamp it
- * starts at; `growthBehindNote` says when it comes again.
+ * starts at; `dueBehindNote` says when it comes again.
  * A model that folds only its last request would otherwise not be asked about the work
  * before it until pi compacts; and asked then to fold from the first stamp of a long session,
  * one model did not, where it did fold from the stamp its unfolded work started at. Notes
@@ -154,12 +157,11 @@ export function registerNudge(pi: ExtensionAPI): void {
     const stranded = leftTokens >= (pressed ? threshold / 4 : threshold) ? left : undefined;
     const behind = pressed || stranded ? tokensBehindNote(entries, stranded) : 0;
     const merge = stranded !== undefined || behind >= threshold / 4;
-    const growth = stranded
-      ? growthBehindNote(entries, stranded, inRun)
-      : nudgeGrowth(entries, !merge);
-    if (growth < (pressed || stranded ? threshold / 4 : (inRun ? 2 : 1) * threshold)) {
-      return undefined;
-    }
+    const growth = nudgeGrowth(entries, !merge);
+    const due = stranded
+      ? dueBehindNote(entries, stranded, inRun, threshold / 4)
+      : growth >= (pressed ? threshold / 4 : (inRun ? 2 : 1) * threshold);
+    if (!due) return undefined;
     const when = inRun ? 'the task' : 'this request';
     const earliest = stranded ?? foldStart(entries, !merge);
     if (!earliest) return undefined;

@@ -1409,6 +1409,63 @@ test('turns a fold kept with until are asked about at the next prompt, or once t
   }
 });
 
+test('a fold that only merges notes does not bring the nudge for left-behind work back', async () => {
+  const bash = (chars: number) => () =>
+    fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(chars)}` }), {
+      stopReason: 'toolUse'
+    });
+  const fold = (args: Record<string, string>) =>
+    fauxAssistantMessage(fauxToolCall('fold', { note: 'Said xx.', ...args }), {
+      stopReason: 'toolUse'
+    });
+  const asked = /tokens of work that later folds did not cover/;
+  const quiet = (context: TranscriptContext) =>
+    assert.equal(conversation(context).at(-1)!.role, 'toolResult');
+  // 2200 tokens of work stay behind a note, over the threshold of 2000: left there by a fold
+  // from a later stamp and asked about at once, or kept with until and not asked about in
+  // the run. Either way the agent then folds twice from the stamp of the newest note, which
+  // covers that note and nothing else.
+  for (const until of [false, true]) {
+    const harness = await createSession(
+      'off',
+      [
+        ...(until ? [bash(2), bash(4400)] : [bash(4400), bash(2)]),
+        () => fold(until ? { since: 't2', until: 't2' } : { since: 't3' }),
+        (context) => {
+          if (until) quiet(context);
+          else assert.match(text(conversation(context).at(-1)!), asked);
+          return fold({ since: 't4' });
+        },
+        (context) => {
+          quiet(context);
+          return fold({ since: 't5' });
+        },
+        (context) => {
+          quiet(context);
+          return fauxAssistantMessage('one');
+        },
+        // The next prompt asks about turns that were kept and never asked about.
+        (context) => {
+          const last = text(conversation(context).at(-1)!);
+          if (until) assert.match(last, asked);
+          else assert.doesNotMatch(last, asked);
+          return fauxAssistantMessage('two');
+        }
+      ],
+      [],
+      { foldNudgeTokens: 2000 }
+    );
+    try {
+      await harness.run('first', 'second');
+      const branch = harness.session.sessionManager.getBranch();
+      assert.equal(episodeStats(branch, harness.dir).nudges, 1, String(until));
+      assert.equal(threadRecords(branch).length, 3, String(until));
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
 test('a long run is nudged at a turn boundary once it grew twice the threshold', async () => {
   const big = 'x'.repeat(800);
   const harness = await createSession(
