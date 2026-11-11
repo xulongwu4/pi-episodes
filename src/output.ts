@@ -20,6 +20,8 @@ export interface CappedOutput {
   preview?: number;
   /** Length of the start of the text that the preview opens with. */
   head?: number;
+  /** Lengths of the text blocks the text was joined from, when there were several. */
+  parts?: number[];
 }
 
 type Block = TextContent | ImageContent;
@@ -33,7 +35,9 @@ export function cappedOutput(details: unknown): CappedOutput | undefined {
     typeof capped.chars === 'number' &&
     typeof capped.block === 'number' &&
     ['undefined', 'number'].includes(typeof capped.preview) &&
-    ['undefined', 'number'].includes(typeof capped.head)
+    ['undefined', 'number'].includes(typeof capped.head) &&
+    (capped.parts === undefined ||
+      (Array.isArray(capped.parts) && capped.parts.every((part) => typeof part === 'number')))
     ? (capped as CappedOutput)
     : undefined;
 }
@@ -66,6 +70,8 @@ interface Cut {
   block?: number;
   /** How much of the start of the text the preview opens with, when the record says. */
   head?: number | undefined;
+  /** The lengths of the blocks the text was joined from, when the record says. */
+  parts?: readonly number[] | undefined;
   /**
    * The line a preview has in place of the middle, with the blank lines around it. It names
    * the file in the cutter's own words, and its first group is how many characters it says
@@ -113,11 +119,10 @@ export async function capOutput(
   const from = texts[0];
   const to = texts.at(-1);
   if (from === undefined || to === undefined || to - from + 1 !== texts.length) return undefined;
-  const text = content
+  const joined = content
     .slice(from, to + 1)
-    .flatMap((block) => (block.type === 'text' ? [block.text] : []))
-    .join('\n')
-    .toWellFormed();
+    .flatMap((block) => (block.type === 'text' ? [block.text] : []));
+  const text = joined.join('\n').toWellFormed();
   // A preview at least half the size of the original would save little and can outgrow it.
   if (text.length < Math.max(limit, 2 * keep)) return undefined;
 
@@ -145,7 +150,8 @@ export async function capOutput(
       chars: text.length,
       block: from,
       preview: preview.length,
-      head: start.length
+      head: start.length,
+      ...(joined.length > 1 ? { parts: joined.map((part) => part.length) } : {})
     }
   };
 }
@@ -158,28 +164,43 @@ function sameCut(shown: string, part: string): boolean {
 /**
  * The text of a block with the preview of `full` in it replaced by `full`. A preview is the
  * start and the end of the text around the marker, as many characters as the marker says were
- * not left out. Only that much is replaced: a block can hold more than the preview, once
- * another cut that took in the preview and a block next to it has been undone. The start is
- * as long as the record says; without that the preview is taken to open the block, or to
- * close it, which is where a cut that joined it with another block leaves it. When the text
- * fits in more than one way, its start or its end repeats, and each way keeps every character
- * of the block and of the text. Undefined when the text fits in none of them.
+ * not left out. With the length of the start on record, only that much is replaced: a block
+ * can hold more than the preview, once another cut that took in the preview and a block next
+ * to it has been undone. Without it the preview has to be all of the block. Where a preview
+ * stands in a longer block is not searched for: text whose start or end repeats fits in more
+ * than one place, and the wrong one would take a handler's line for part of the output.
+ * Undefined when the text does not fit.
  */
 function putBack(text: string, marker: RegExp, full: string, head?: number): string | undefined {
   for (const match of text.matchAll(marker)) {
     const before = match.index;
     const after = before + match[0].length;
-    const kept = full.length - Number(match[1]);
-    for (const start of [head, before, kept - (text.length - after)]) {
-      if (start === undefined) continue;
-      const end = kept - start;
-      if (start < 0 || start > before || end < 0 || end > text.length - after) continue;
-      if (!sameCut(text.slice(before - start, before), full.slice(0, start))) continue;
-      if (!sameCut(text.slice(after, after + end), full.slice(full.length - end))) continue;
-      return text.slice(0, before - start) + full + text.slice(after + end);
-    }
+    const start = head ?? before;
+    const end = full.length - Number(match[1]) - start;
+    if (head === undefined && end !== text.length - after) continue;
+    if (start < 0 || start > before || end < 0 || end > text.length - after) continue;
+    if (!sameCut(text.slice(before - start, before), full.slice(0, start))) continue;
+    if (!sameCut(text.slice(after, after + end), full.slice(full.length - end))) continue;
+    return text.slice(0, before - start) + full + text.slice(after + end);
   }
   return undefined;
+}
+
+/**
+ * The blocks a text was joined from, by their recorded lengths. A preview that another
+ * extension made before the join is then all of its block again, as that extension left it.
+ * The text as one block when the lengths are not those of this text.
+ */
+function unjoined(text: string, parts: readonly number[] | undefined): string[] {
+  if (!parts) return [text];
+  const blocks: string[] = [];
+  let at = 0;
+  for (const length of parts) {
+    if (blocks.length > 0 && text[at++] !== '\n') return [text];
+    blocks.push(text.slice(at, at + length));
+    at += length;
+  }
+  return at === text.length ? blocks : [text];
 }
 
 async function cutText(cut: Cut): Promise<string | undefined> {
@@ -214,8 +235,10 @@ async function restored(content: readonly Block[], cut: Cut): Promise<Block[] | 
   const fit =
     fits.find(({ index }) => index === cut.block) ?? (fits.length === 1 ? fits[0] : undefined);
   if (!fit) return undefined;
-  return content.map((block, index) =>
-    index === fit.index ? { type: 'text', text: fit.text } : block
+  // Only a preview that was all of its block is the text as it was joined.
+  const blocks = fit.text.length === full.length ? unjoined(full, cut.parts) : [fit.text];
+  return content.flatMap((block, index): Block[] =>
+    index === fit.index ? blocks.map((text) => ({ type: 'text', text })) : [block]
   );
 }
 
@@ -224,7 +247,8 @@ async function restored(content: readonly Block[], cut: Cut): Promise<Block[] | 
  * back an archived thread, whether this extension cut it or tool-result-offload did. When
  * both did, one cut the other's preview: the preview in the message is put back first, and
  * the text that brings holds the preview of the other, with whatever a handler added between
- * the two cuts, which stays. Unchanged when it was not cut, its file is gone, or the file is
+ * the two cuts, which stays: in blocks of its own when this extension made the later cut,
+ * and in one block with the output when the other did, which keeps no record of the join. Unchanged when it was not cut, its file is gone, or the file is
  * not the text the other extension recorded.
  */
 export async function withFullOutput(message: AgentMessage): Promise<AgentMessage> {
@@ -238,6 +262,7 @@ export async function withFullOutput(message: AgentMessage): Promise<AgentMessag
             path: capped.path,
             block: capped.block,
             head: capped.head,
+            parts: capped.parts,
             marker: new RegExp(
               `\\n\\n\\[episodes\\] (\\d+) of \\d+ characters left out here\\. ${literal(named(capped.path))}[^\\n]*\\n\\n`,
               'g'
