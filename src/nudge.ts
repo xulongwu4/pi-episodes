@@ -27,11 +27,17 @@ export function nudgeThreshold(tokens: number, contextWindow: number | undefined
 }
 
 /**
- * Tokens a fold from the earliest stamp could remove that built up since the latest nudge,
- * read from the entries rather than kept in memory, so a resumed session or another branch is
- * measured the same way. The system prompt, tool declarations, results a fold cannot reach,
- * such as those of calls made next to a fold call, and what a fold keeps, such as the start of
- * each user message, are not counted.
+ * Tokens of work a fold from the earliest stamp could remove that built up since the latest
+ * nudge, read from the entries rather than kept in memory, so a resumed session or another
+ * branch is measured the same way. With `notes` the earliest stamp after the latest note,
+ * without them the earliest after the compaction, for a fold that merges the notes. The system
+ * prompt, tool declarations, results a fold cannot reach, such as those of calls made next to
+ * a fold call, and what a fold keeps, such as the start of each user message, are not counted.
+ * Nor are notes and the responses that called their folds: a fold adds no work, and counted
+ * in, a long note brought the next nudge by itself, and the fold that answered it another.
+ * That leaves out what a script did next to its fold, whose result is the note: it counts as
+ * room the notes take, in `tokensBehindNote`, and leaves with the next merge. What the agent
+ * wrote after a fold is work, and only a fold that takes in the note before it removes it.
  */
 export function nudgeGrowth(entries: readonly ProjectedSessionEntry[], notes = true): number {
   const start = foldStart(entries, notes);
@@ -40,22 +46,22 @@ export function nudgeGrowth(entries: readonly ProjectedSessionEntry[], notes = t
     (entry) =>
       entry.sourceEntry.type === 'custom_message' && entry.sourceEntry.customType === NUDGE_TYPE
   );
-  return foldableTokens(entries.slice(Math.max(start.index, nudged + 1)));
+  return foldableTokens(workSince(entries, Math.max(start.index, nudged + 1) - 1).left);
 }
 
 /**
- * Tokens a fold from `start`, by default where a fold that merges the notes starts, could
- * remove that sit up to the latest note: the notes with the calls that wrote them, and work a
- * fold that started later left behind them.
+ * Tokens that a fold from `start`, by default where a fold that merges the notes starts, could
+ * remove and a fold from the earliest stamp after the latest note could not: the notes with
+ * the calls that wrote them, work a fold that started later left behind them, and what stands
+ * between a note and the next stamp, such as the reply that followed its fold, also after the
+ * latest note.
  */
 export function tokensBehindNote(
   entries: readonly ProjectedSessionEntry[],
   start = mergeStart(entries)
 ): number {
-  const boundary = foldBoundary(entries);
-  return start && start.index <= boundary
-    ? foldableTokens(entries.slice(start.index, boundary + 1))
-    : 0;
+  if (!start || start.index > foldBoundary(entries)) return 0;
+  return foldableTokens(entries.slice(start.index, foldStart(entries)?.index));
 }
 
 /**
@@ -135,8 +141,9 @@ function continues(message: AssistantMessage): boolean {
  * take up room as well: each stays with the call that wrote it, and a session that folds on
  * every nudge can stay far from compaction, where alone they were merged at first. In one
  * of 302 turns, 32 notes and their calls were 49k of the 124k tokens in context at the end.
- * So once a quarter of the threshold sits up to the latest note, the nudge for new work
- * names `mergeStart`, the earliest note as a rule, and asks for one note in place of all.
+ * So once a quarter of the threshold sits up to the first stamp after the latest note, the
+ * nudge for new work names `mergeStart`, the earliest note as a rule, and asks for one
+ * note in place of all.
  * It is appended, never edited in, so the cached prefix is untouched.
  */
 export function registerNudge(pi: ExtensionAPI): void {
@@ -173,7 +180,9 @@ export function registerNudge(pi: ExtensionAPI): void {
     const k = (tokens: number) => Math.round(tokens / 1000);
     const lead = stranded
       ? `About ${k(leftTokens)}k tokens of work that later folds did not cover are still in your context behind their notes, from ${since} on, and are sent again with every request. `
-      : `About ${k(growth)}k tokens of work built up since the last fold, compaction or message like this one. `;
+      : merge
+        ? `About ${k(growth)}k tokens of work built up that no fold has removed, since the last compaction or message like this one. `
+        : `About ${k(growth)}k tokens of work built up since the last fold, compaction or message like this one. `;
     const start = stranded
       ? `with since "${since}"`
       : merge

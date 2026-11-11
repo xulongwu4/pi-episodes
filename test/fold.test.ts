@@ -26,6 +26,7 @@ import {
   workSince
 } from '../src/fold.js';
 import { skillPaths, touchedPaths } from '../src/messages.js';
+import { nudgeGrowth, tokensBehindNote } from '../src/nudge.js';
 import { readStamp } from '../src/stamps.js';
 import { assistant, call, result, session, user } from './helpers.js';
 
@@ -576,6 +577,40 @@ test('a fold that merges the notes starts at the earliest thing a fold removes b
   const { manager: tail } = session([assistant('kept'), user('first', 1), ...command('a', 2)]);
   fold(tail, 'f1', 1, 3);
   assert.equal(start(tail), 3);
+});
+test('growth counts the work after a note and what was written after its fold, and no note', () => {
+  const { manager } = session([
+    user('first', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'out', 2),
+    assistant(call('f', 'fold', { note: 'n'.repeat(8000) }))
+  ]);
+  const entries = () => manager.buildSessionProjection().entries;
+  const near = (tokens: number, expected: number) =>
+    assert.ok(tokens >= expected && tokens < expected + 20, `${tokens} for ${expected}`);
+  const plan = planFold(entries(), 'f', 1);
+  apply(manager, plan.edits);
+  manager.appendMessage({
+    ...result('f', 'fold', 'n'.repeat(8000), 3),
+    details: { kind: 'fold', handle: plan.handle, headline: 'note' }
+  } as Message);
+  manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
+  // The note and its call, 2,000 tokens each, take up room and are not work.
+  assert.equal(nudgeGrowth(entries(), false), 0);
+  near(tokensBehindNote(entries()), 4000);
+
+  // The reply after the fold has no stamp of its own: only a fold from the note's reaches it.
+  manager.appendMessage(assistant('r'.repeat(4000)));
+  assert.equal(nudgeGrowth(entries()), 0);
+  near(nudgeGrowth(entries(), false), 1000);
+  near(tokensBehindNote(entries()), 5000);
+
+  // The first stamp after the note is on a result; the span starts at the call that made it.
+  manager.appendMessage(assistant(call('b', 'bash', { command: 'x'.repeat(4000) })));
+  manager.appendMessage(result('b', 'bash', 'out', 4));
+  near(nudgeGrowth(entries()), 1000);
+  near(nudgeGrowth(entries(), false), 2000);
+  near(tokensBehindNote(entries()), 5000);
 });
 test('work behind a note starts at the stamp a fold of it needs, whatever stands around it', () => {
   // A fold from `since`, applied, with its note at `stamp`.

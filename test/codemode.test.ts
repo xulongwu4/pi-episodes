@@ -1661,6 +1661,142 @@ test('a fold in a long run is not followed by a nudge in the same run', async ()
   }
 });
 
+test('a long note is not work: the fold that wrote it is not followed by a nudge', async () => {
+  // Over twice the threshold with the call that wrote it, and enough to ask for a merge.
+  const note = `Printed a line. ${'detail '.repeat(200)}`;
+  const fold = (since: string) => (context: Parameters<typeof conversation>[0]) => {
+    // Only the first fold answers a nudge.
+    const last = conversation(context).at(-1)!;
+    assert.equal(/tokens of work built up/.test(text(last)), since === 't1', since);
+    return fauxAssistantMessage(fauxToolCall('fold', { since, note }), { stopReason: 'toolUse' });
+  };
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(800)}` }), {
+          stopReason: 'toolUse'
+        }),
+      fold('t1'),
+      // The note is at t3: folding from it merges it, and adds no work either.
+      fold('t3'),
+      (context) => {
+        assert.equal(conversation(context).at(-1)!.role, 'toolResult');
+        return fauxAssistantMessage('done');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 100 }
+  );
+  try {
+    await harness.run('go');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(threadRecords(branch).length, 2);
+    assert.equal(episodeStats(branch, harness.dir).nudges, 1);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('what the agent wrote after its folds is asked about with the notes it follows', async () => {
+  // One long reply after the only note, or two shorter ones after two notes: over the threshold.
+  for (const [size, rounds] of [
+    [9000, 1],
+    [6000, 2]
+  ] as const) {
+    const quiet = (context: Parameters<typeof conversation>[0]) =>
+      assert.doesNotMatch(text(conversation(context).at(-1)!), /tokens of work built up/);
+    const steps = Array.from({ length: rounds }, (_, round) => [
+      (context: Parameters<typeof conversation>[0]) => {
+        quiet(context);
+        return fauxAssistantMessage(fauxToolCall('bash', { command: 'echo small' }), {
+          stopReason: 'toolUse'
+        });
+      },
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', { since: `t${3 * round + 1}`, note: 'Ran it.' }),
+          { stopReason: 'toolUse' }
+        ),
+      () => fauxAssistantMessage('r'.repeat(size))
+    ]).flat();
+    const harness = await createSession(
+      'off',
+      [
+        ...steps,
+        (context) => {
+          const nudge = text(conversation(context).at(-1)!);
+          // Some of it was written before the last fold.
+          assert.match(nudge, /tokens of work built up that no fold has removed, since/);
+          // No stamp after the first note reaches the reply that followed it.
+          assert.match(nudge, /since "t3", early enough to take in all your notes/);
+          return fauxAssistantMessage(fauxToolCall('fold', { since: 't3', note: 'All of it.' }), {
+            stopReason: 'toolUse'
+          });
+        },
+        (context) => {
+          assert.doesNotMatch(conversation(context).map(text).join('\n'), /rrrr/);
+          return fauxAssistantMessage('done');
+        }
+      ],
+      [],
+      { foldNudgeTokens: 2000 }
+    );
+    try {
+      await harness.run(...Array.from({ length: rounds + 1 }, (_, round) => `prompt ${round}`));
+      const branch = harness.session.sessionManager.getBranch();
+      assert.equal(threadRecords(branch).length, rounds + 1);
+      assert.equal(episodeStats(branch, harness.dir).nudges, 1);
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+test('what a script printed next to its fold counts as room its note takes, and leaves with a merge', async () => {
+  const bash = (size: number) => () =>
+    script(`text(await tools.bash({ command: "echo ${'y'.repeat(size)}" }));`);
+  const harness = await createSession(
+    'only',
+    [
+      bash(5),
+      // The result of this script is the note, and 3,000 tokens of output besides.
+      () =>
+        script(
+          'text(await tools.fold({ since: "t1", note: "Ran it." })); text("x".repeat(12000));'
+        ),
+      () => fauxAssistantMessage('done'),
+      // Not new work: the next prompt is not nudged for it.
+      (context) => {
+        assert.doesNotMatch(text(conversation(context).at(-1)!), /tokens of work built up/);
+        return bash(5000)();
+      },
+      () => fauxAssistantMessage('done'),
+      // Once new work is due for a fold, the nudge asks for one that takes in the note.
+      (context) => {
+        const nudge = text(conversation(context).at(-1)!);
+        assert.match(nudge, /since "t3", early enough to take in all your notes/);
+        assert.match(nudge, /about 3k tokens with what they left behind/);
+        return script('text(await tools.fold({ since: "t3", note: "Ran it, and printed." }));');
+      },
+      (context) => {
+        assert.doesNotMatch(conversation(context).map(text).join('\n'), /xxxx|yyyy/);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 2000 }
+  );
+  try {
+    await harness.run('first', 'second', 'third');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(threadRecords(branch).length, 2);
+    assert.equal(episodeStats(branch, harness.dir).nudges, 1);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test('a response cut off by the length limit inside a tool call is nudged too', async () => {
   const harness = await createSession(
     'off',
