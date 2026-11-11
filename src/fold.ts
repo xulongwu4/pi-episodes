@@ -211,9 +211,12 @@ function* stampedStarts(
 /**
  * Work that sits behind the latest note and that no fold removed: what a fold from a later
  * stamp left there, or what a fold with `until` kept. Its entries, without the notes and the
- * responses that called fold, and the stamp a fold of all of it starts from. User messages
- * are left out: a fold keeps them. So is what stands between a note and the next stamp, such
- * as the reply that followed a fold: only a fold that covers that note reaches it.
+ * responses that called fold, and the stamp a fold of all of it starts from. A user message
+ * counts only when a fold would cut it: a fold keeps the others whole. A message an extension
+ * put in, such as a reminder, goes with the work it stands in and starts none: a fold from
+ * the stamp before it would cover notes for the sake of a few lines. What stands between a
+ * note and the next stamp, such as the reply that followed a fold, is left out: only a fold
+ * that covers that note reaches it.
  */
 export function unfoldedBehindNote(
   entries: readonly ProjectedSessionEntry[]
@@ -240,15 +243,24 @@ export function unfoldedBehindNote(
     if (entry.messages.length === 0 || next >= starts.length || starts[next]!.index > index) {
       continue;
     }
+    if (entry.sourceEntry.type === 'custom_message') {
+      if (start) work.push(entry);
+      continue;
+    }
     const message = entryMessage(entry);
+    const shown = entry.messages[0];
     const counts =
-      entry.sourceEntry.type === 'custom_message' ||
       message?.role === 'toolResult' ||
       (message?.role === 'assistant' &&
-        !message.content.some((block) => block.type === 'toolCall' && calls.has(block.id)));
+        !message.content.some((block) => block.type === 'toolCall' && calls.has(block.id))) ||
+      (shown?.role === 'user' && capUserContent(shown.content, '') !== undefined);
     if (!counts) continue;
-    // The latest stamp whose span holds this first entry: an earlier one adds nothing.
-    start ??= starts.findLast((candidate) => candidate.index <= index);
+    if (!start) {
+      // The latest span start that holds this first entry: an earlier one adds nothing. Of the
+      // results of one response, which all start there, the first names it.
+      const at = starts.findLast((candidate) => candidate.index <= index)?.index;
+      start = starts.find((candidate) => candidate.index === at);
+    }
     work.push(entry);
   }
   return start && { ...start, work };

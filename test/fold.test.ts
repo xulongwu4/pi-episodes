@@ -530,6 +530,70 @@ test('work behind the latest note that no fold removed is found, with the stamp 
   manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: merged.handle });
   assert.equal(unfoldedBehindNote(entries()), undefined);
 });
+test('work behind a note starts at the stamp a fold of it needs, whatever stands around it', () => {
+  // A fold from `since`, applied, with its note at `stamp`.
+  const fold = (manager: SessionManager, id: string, since: number, stamp: number) => {
+    manager.appendMessage(assistant(call(id, 'fold')));
+    const plan = planFold(manager.buildSessionProjection().entries, id, since);
+    apply(manager, plan.edits);
+    manager.appendMessage({
+      ...result(id, 'fold', 'note', stamp),
+      details: { kind: 'fold', handle: plan.handle, headline: 'note' }
+    } as Message);
+    manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
+  };
+  // Two requests folded whole, the second with a reminder before its work, then a third
+  // of which only the last command is folded.
+  const left = (third: string, work: readonly AgentMessage[], last: number) => {
+    const { manager } = session([
+      user('first', 1),
+      assistant(call('a', 'bash')),
+      result('a', 'bash', 'out', 2)
+    ]);
+    fold(manager, 'f1', 2, 3);
+    manager.appendMessage(assistant('done'));
+    manager.appendMessage(user('second', 4));
+    manager.appendCustomMessageEntry('episodes-open', 'Still open: the pin.', true);
+    manager.appendMessage(assistant(call('b', 'bash')));
+    manager.appendMessage(result('b', 'bash', 'out', 5));
+    fold(manager, 'f2', 5, 6);
+    manager.appendMessage(assistant('done'));
+    manager.appendMessage(user(third, 7));
+    for (const message of work) {
+      if ('customType' in message) manager.appendCustomMessageEntry('episodes-open', 'x', true);
+      else manager.appendMessage(message as Message);
+    }
+    manager.appendMessage(assistant(call('z', 'bash')));
+    manager.appendMessage(result('z', 'bash', 'out', last));
+    fold(manager, 'f3', last, last + 1);
+    const found = unfoldedBehindNote(manager.buildSessionProjection().entries);
+    return found && { stamp: found.stamp, work: found.work.map((entry) => entry.sourceEntry.type) };
+  };
+  const command = [assistant(call('c', 'bash')), result('c', 'bash', 'out', 8)];
+
+  // The reminder behind the second note is no work: a fold from t4 would cover that note.
+  assert.deepEqual(left('third', command, 9), { stamp: 8, work: ['message', 'message'] });
+  // One that stands in the work goes with it.
+  assert.deepEqual(left('third', [...command, { customType: 'x' } as never], 9), {
+    stamp: 8,
+    work: ['message', 'message', 'custom_message']
+  });
+  // A user message counts when a fold would cut it, and not once one did.
+  assert.deepEqual(left('x'.repeat(USER_TEXT_CAP + 1), command, 9), {
+    stamp: 7,
+    work: ['message', 'message', 'message']
+  });
+  const cut = `${'x'.repeat(USER_TEXT_CAP)}\n[9 more characters of this message are in ep-0a; recall can search them]`;
+  assert.equal(left(cut, command, 9)?.stamp, 8);
+  // The results of one response all start at it: the first of them names the start.
+  const pair = [
+    assistant(call('c', 'bash'), call('d', 'bash')),
+    result('c', 'bash', 'out', 8),
+    result('d', 'bash', 'out', 9)
+  ];
+  assert.equal(left('third', pair, 10)?.stamp, 8);
+});
+
 function earlierFold(applied: boolean) {
   const note = {
     ...result('f0', 'fold', 'first note', 3),
