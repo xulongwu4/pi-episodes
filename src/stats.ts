@@ -743,9 +743,12 @@ export function statsLines(stats: EpisodeStats): string[] {
   if (needed.length > 0) {
     const middle = median(needed);
     const paid = folds.each.filter((fold) => fold.requests >= (breakEven(fold, rates) ?? Infinity));
+    // A small share is not none: where cached input is free, no fold breaks even.
+    const share =
+      rates.cached > 0 && rates.cached < 0.005 ? 'under 1' : Math.round(rates.cached * 100);
     const basis =
       rates.basis === 'costs'
-        ? `cached input at ${Math.round(rates.cached * 100)}% of the input price, from recorded costs`
+        ? `cached input at ${share}% of the input price, from recorded costs`
         : rates.basis === 'uncached'
           ? 'nothing was read from cache, so a fold costs only its note'
           : `cached input counted at ${rates.cached * 100}%`;

@@ -115,6 +115,13 @@ test('rates keep each model apart and leave out requests without a cost', () => 
   const partly = cacheRates([sent('a', 1e-6, 1000, 1000), sent('b', 1e-4, 2000, 0)]);
   near(partly.inputPrice!, 50.5e-6);
   near(partly.cached * partly.inputPrice!, 0.1e-6);
+  // That share of the mixed input price is small, and is not printed as none.
+  const some = episodeStats([], '/repo');
+  some.folds.each.push({ handle: 'ep-1', net: 10_000, uncachedAfter: 9000, requests: 5 });
+  some.folds.rates = partly;
+  assert.ok(
+    statsLines(some).some((line) => line.includes('(cached input at under 1% of the input price,'))
+  );
   // Tokens of a request with no recorded cost are not input that cost nothing.
   const free = {
     ...sent('a', 0, 9000, 0),
