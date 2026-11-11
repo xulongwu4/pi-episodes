@@ -273,14 +273,50 @@ export function unfoldedBehindNote(
   return { ...start, work, keptAt };
 }
 
-/** A tool result that a fold removed and that was work, not the note of a fold it covered. */
-export function isRemovedWork(entry: ProjectedSessionEntry): boolean {
-  const message = entryMessage(entry);
-  return (
-    entry.messages.length === 0 &&
-    message?.role === 'toolResult' &&
-    foldNoteDetails(message) === undefined
-  );
+/**
+ * What became of the work done after the entry at `after`: whether a fold removed some of it,
+ * and what of it is still in context. Work is told from folding itself: a note and the
+ * response that called its fold are neither, so a fold that only merges notes removes no work
+ * and adds none, however long its note. A tool result counts as folded only when an applied
+ * fold recorded its removal in the plan it writes before its edits: another extension can
+ * remove one too, also inside the span of a fold. A session from before folds wrote that
+ * plan shows none.
+ */
+export function workSince(
+  entries: readonly ProjectedSessionEntry[],
+  after: number
+): { folded: boolean; left: ProjectedSessionEntry[] } {
+  const applied = appliedFolds(entries.map((entry) => entry.sourceEntry));
+  const removed = new Set<string>();
+  const calls = new Set<string>();
+  for (const entry of entries) {
+    const source = entry.sourceEntry;
+    if (source.type === 'custom' && source.customType === FOLD_STARTED_TYPE) {
+      const { handle, edits } = (source.data ?? {}) as { handle?: unknown; edits?: unknown };
+      if (typeof handle !== 'string' || !applied.has(handle) || !Array.isArray(edits)) continue;
+      for (const edit of edits as ContextEditEntryDraft[]) {
+        if (edit.replacement === null) removed.add(edit.targetId);
+      }
+    }
+    const message = entryMessage(entry);
+    if (message?.role === 'toolResult' && foldNoteDetails(message)) calls.add(message.toolCallId);
+  }
+  let folded = false;
+  const left: ProjectedSessionEntry[] = [];
+  for (let index = after + 1; index < entries.length; index++) {
+    const entry = entries[index]!;
+    const message = entryMessage(entry);
+    if (message?.role === 'toolResult' && foldNoteDetails(message)) continue;
+    if (
+      message?.role === 'assistant' &&
+      message.content.some((block) => block.type === 'toolCall' && calls.has(block.id))
+    ) {
+      continue;
+    }
+    if (entry.messages.length > 0) left.push(entry);
+    else if (message?.role === 'toolResult') folded ||= removed.has(entry.sourceEntry.id);
+  }
+  return { folded, left };
 }
 
 /**

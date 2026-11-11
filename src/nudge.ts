@@ -9,10 +9,10 @@ import {
   foldBoundary,
   foldInstruction,
   foldStart,
-  isRemovedWork,
   renderFoldAsk,
   USER_TEXT_CAP,
-  unfoldedBehindNote
+  unfoldedBehindNote,
+  workSince
 } from './fold.js';
 import { estimateTokens } from './messages.js';
 import { episodesSettings } from './settings.js';
@@ -63,8 +63,9 @@ export function tokensBehindNote(
  * `until`: its own choice to keep those turns for its next steps, which the next prompt asks
  * about. With no such point the nudge is due at once. After one, it is due once a fold has
  * removed work done since and left this work behind again, or once a quarter of the
- * threshold has built up since. A fold that only merges notes removes no work and does not
- * bring the nudge back: an agent that answered each nudge that way would be asked without end.
+ * threshold of work has built up since. A fold that only merges notes removes no work and
+ * its note is none, so it does not bring the nudge back: an agent that answered each nudge
+ * that way would be asked without end.
  */
 function dueBehindNote(
   entries: readonly ProjectedSessionEntry[],
@@ -78,8 +79,8 @@ function dueBehindNote(
   );
   const decided = Math.max(nudged, inRun ? left.keptAt : -1);
   if (decided < 0) return true;
-  const since = entries.slice(decided + 1);
-  return since.some(isRemovedWork) || foldableTokens(since) >= quarter;
+  const { folded, left: since } = workSince(entries, decided);
+  return folded || foldableTokens(since) >= quarter;
 }
 
 function foldableTokens(entries: readonly ProjectedSessionEntry[]): number {

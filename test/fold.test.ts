@@ -21,7 +21,8 @@ import {
   planFold,
   renderNote,
   USER_TEXT_CAP,
-  unfoldedBehindNote
+  unfoldedBehindNote,
+  workSince
 } from '../src/fold.js';
 import { skillPaths, touchedPaths } from '../src/messages.js';
 import { readStamp } from '../src/stamps.js';
@@ -593,6 +594,81 @@ test('work behind a note starts at the stamp a fold of it needs, whatever stands
     result('d', 'bash', 'out', 9)
   ];
   assert.equal(left('third', pair, 10)?.stamp, 8);
+});
+
+test('work since an entry is told from folding itself and from what other extensions remove', () => {
+  const { manager, ids } = session([
+    user('go', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'first', 2),
+    assistant(call('b', 'bash')),
+    result('b', 'bash', 'second', 3),
+    assistant(call('c', 'bash')),
+    result('c', 'bash', 'third', 4)
+  ]);
+  const entries = () => manager.buildSessionProjection().entries;
+  const since = (after: number) => {
+    const { folded, left } = workSince(entries(), after);
+    return { folded, left: left.map((entry) => entry.messages[0]?.role) };
+  };
+  const work = ['assistant', 'toolResult'];
+  assert.deepEqual(since(0), { folded: false, left: [...work, ...work, ...work] });
+
+  // Another extension removes the second command: gone, but no fold removed it, and the
+  // fold below, whose span it lies in, does not either.
+  manager.appendContextEdit(ids[4]!, null);
+  manager.appendContextEdit(ids[3]!, null);
+  assert.deepEqual(since(0), { folded: false, left: [...work, ...work] });
+
+  // A fold with until removes the first command and keeps the rest.
+  const fold = (
+    id: string,
+    since: number,
+    until: number | undefined,
+    stamp: number,
+    land = true
+  ) => {
+    manager.appendMessage(assistant(call(id, 'fold')));
+    const plan = planFold(entries(), id, since, until === undefined ? {} : { until });
+    if (land) {
+      manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
+      apply(manager, plan.edits);
+    }
+    const details = {
+      kind: 'fold',
+      handle: plan.handle,
+      headline: 'note',
+      firstEntryId: plan.firstEntryId,
+      lastEntryId: plan.lastEntryId,
+      ...(plan.keptFrom === undefined ? {} : { keptFrom: `t${plan.keptFrom}` })
+    };
+    manager.appendMessage({
+      ...result(id, 'fold', 'note '.repeat(400), stamp),
+      details
+    } as Message);
+    return plan;
+  };
+  const kept = fold('f', 2, 2, 5).handle;
+  // Its note counts for nothing before the fold applied, nor as a choice to keep turns.
+  assert.equal(since(0).folded, false);
+  manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: kept });
+  const keptAt = entries().findIndex((entry) => entry.sourceEntry.id === manager.getLeafId()) - 1;
+  assert.equal(unfoldedBehindNote(entries())?.keptAt, keptAt);
+  // The command it removed lay before entry 2, the one it kept after: nothing folded since.
+  assert.deepEqual(since(0), { folded: true, left: work });
+  assert.deepEqual(since(2), { folded: false, left: work });
+
+  // A fold from the note's stamp covers the note and removes no work, however long its own.
+  manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: fold('g', 5, undefined, 6).handle });
+  assert.deepEqual(since(2), { folded: false, left: work });
+  // The choice to keep turns outlives the note that recorded it.
+  assert.equal(unfoldedBehindNote(entries())?.keptAt, keptAt);
+
+  // A fold with until whose edits never landed is no such choice.
+  manager.appendMessage(assistant(call('d', 'bash')));
+  manager.appendMessage(result('d', 'bash', 'fourth', 7));
+  assert.equal(fold('h', 6, 6, 8, false).keptFrom, 7);
+  assert.equal(unfoldedBehindNote(entries())?.keptAt, keptAt);
 });
 
 function earlierFold(applied: boolean) {
