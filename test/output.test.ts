@@ -170,55 +170,24 @@ test('the full text is put back for search, under the stamp', async () => {
   }
 });
 
-test('the text another extension offloaded is put back when its file matches the record', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
-  try {
-    // As tool-result-offload leaves a script's result: the status block, then one preview.
-    const sha256 = createHash('sha256').update(long).digest('hex');
-    const path = join(dir, `${sha256}.txt`);
-    await writeFile(path, long);
-    const header = {
-      type: 'text' as const,
-      text: 'Script completed\nWall time 0.1 seconds\nOutput:\n'
-    };
-    const preview = `line 0\n\n[tool-result-offload: 9 of 10 chars omitted. This result in full (sha256 ${sha256.slice(0, 12)}): ${path} — grep it.]\n\nline 9`;
-    const message: Extract<AgentMessage, { role: 'toolResult' }> = {
-      role: 'toolResult',
-      toolCallId: 'c1',
-      toolName: 'codemode',
-      content: withStamp([header, { type: 'text', text: preview }], 7),
-      details: { offload: { path, sha256, chars: long.length } },
-      isError: false,
-      timestamp: 0
-    };
-    const full = await withFullOutput(message);
-    assert.ok(full.role === 'toolResult');
-    assert.deepEqual(full.content.slice(0, 2), [header, { type: 'text', text: long }]);
-    assert.equal(readStamp(full), 7);
-
-    // A record without the hash, or a result that no longer names the file, is left alone.
-    const unhashed = { ...message, details: { offload: { path } } };
-    assert.equal(await withFullOutput(unhashed), unhashed);
-    const replaced = { ...message, content: withStamp([header], 7) };
-    assert.equal(await withFullOutput(replaced), replaced);
-    // A file that is not the recorded text is not the output.
-    await writeFile(path, 'something else');
-    assert.equal(await withFullOutput(message), message);
-    await rm(path);
-    assert.equal(await withFullOutput(message), message);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-/** A preview as tool-result-offload writes it, with the file it keeps the text in. */
+/**
+ * A preview as tool-result-offload writes it, with the file it keeps the text in: the start
+ * and the end, cut at a line break where one is near, around a line with the counts.
+ */
 async function offloaded(dir: string, text: string, keep: number) {
   const sha256 = createHash('sha256').update(text).digest('hex');
   const path = join(dir, `${sha256}.txt`);
   await writeFile(path, text);
-  const head = text.slice(0, Math.floor((keep * 2) / 3));
-  const tail = text.slice(text.length - Math.floor(keep / 3));
-  const preview = `${head}\n\n[tool-result-offload: some chars omitted. This result in full (sha256 ${sha256.slice(0, 12)}): ${path} — grep it.]\n\n${tail}`;
+  const starts = Math.floor((keep * 2) / 3);
+  const ends = Math.floor(keep / 3);
+  const cut = text.lastIndexOf('\n', starts);
+  const head = text.slice(0, cut > starts / 2 ? cut : starts);
+  const from = text.indexOf('\n', text.length - ends);
+  const tail = text.slice(
+    from >= 0 && from < text.length - ends / 2 ? from + 1 : text.length - ends
+  );
+  const omitted = text.length - head.length - tail.length;
+  const preview = `${head}\n\n[tool-result-offload: ${omitted} of ${text.length} chars omitted. This result in full (sha256 ${sha256.slice(0, 12)}): ${path} — grep it.]\n\n${tail}`;
   return { preview, details: { path, sha256, chars: text.length } };
 }
 
@@ -238,6 +207,39 @@ function toolResult(
     timestamp: 0
   };
 }
+
+test('the text another extension offloaded is put back when its file matches the record', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    // As tool-result-offload leaves a script's result: the status block, then one preview.
+    const { preview, details } = await offloaded(dir, long, 600);
+    const { path } = details;
+    const header = {
+      type: 'text' as const,
+      text: 'Script completed\nWall time 0.1 seconds\nOutput:\n'
+    };
+    const message = toolResult(withStamp([header, { type: 'text', text: preview }], 7), {
+      offload: details
+    });
+    const full = await withFullOutput(message);
+    assert.ok(full.role === 'toolResult');
+    assert.deepEqual(full.content.slice(0, 2), [header, { type: 'text', text: long }]);
+    assert.equal(readStamp(full), 7);
+
+    // A record without the hash, or a result that no longer names the file, is left alone.
+    const unhashed = { ...message, details: { offload: { path } } };
+    assert.equal(await withFullOutput(unhashed), unhashed);
+    const replaced = { ...message, content: withStamp([header], 7) };
+    assert.equal(await withFullOutput(replaced), replaced);
+    // A file that is not the recorded text is not the output.
+    await writeFile(path, 'something else');
+    assert.equal(await withFullOutput(message), message);
+    await rm(path);
+    assert.equal(await withFullOutput(message), message);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test('a result that both extensions cut gets all of its text back, whichever cut first', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
@@ -273,6 +275,50 @@ test('a result that both extensions cut gets all of its text back, whichever cut
   }
 });
 
+test('what a handler added between two cuts stays when both are put back', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    const warning = 'WARNING: output came from staging, not production.';
+    // This extension cut the result, a handler added a block, and the other extension cut
+    // both as one text: the preview made here comes back inside a block that holds more.
+    const cut = await capOutput([{ type: 'text', text: long }], dir, 4000, 3000);
+    assert.ok(cut?.content[0]?.type === 'text');
+    const outer = await offloaded(dir, `${cut.content[0].text}\n${warning}`, 600);
+    assert.doesNotMatch(outer.preview, /\[episodes\]/);
+    const message = toolResult(withStamp([{ type: 'text', text: outer.preview }], 7), {
+      [CAPPED_KEY]: { ...cut.capped },
+      offload: outer.details
+    });
+    const full = await withFullOutput(message);
+    assert.ok(full.role === 'toolResult');
+    assert.deepEqual(full.content[0], { type: 'text', text: `${long}\n${warning}` });
+    assert.equal(readStamp(full), 7);
+
+    // The other way round: the other extension cut first, and this one cut both blocks.
+    const first = await offloaded(dir, long, 3000);
+    const second = await capOutput(
+      [
+        { type: 'text', text: first.preview },
+        { type: 'text', text: warning }
+      ],
+      dir,
+      1000,
+      300
+    );
+    assert.ok(second);
+    assert.doesNotMatch(JSON.stringify(second.content), /tool-result-offload/);
+    const reversed = toolResult(withStamp(second.content, 7), {
+      offload: first.details,
+      [CAPPED_KEY]: { ...second.capped }
+    });
+    const whole = await withFullOutput(reversed);
+    assert.ok(whole.role === 'toolResult');
+    assert.deepEqual(whole.content[0], { type: 'text', text: `${long}\n${warning}` });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('a block that only mentions the file of a cut is not taken for its preview', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
   try {
@@ -287,6 +333,25 @@ test('a block that only mentions the file of a cut is not taken for its preview'
     // Two blocks that read as the preview are not told apart: neither is replaced.
     const doubled = toolResult(withStamp([preview, preview], 7), { offload: cut.details });
     assert.equal(await withFullOutput(doubled), doubled);
+    // Text around the line that is not the start and the end of the output is no preview.
+    assert.match(cut.preview, /^line 0 of the build log\nline 1 of/);
+    const other = { type: 'text' as const, text: cut.preview.replace('line 1 of', 'line 9 of') };
+    const altered = toolResult(withStamp([other], 7), { offload: cut.details });
+    assert.equal(await withFullOutput(altered), altered);
+    // Nor are two previews in one block.
+    const joined = { type: 'text' as const, text: `${cut.preview}\n${cut.preview}` };
+    const twice = toolResult(withStamp([joined], 7), { offload: cut.details });
+    assert.equal(await withFullOutput(twice), twice);
+    // The line of a preview without the start and the end of the text around it is not one.
+    const line = cut.preview.slice(
+      cut.preview.indexOf('\n\n['),
+      cut.preview.lastIndexOf('\n\n') + 2
+    );
+    const quoted = { type: 'text' as const, text: `The file said:${line}and no more.` };
+    const mention = toolResult(withStamp([quoted, preview], 7), { offload: cut.details });
+    const told = await withFullOutput(mention);
+    assert.ok(told.role === 'toolResult');
+    assert.deepEqual(told.content.slice(0, 2), [quoted, { type: 'text', text: long }]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

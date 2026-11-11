@@ -53,14 +53,23 @@ function named(path: string): string {
   return `All of this output is in ${path};`;
 }
 
-/** One cut of a result: the file with the text, and how to tell the preview that names it. */
+/** One cut of a result: the file with the text, and how to find the preview made from it. */
 interface Cut {
   path: string;
   /** The hash the file's text must have, when the record gives one. */
   sha256?: string;
   /** Where the preview was when it was made. */
   block?: number;
-  names(text: string): boolean;
+  /**
+   * The line a preview has in place of the middle, with the blank lines around it. It names
+   * the file in the cutter's own words, and its first group is how many characters it says
+   * were left out.
+   */
+  marker: RegExp;
+}
+
+function literal(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 // Cut at a line break when one is in the nearer half, so the preview does not end mid-line.
@@ -129,19 +138,37 @@ export async function capOutput(
   };
 }
 
+// A cut that fell inside a surrogate pair left U+FFFD for the half it kept.
+function sameCut(shown: string, part: string): boolean {
+  return shown === part || shown === part.toWellFormed();
+}
+
 /**
- * The index of the preview a cut left. The path alone does not tell it: a later handler can
- * add a block that mentions the file, so the preview is the block with the cutter's own words
- * around the path. Where the preview was made is tried first; several such blocks otherwise
- * are not told apart, and none is taken.
+ * The text of a block with the preview of `full` in it replaced by `full`. A preview is the
+ * start and the end of the text around the marker, as many characters as the marker says were
+ * not left out. Only that much is replaced: a block can hold more than the preview, once
+ * another cut that took in the preview and a block after it has been undone. Undefined when
+ * the block holds no such preview, or the text fits in more than one way.
  */
-function previewAt(content: readonly Block[], cut: Cut): number | undefined {
-  const found = [...content.keys()].filter((index) => {
-    const block = content[index];
-    return block?.type === 'text' && cut.names(block.text);
-  });
-  if (cut.block !== undefined && found.includes(cut.block)) return cut.block;
-  return found.length === 1 ? found[0] : undefined;
+function putBack(text: string, marker: RegExp, full: string): string | undefined {
+  const fits: string[] = [];
+  for (const match of text.matchAll(marker)) {
+    const before = match.index;
+    const after = before + match[0].length;
+    const kept = full.length - Number(match[1]);
+    for (let start = Math.min(kept, before); start >= 0; start--) {
+      const end = kept - start;
+      if (end > text.length - after) break;
+      // The first and the last character of a preview are those of the text: most places
+      // are ruled out by them.
+      if (start > 0 && text[before - start] !== full[0]) continue;
+      if (end > 0 && text[after + end - 1] !== full.at(-1)) continue;
+      if (!sameCut(text.slice(before - start, before), full.slice(0, start))) continue;
+      if (!sameCut(text.slice(after, after + end), full.slice(full.length - end))) continue;
+      fits.push(text.slice(0, before - start) + full + text.slice(after + end));
+    }
+  }
+  return fits.length === 1 ? fits[0] : undefined;
 }
 
 async function cutText(cut: Cut): Promise<string | undefined> {
@@ -156,11 +183,38 @@ async function cutText(cut: Cut): Promise<string | undefined> {
 }
 
 /**
+ * The content with the preview of a cut replaced by the text it was cut from. The path alone
+ * does not tell the preview: a later handler can add a block that mentions the file, so it is
+ * the block where the start and the end of the text stand around the cutter's own line. Where
+ * the preview was made is tried first; several such blocks otherwise are not told apart, and
+ * none is taken. Undefined when no block is taken, or the file is gone or not the text.
+ */
+async function restored(content: readonly Block[], cut: Cut): Promise<Block[] | undefined> {
+  const marked = content.flatMap((block, index) =>
+    block.type === 'text' && block.text.search(cut.marker) >= 0 ? [{ index, text: block.text }] : []
+  );
+  if (marked.length === 0) return undefined;
+  const full = await cutText(cut);
+  if (full === undefined) return undefined;
+  const fits = marked.flatMap(({ index, text }) => {
+    const whole = putBack(text, cut.marker, full);
+    return whole === undefined ? [] : [{ index, text: whole }];
+  });
+  const fit =
+    fits.find(({ index }) => index === cut.block) ?? (fits.length === 1 ? fits[0] : undefined);
+  if (!fit) return undefined;
+  return content.map((block, index) =>
+    index === fit.index ? { type: 'text', text: fit.text } : block
+  );
+}
+
+/**
  * The message with the text its preview was cut from put back, for searching and reading
  * back an archived thread, whether this extension cut it or tool-result-offload did. When
  * both did, one cut the other's preview: the preview in the message is put back first, and
- * the text that brings holds the preview of the other. Unchanged when it was not cut, its
- * file is gone, or the file is not the text the other extension recorded.
+ * the text that brings holds the preview of the other, with whatever a handler added between
+ * the two cuts, which stays. Unchanged when it was not cut, its file is gone, or the file is
+ * not the text the other extension recorded.
  */
 export async function withFullOutput(message: AgentMessage): Promise<AgentMessage> {
   if (message.role !== 'toolResult') return message;
@@ -172,8 +226,10 @@ export async function withFullOutput(message: AgentMessage): Promise<AgentMessag
           {
             path: capped.path,
             block: capped.block,
-            names: (text: string) =>
-              text.includes('[episodes] ') && text.includes(named(capped.path))
+            marker: new RegExp(
+              `\\n\\n\\[episodes\\] (\\d+) of \\d+ characters left out here\\. ${literal(named(capped.path))}[^\\n]*\\n\\n`,
+              'g'
+            )
           }
         ]
       : []),
@@ -181,25 +237,26 @@ export async function withFullOutput(message: AgentMessage): Promise<AgentMessag
       ? [
           {
             ...offloaded,
-            names: (text: string) =>
-              text.includes('[tool-result-offload: ') && text.includes(offloaded.path)
+            marker: new RegExp(
+              `\\n\\n\\[tool-result-offload: (\\d+) of \\d+ chars omitted\\.[^\\n]*${literal(offloaded.path)}[^\\n]*\\n\\n`,
+              'g'
+            )
           }
         ]
       : [])
   ];
   let content: Block[] = message.content;
   for (let left = cuts.length; left > 0; left--) {
-    let restored: Cut | undefined;
+    let done: Cut | undefined;
     for (const cut of cuts) {
-      const at = previewAt(content, cut);
-      const text = at === undefined ? undefined : await cutText(cut);
-      if (text === undefined) continue;
-      content = content.map((block, index) => (index === at ? { type: 'text', text } : block));
-      restored = cut;
+      const next = await restored(content, cut);
+      if (!next) continue;
+      content = next;
+      done = cut;
       break;
     }
-    if (!restored) break;
-    cuts = cuts.filter((cut) => cut !== restored);
+    if (!done) break;
+    cuts = cuts.filter((cut) => cut !== done);
   }
   return content === message.content ? message : { ...message, content };
 }
