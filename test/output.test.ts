@@ -337,6 +337,23 @@ test('what a handler added between two cuts stays when both are put back', async
       assert.deepEqual(one.content, [{ type: 'text', text: `${first.preview}\n${warning}` }]);
     }
 
+    // The later cut can leave the earlier preview whole and in sight, here before the start
+    // of a long block a handler added: the later cut is still the one to undo first.
+    const lines = Array.from({ length: 900 }, (_, index) => `added line ${index}`).join('\n');
+    const small = await capOutput([{ type: 'text', text: long }], dir, 1000, 300);
+    assert.ok(small?.content[0]?.type === 'text');
+    const both = await offloaded(dir, `${small.content[0].text}\n${lines}`, 6000);
+    assert.match(both.preview, /\[episodes\] [\s\S]*\[tool-result-offload: /);
+    assert.doesNotMatch(both.preview, /added line 450\n/);
+    const seen = await withFullOutput(
+      toolResult([{ type: 'text', text: both.preview }], {
+        [CAPPED_KEY]: { ...small.capped },
+        offload: both.details
+      })
+    );
+    assert.ok(seen.role === 'toolResult');
+    assert.deepEqual(seen.content, [{ type: 'text', text: `${long}\n${lines}` }]);
+
     // This extension cut first, and blocks were added on both sides before the other cut all
     // three as one text: the record says where the preview starts, and without that it stays
     // as the model saw it.

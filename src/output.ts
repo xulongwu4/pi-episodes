@@ -220,8 +220,12 @@ async function cutText(cut: Cut): Promise<string | undefined> {
  * the block where the start and the end of the text stand around the cutter's own line. Where
  * the preview was made is tried first; several such blocks otherwise are not told apart, and
  * none is taken. Undefined when no block is taken, or the file is gone or not the text.
+ * `whole` says that the preview was all of its block.
  */
-async function restored(content: readonly Block[], cut: Cut): Promise<Block[] | undefined> {
+async function restored(
+  content: readonly Block[],
+  cut: Cut
+): Promise<{ content: Block[]; whole: boolean } | undefined> {
   const marked = content.flatMap((block, index) =>
     block.type === 'text' && block.text.search(cut.marker) >= 0 ? [{ index, text: block.text }] : []
   );
@@ -236,20 +240,26 @@ async function restored(content: readonly Block[], cut: Cut): Promise<Block[] | 
     fits.find(({ index }) => index === cut.block) ?? (fits.length === 1 ? fits[0] : undefined);
   if (!fit) return undefined;
   // Only a preview that was all of its block is the text as it was joined.
-  const blocks = fit.text.length === full.length ? unjoined(full, cut.parts) : [fit.text];
-  return content.flatMap((block, index): Block[] =>
-    index === fit.index ? blocks.map((text) => ({ type: 'text', text })) : [block]
-  );
+  const whole = fit.text.length === full.length;
+  const blocks = whole ? unjoined(full, cut.parts) : [fit.text];
+  return {
+    content: content.flatMap((block, index): Block[] =>
+      index === fit.index ? blocks.map((text) => ({ type: 'text', text })) : [block]
+    ),
+    whole
+  };
 }
 
 /**
  * The message with the text its preview was cut from put back, for searching and reading
  * back an archived thread, whether this extension cut it or tool-result-offload did. When
- * both did, one cut the other's preview: the preview in the message is put back first, and
- * the text that brings holds the preview of the other, with whatever a handler added between
- * the two cuts, which stays: in blocks of its own when this extension made the later cut,
- * and in one block with the output when the other did, which keeps no record of the join. Unchanged when it was not cut, its file is gone, or the file is
- * not the text the other extension recorded.
+ * both did, the later cut took in the preview of the earlier one, and is undone first: its
+ * preview is all of a block, and the earlier preview can be in sight inside it, where putting
+ * that back first would leave the block no longer the preview of the later cut. What a
+ * handler added between the two cuts stays: in blocks of its own when this extension made
+ * the later cut, and in one block with the output when the other did, which keeps no record
+ * of the join. Unchanged when it was not cut, its file is gone, or the file is not the text
+ * the other extension recorded.
  */
 export async function withFullOutput(message: AgentMessage): Promise<AgentMessage> {
   if (message.role !== 'toolResult') return message;
@@ -284,16 +294,15 @@ export async function withFullOutput(message: AgentMessage): Promise<AgentMessag
   ];
   let content: Block[] = message.content;
   for (let left = cuts.length; left > 0; left--) {
-    let done: Cut | undefined;
+    const found: { cut: Cut; content: Block[]; whole: boolean }[] = [];
     for (const cut of cuts) {
       const next = await restored(content, cut);
-      if (!next) continue;
-      content = next;
-      done = cut;
-      break;
+      if (next) found.push({ cut, ...next });
     }
-    if (!done) break;
-    cuts = cuts.filter((cut) => cut !== done);
+    const next = found.find(({ whole }) => whole) ?? found[0];
+    if (!next) break;
+    content = next.content;
+    cuts = cuts.filter((cut) => cut !== next.cut);
   }
   return content === message.content ? message : { ...message, content };
 }
