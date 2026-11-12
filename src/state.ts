@@ -17,7 +17,13 @@ export interface PendingFold {
    * call instead, and its result carries the details, the note if the script did not print it,
    * and the notes the fold covers.
    */
-  script?: { foldCallId: string; note: string; details: FoldDetails };
+  script?: {
+    foldCallId: string;
+    note: string;
+    details: FoldDetails;
+    /** A hook changed the fold's result before the script got it. */
+    changed?: boolean;
+  };
 }
 
 /** Per-session runtime state. Everything durable lives in the session file instead. */

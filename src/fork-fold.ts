@@ -5,11 +5,11 @@ import type { FoldDetails, NestedFold } from './archive.js';
 import {
   coveredTokens,
   headline,
-  keptMark,
   openItems,
   planFold,
   renderCovered,
-  renderNote
+  renderNote,
+  writtenMark
 } from './fold.js';
 import { estimateTokens, skillPaths, touchedPaths } from './messages.js';
 import { parseStamp, readStamp, stampLabel, withStamp } from './stamps.js';
@@ -151,7 +151,6 @@ export class ForkFolds {
     record.noteTokens = Math.ceil(note.length / 4);
     if (plan.covers.length > 0) record.keptTokens = coveredTokens(plan.covers);
     const carried = renderCovered(plan.covers);
-    if (carried) record.kept = keptMark(carried);
     const keptFrom = plan.keptFrom === undefined ? undefined : stampLabel(plan.keptFrom);
     if (keptFrom) record.keptFrom = keptFrom;
     const open = openItems(note);
@@ -163,29 +162,28 @@ export class ForkFolds {
       omit
     });
 
-    return {
-      content: [
-        {
-          type: 'text',
-          text: `${renderNote({
-            handle: plan.handle,
-            since: sinceLabel,
-            until,
-            messages: plan.omitted.length,
-            tokens,
-            note,
-            // The fork's own result carries the working tree diff for all of its work.
-            changes: undefined,
-            touched,
-            keptUserTurns: plan.keptUserTurns,
-            keptFrom,
-            covers: plan.covers,
-            skills: skillPaths(plan.spanMessages, this.state.cwd),
-            cwd: this.state.cwd
-          })}${carried ? `\n\n${carried}` : ''}`
-        }
-      ],
-      details: record
-    };
+    const content = [
+      {
+        type: 'text' as const,
+        text: `${renderNote({
+          handle: plan.handle,
+          since: sinceLabel,
+          until,
+          messages: plan.omitted.length,
+          tokens,
+          note,
+          // The fork's own result carries the working tree diff for all of its work.
+          changes: undefined,
+          touched,
+          keptUserTurns: plan.keptUserTurns,
+          keptFrom,
+          covers: plan.covers,
+          skills: skillPaths(plan.spanMessages, this.state.cwd),
+          cwd: this.state.cwd
+        })}${carried ? `\n\n${carried}` : ''}`
+      }
+    ];
+    record.written = writtenMark(content, carried);
+    return { content, details: record };
   }
 }

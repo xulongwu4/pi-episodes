@@ -97,20 +97,35 @@ function isFoldNote(entry: ProjectedSessionEntry, applied: ReadonlySet<string>):
   return details !== undefined && applied.has(details.handle);
 }
 
-/** What a fold records of the kept notes it wrote, to know that text again. */
-export function keptMark(
-  carried: string,
-  block = 0
-): { chars: number; sha256: string; block: number } {
+const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
+
+/**
+ * What a fold records of its result as it left it: how many blocks, their hash, and the
+ * length and hash of the kept notes at the end of the last one. A later fold that covers the
+ * note tells by it whether the result, and the kept notes in it, are still what the fold
+ * wrote. `changed` leaves the hash of the blocks out, for a result whose note a hook had
+ * already changed: it never was what the agent wrote.
+ */
+export function writtenMark(
+  content: readonly (TextContent | ImageContent)[],
+  carried?: string,
+  changed = false
+): NonNullable<FoldDetails['written']> {
+  const blocks = content
+    .map((block) =>
+      block.type === 'text' ? `text ${block.text.length}\n${block.text}\n` : 'image\n'
+    )
+    .join('');
   return {
-    chars: carried.length,
-    sha256: createHash('sha256').update(carried).digest('hex'),
-    block
+    blocks: content.length,
+    ...(changed ? {} : { sha256: sha256(blocks) }),
+    ...(carried ? { kept: { chars: carried.length, sha256: sha256(carried) } } : {})
   };
 }
 
 /** The notes in text that `renderCovered` wrote: each under its line, as long as the line says. */
 function keptUnder(text: string): CoveredNote[] | undefined {
+  if (!text.startsWith(KEPT_TITLE)) return undefined;
   const notes: CoveredNote[] = [];
   let index = KEPT_TITLE.length;
   while (index < text.length) {
@@ -126,61 +141,57 @@ function keptUnder(text: string): CoveredNote[] | undefined {
 }
 
 /**
- * A note's result as it stands in context: its own text, and the notes kept under it, which
- * `renderCovered` wrote at the end of one of its text blocks. They are taken apart only if
- * that text stands where the fold wrote it and as it wrote it: in the block, and with the
- * length and hash, that the fold recorded in `mark`. Anything else stays in the note's own
- * text, whole: kept notes that something changed or moved since, a copy of them elsewhere
- * in the result, and whatever a note says that reads like kept notes.
+ * A note's result as it stands in context, read by what the fold recorded of it in
+ * `written`. The stamp is left out.
+ *
+ * `kept`: the notes kept under this one, taken from the end of the block the fold wrote them
+ * in, only while the text there has the length and hash of what the fold wrote. `own`: all
+ * the other text of the result. `added`: set while the blocks the fold left are, to the
+ * character, what it left; it is then the text of the blocks added after them, a cue say, and
+ * everything else in the result is known to be the fold's own writing, with the agent's note
+ * in it as recorded.
+ *
+ * So nothing is taken for kept notes by its form, wherever it stands, and once anything was
+ * changed, moved or cut, the changed text is in `own`, whole.
  */
 function standing(
   content: readonly (TextContent | ImageContent)[],
-  mark: { chars?: unknown; sha256?: unknown; block?: unknown } | undefined
-): {
-  own: string;
-  kept: CoveredNote[];
-} {
-  const texts = content.map((block, index) =>
-    block.type !== 'text' || (index === content.length - 1 && isStampBlock(block))
-      ? undefined
-      : block.text
+  written: FoldDetails['written']
+): { own: string; kept: CoveredNote[]; added?: string } {
+  const blocks = content.filter(
+    (block, index) =>
+      !(index === content.length - 1 && block.type === 'text' && isStampBlock(block))
   );
-  const holder = typeof mark?.block === 'number' ? mark.block : -1;
-  const text = texts[holder];
-  const at = text !== undefined && typeof mark?.chars === 'number' ? text.length - mark.chars : -1;
+  const count = typeof written?.blocks === 'number' ? written.blocks : 0;
+  const holder = blocks[count - 1];
+  const at =
+    holder?.type === 'text' && typeof written?.kept?.chars === 'number'
+      ? holder.text.length - written.kept.chars
+      : -1;
   const tail =
-    text !== undefined && at >= 0 && (at === 0 || text.slice(0, at).endsWith('\n\n'))
-      ? text.slice(at)
+    holder?.type === 'text' && at >= 0 && (at === 0 || holder.text.slice(0, at).endsWith('\n\n'))
+      ? holder.text.slice(at)
       : undefined;
-  const under =
-    tail !== undefined && keptMark(tail).sha256 === mark?.sha256 ? keptUnder(tail) : undefined;
-  const kept = under ?? [];
-  const own = texts.flatMap((block, index) =>
-    block === undefined ? [] : [index === holder && kept.length > 0 ? block.slice(0, at) : block]
-  );
-  return { own: own.join('\n').trim(), kept };
-}
-
-/**
- * Whether a note's own text still holds what the agent wrote where the fold put it: after
- * the line that names the fold and before a blank line, plain or as a script printed it.
- * Finding the words anywhere would take a short note for standing inside any text that
- * happens to hold them.
- */
-function holdsOwnNote(own: string, handle: string, note: string): boolean {
-  const line = `[fold ${handle}: `;
-  const printed = JSON.stringify(note.trim()).slice(1, -1);
-  // Every such line: the output cap can leave the start of the note in its preview, cut
-  // short, before the whole note that the fold then added.
-  for (let head = own.indexOf(line); head >= 0; head = own.indexOf(line, head + 1)) {
-    const from = own.indexOf(']', head);
-    if (from < 0) return false;
-    const rest = own.slice(from + 1);
-    if (rest.startsWith(`\n\n${note.trim()}\n\n`) || rest.startsWith(`\\n\\n${printed}\\n\\n`)) {
-      return true;
-    }
-  }
-  return false;
+  const kept =
+    (tail !== undefined && sha256(tail) === written?.kept?.sha256 ? keptUnder(tail) : undefined) ??
+    [];
+  const texts = (from: number, to?: number) =>
+    blocks
+      .slice(from, to)
+      .flatMap((block) =>
+        block.type !== 'text'
+          ? []
+          : [block === holder && kept.length > 0 ? block.text.slice(0, at) : block.text]
+      )
+      .join('\n')
+      .trim();
+  const asWritten =
+    count > 0 &&
+    blocks.length >= count &&
+    typeof written?.sha256 === 'string' &&
+    writtenMark(blocks.slice(0, count)).sha256 === written.sha256 &&
+    (written.kept === undefined) === (kept.length === 0);
+  return { own: texts(0), kept, ...(asWritten ? { added: texts(count) } : {}) };
 }
 
 /**
@@ -191,12 +202,14 @@ function holdsOwnNote(own: string, handle: string, note: string): boolean {
  * the facts of its first note went, and it answered 2 of 12 questions from context where it
  * answered 12 with every note standing.
  *
- * What is kept is read from the note's result as it stands in context, not from a record: a
- * handler or another extension may have changed it since, and the notes under it are there
- * and nowhere else in context. The note's own text is the one the agent wrote when the result
- * still holds it where the fold put it, and the notes it kept read back; otherwise all of
- * the result but the notes read back from under it, which is also what a fold made before
- * notes were recorded gets. So what cannot be read back is kept as it stands, not dropped.
+ * What is kept is read from the note's result as it stands in context: a handler or another
+ * extension may have changed it since, and the notes under it are there and nowhere else in
+ * context. While the result is what the fold wrote (`standing`), the note's own text is the
+ * one the agent wrote, without the lines the harness put around it or what a script printed
+ * next to it, and with whatever was added to the result afterwards. Otherwise all of the
+ * result is kept under the note's handle, which is also what a fold made before this was
+ * recorded gets. So nothing that stands in a covered note's result is dropped unless the
+ * fold itself put it there.
  */
 export function coveredNotes(
   entries: readonly ProjectedSessionEntry[],
@@ -216,16 +229,15 @@ export function coveredNotes(
     const shown = entry.messages[0];
     const fold = isFoldNote(entry, applied) ? foldNoteDetails(entryMessage(entry)) : undefined;
     if (!fold || shown?.role !== 'toolResult') continue;
-    const covers = (fold.covers ?? []).filter((handle) => typeof handle === 'string');
-    const { own, kept } = standing(shown.content, fold.kept);
+    const read = standing(shown.content, fold.written);
+    // A record that names more folds than its result has notes for is not to be trusted.
+    const { own, kept, added } =
+      read.kept.length === (fold.covers?.length ?? 0) ? read : standing(shown.content, undefined);
     const at = written.get(fold.handle) ?? 0;
-    // A fold whose kept notes do not read back has them in its own text still.
     const recorded =
-      fold.note !== undefined &&
-      kept.length === covers.length &&
-      holdsOwnNote(own, fold.handle, fold.note)
-        ? fold.note.trim()
-        : own;
+      added === undefined || fold.note === undefined
+        ? own
+        : [fold.note.trim(), added].filter((part) => part).join('\n\n');
     for (const note of kept) {
       if (!covered.has(note.handle))
         covered.set(note.handle, { note, at: written.get(note.handle) ?? at });
@@ -1237,7 +1249,6 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         cwd: state.cwd
       });
       const carried = renderCovered(plan.covers);
-      if (carried) details.kept = keptMark(carried);
       // Snapshots take time; a run aborted meanwhile, or already settled, must not get edits.
       if (signal?.aborted || run !== state.run) throw new Error('The fold was cancelled.');
       // A fold from a script takes effect with the script's result, which then stands as the
@@ -1258,7 +1269,10 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       // A script gets its own note only. The notes it covers are added to the script's result:
       // printed by the script they would be there twice, or cut where codemode cuts long output.
       const shown = carried && !scriptCall ? `${text}\n\n${carried}` : text;
-      return { content: [{ type: 'text', text: shown }], details, terminate };
+      const content = [{ type: 'text' as const, text: shown }];
+      // A script's result is recorded when it is there, with what the script printed.
+      if (!scriptCall) details.written = writtenMark(content, carried);
+      return { content, details, terminate };
     }
   });
 
@@ -1282,6 +1296,8 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       state.pendingFolds.delete(root);
       return;
     }
+    // What the agent wrote is then no longer what the result says.
+    if (note !== pending.script.note.trim()) pending.script.changed = true;
     pending.script.note = note;
   });
   // A fold from a script takes effect only if the script succeeds. Its result then carries the
@@ -1305,12 +1321,12 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       ...(holdsNote(event.content, script.note) ? [] : [script.note]),
       ...(pending.carried ? [pending.carried] : [])
     ];
-    // Where the kept notes stand in this result, for the fold that reads them back.
-    if (pending.carried) {
-      script.details.kept = keptMark(pending.carried, event.content.length + added.length - 1);
-    }
-    if (added.length === 0) return { details };
     const content = [...event.content, ...added.map((text) => ({ type: 'text' as const, text }))];
+    // The result as the fold leaves it, for the fold that covers this note to know it by;
+    // not when a hook changed the note on its way to the script, which that fold must keep
+    // as the result has it.
+    script.details.written = writtenMark(content, pending.carried, script.changed);
+    if (added.length === 0) return { details };
     return event.structuredContent === undefined
       ? { content, details }
       : { content, details, structuredContent: event.structuredContent };
