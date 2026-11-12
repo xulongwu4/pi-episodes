@@ -461,7 +461,19 @@ test('a fold whose result an earlier handler of its boundary leaves without the 
   const cases = {
     cut: { edits: (_whole: object) => [preview], folds: 1 },
     'whole, then cut': { edits: (whole: object) => [whole, preview], folds: 1 },
-    'removed, then whole again': { edits: (whole: object) => [null, whole], folds: 2 }
+    'removed, then whole again': { edits: (whole: object) => [null, whole], folds: 2 },
+    // Pi takes a string for content, and makes a text block of it.
+    'cut, then whole again as one string': {
+      edits: (whole: object) => [
+        preview,
+        {
+          content: (whole as { content: { type: string; text?: string }[] }).content
+            .map((block) => block.text ?? '')
+            .join('\n')
+        }
+      ],
+      folds: 2
+    }
   };
   for (const [name, { edits, folds }] of Object.entries(cases)) {
     const editAtBoundary: ExtensionFactory = (pi) => {
@@ -481,7 +493,7 @@ test('a fold whose result an earlier handler of its boundary leaves without the 
             ...edits({ content: kept.message.content }).map((replacement) => ({
               type: 'context_edit' as const,
               targetId: kept.id,
-              replacement: replacement as typeof preview | null
+              replacement: replacement as typeof preview | { content: string } | null
             }))
           ]
         };
@@ -597,6 +609,17 @@ test('the output cap does not cut the note of a script that folded, only what it
           assert.equal(result.split('detail end.').length - 1, 1, `${beside}`);
           assert.equal(result.split('characters left out here').length - 1, beside ? 1 : 0);
           assert.ok(result.length < (beside ? 6000 : 5000), `${result.length}`);
+          return script('text(await tools.bash({ command: "echo two" }));');
+        },
+        // A fold that covers that note keeps the note, not the cut output around it.
+        () => script('text(await tools.fold({ since: "t3", note: "second" }));'),
+        (context) => {
+          const result = text(conversation(context).at(-1)!);
+          assert.ok(
+            result.includes(`, ${note.length} characters]\n${note}\n[t5]`),
+            `${beside} ${result.slice(-300)}`
+          );
+          assert.doesNotMatch(result, /characters left out here|row row/, `${beside}`);
           return fauxAssistantMessage('ok');
         }
       ],
@@ -611,7 +634,7 @@ test('the output cap does not cut the note of a script that folded, only what it
     try {
       await harness.run('go');
       const branch = harness.session.sessionManager.getBranch();
-      assert.equal(threadRecords(branch).length, 1, `${beside}`);
+      assert.equal(threadRecords(branch).length, 2, `${beside}`);
       assert.equal(episodeStats(branch, harness.dir).outputs.capped, beside ? 1 : 0);
     } finally {
       await harness.cleanup();

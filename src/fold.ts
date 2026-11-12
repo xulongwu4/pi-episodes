@@ -133,27 +133,23 @@ function standing(
   own: string;
   kept: CoveredNote[];
 } {
-  const own: string[] = [];
-  let kept: CoveredNote[] = [];
-  content.forEach((block, index) => {
-    if (block.type !== 'text' || (index === content.length - 1 && isStampBlock(block))) return;
-    const { text } = block;
+  const blocks = content.flatMap((block, index) =>
+    block.type !== 'text' || (index === content.length - 1 && isStampBlock(block))
+      ? []
+      : [block.text]
+  );
+  const underAt = (text: string) => {
     const at = typeof mark?.chars === 'number' ? text.length - mark.chars : -1;
-    const tail = at >= 0 && kept.length === 0 ? text.slice(at) : undefined;
-    const under =
-      tail !== undefined &&
-      (at === 0 || text.slice(0, at).endsWith('\n\n')) &&
-      keptMark(tail).sha256 === mark?.sha256
-        ? keptUnder(tail)
-        : undefined;
-    if (!under?.length) {
-      own.push(text);
-      return;
-    }
-    if (at > 0) own.push(text.slice(0, at));
-    kept = under;
-  });
-  return { own: own.join('\n').trim(), kept };
+    if (at < 0 || (at > 0 && !text.slice(0, at).endsWith('\n\n'))) return undefined;
+    const tail = text.slice(at);
+    const under = keptMark(tail).sha256 === mark?.sha256 ? keptUnder(tail) : undefined;
+    return under?.length ? { at, under } : undefined;
+  };
+  // The fold wrote its kept notes last: of two blocks that end alike, the later one is theirs.
+  const holder = blocks.findLastIndex((text) => underAt(text) !== undefined);
+  const found = holder < 0 ? undefined : underAt(blocks[holder]!);
+  const own = blocks.map((text, index) => (index === holder ? text.slice(0, found!.at) : text));
+  return { own: own.join('\n').trim(), kept: found?.under ?? [] };
 }
 
 /**
@@ -601,12 +597,14 @@ function editedContent(
   for (const entry of [...branch, ...pending]) {
     if (entry.type !== 'context_edit' || entry.targetId !== id) continue;
     const replacement = entry.replacement as { content?: unknown } | null | undefined;
-    // A tool result's content is a list of blocks; anything else holds no note.
+    // Pi takes a string for content and makes one text block of it.
     content = !replacement
       ? null
-      : Array.isArray(replacement.content)
-        ? (replacement.content as (TextContent | ImageContent)[])
-        : [];
+      : typeof replacement.content === 'string'
+        ? [{ type: 'text', text: replacement.content }]
+        : Array.isArray(replacement.content)
+          ? (replacement.content as (TextContent | ImageContent)[])
+          : [];
   }
   return content;
 }
