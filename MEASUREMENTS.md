@@ -287,19 +287,19 @@ One full run of the 302-turn task with the rule (c0279d4, output cap off, 2026-1
 
 ## 14. Room the notes take
 
-**Question.** How much of the context do the notes hold in a long session, and does the model merge them when asked far from compaction?
+**Question.** How much of the context do the notes hold in a long session, does the model fold from the earliest note when asked far from compaction, and what does it still know afterwards?
 
 **Why.** A note stays until a later fold covers it, and so does the response that called its fold, whose argument is the note again. Notes were merged only close to compaction, and a session that folds at every nudge can stay far from it: the one below did for all its 302 turns.
 
-**Method.** For the share: at the end of a session, add up the text still in context by kind (script `/tmp/ctx-composition.py` for the run below). For the merge: the replay of section 13, cut before a turn at which the nudge for new work is due and the notes weigh over a quarter of the threshold.
+**Method.** For the share: at the end of a session, add up the text still in context by kind (script `/tmp/ctx-composition.py` for the run below). For the fold: the replay of section 13, cut before a turn at which the nudge for new work is due and what stands around the notes weighs over a quarter of the threshold. For what the model still knows: a full session, and at its end the 12 questions of the benchmark about facts from the whole session, answered from context alone.
 
-**Report.** Tokens in context by kind at the end. Per replay: the stamp named, the fold made, the notes covered, the size of the new note, the context before and after.
+**Report.** Tokens in context by kind at the end. Per replay: the stamp named, the fold made, the notes covered, the size of the new note, the context before and after. Per full session: questions answered, peak context, cost.
 
-**Pass.** The model folds from the stamp named in most tries, and one note stands where there were many.
+**Pass.** The model folds from the stamp named in most tries, the context after such a fold is clearly smaller, and the questions are answered as well as in a session that never covered a note.
 
 **Result.** 2026-11-11, gpt-6-luna at low thinking, codemode as the only tool, pi 1.4.0, the 302-turn run of section 13 (c0279d4, output cap off), in which the model folded at each of 29 nudges: 39 folds in all, some unasked, of which 32 notes still stood at the end. At the end about 124k tokens of text were in context: tool results 39k, the 302 user messages 31k, 32 notes 29k, the calls of their folds 20k, other responses 2k. Each note was there three times: as the argument of the call, as the script printed it, in JSON, and as the extension added it again because it looked for the plain text (fixed in e4bca6a). The first request after a fold held 6k tokens at turn 12, 36k at turn 100, 76k at turn 205, 110k at turn 256 and 135k at turn 299.
 
-Replayed with the rule of this section at three turns of that run, the nudge named `t19`, the stamp of the earliest note, every time, and the model folded from it in 9 of 9 tries:
+*First rule: one note in place of all (ac7533f to bef8a0a).* A fold that covered notes removed them, and the message asked for a note covering everything from the earliest note on. Replayed at three turns of that run, the nudge named `t19`, the stamp of the earliest note, every time, and the model folded from it in 9 of 9 tries:
 
 | Turn | Tries | Context before | Notes covered | Removed | New note | Next request | Same point in the run |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -309,7 +309,33 @@ Replayed with the rule of this section at three turns of that run, the nudge nam
 
 "Same point in the run" is the first request after the fold the original run made at that turn. The tries span three versions of the message's wording and of the count that decides when it is sent (the working tree before ac7533f, 61cc80e, f17a2a5); the stamp named and the fold made were the same in all. The first request after such a fold sent 16k tokens uncached at turn 143, 23k at turn 205 and 28k at turn 256, in the tries that no other try had warmed the cache for: the user messages after `t19`, which stay. The result of the merging fold carries text the model did not write, the stamps of the user messages kept and the handles of the notes covered: about 700 tokens at turn 143 (136 messages, 13 notes).
 
-Not measured: a full run with the rule, and what the answers lose when 13 to 26 notes become one of 400 to 1,000 tokens.
+A full session with that rule (bef8a0a, output cap off, same workload and model, 2026-11-11, n = 1) against the session of section 13 without it:
+
+| | Notes merged only close to compaction (c0279d4) | One note in place of all (bef8a0a) |
+| --- | --- | --- |
+| Questions answered from context | 12 of 12 | 2 of 12 |
+| Questions answered with recall allowed | 12 of 12 | 12 of 12 |
+| Peak context | 197k | 112k |
+| First request after the last fold | 135k | 44k |
+| Notes and their calls in context at the end | 32 notes, 49k | 6 notes, 7k |
+| Folds, of which covering earlier notes | 39, 7 | 64, 30 |
+| Cost | $1.12 | $1.01 |
+
+The rule did what it was for, and it failed the pass condition. The facts asked about were in the first note, which stood to the end in the session without the rule. With it, three folds answered the message (turns 126, 167 and 252) and put one note of 615, 397 and 771 tokens in place of 15, 7 and 8 notes: the model wrote a note of about the same size whatever it covered. The early facts came through the first two and were left out of the third; the two questions answered at the end were about a user message that stays. The 27 other covering folds were not asked for: they started at the stamp of the note before them, which is the only stamp from which the reply written after that note can be folded, and put a note about the last request in its place. The same happened 7 times in the session without the rule. The 9% difference in cost is inside what two sessions of one setup differ by. An earlier try with this rule ended at turn 287 on a harness time limit and is not counted.
+
+*Second rule: a covering fold keeps the notes.* The harness adds each covered note under the new one, as written, so covering a note loses nothing it said; the message is sent once a quarter of the threshold of what such a fold frees has built up, and no longer counts the notes themselves. Replayed at turns of the same session, with the text of each note put into its record as the package now records it:
+
+| Turn | Tries | Folded from `t19` | Notes kept | Removed | New note | Kept notes | Next request | Same point in the run |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 143 | 2 | 2 | 13 | 75k | 280 and 860 tokens | 8.6k | 31k and 34k | 57k |
+| 205 | 6 | 4 | 21 | 85k | 420 to 660 tokens | 12.4k | 44k to 46k | 76k |
+| 256 | 6 | 5 | 26 | 108k | 200 to 620 tokens | 16.1k | 56k to 57k | 110k |
+
+"Kept notes" is their text at four characters a token. They are full of trace ids, and going by the next request the provider counts more for them: 26k more than under the first rule at turn 256.
+
+The tries span three wordings. With the first, which asked for "a note covering only the work that no note describes yet", the model folded from `t19` in 1 of 3 tries and in the others from the stamp where that work started, as the words say. With "a note covering everything from there that your notes do not say already" it did in 4 of 5; in the fifth it wrote that `t19` lay behind a compaction and folded its last request, the answer section 13 reports for `t1`. With the message also saying which note the stamp ends ("the stamp at the end of your note ep-3b4b7333") it did in 6 of 6. In one of those the model then folded once more from the stamp of the new note: a fold of 17k tokens whose note, with the 27 it kept, came to 16k.
+
+Not measured yet: a full session with the second rule.
 
 <br />
 
