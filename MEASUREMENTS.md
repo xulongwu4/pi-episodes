@@ -354,7 +354,7 @@ What it shows: the 9 covering folds, none of them asked for, each started at the
 What it does not show:
 
 - That answers hold. Of the 4 questions missed, 3 asked for values that no note of this session ever held: its first note said "counts/docs basenames" where the first note of the other session gave them. The fourth, the latest commit, stood in that first note to the end, and the model answered null. So the quiz here measured what the model wrote down, which differs from one session to the next, more than what folds kept.
-- The message that asks for a merge. It was never due: what a fold of all the notes would free, the calls that wrote them and the replies after them, reached 13k tokens only at the end, against a quarter of the threshold of 12.5k. The replays above remain the only evidence for it.
+- The message that asks for a merge. It was never sent: what a fold of all the notes would free, the calls that wrote them and the replies after them, came to about 13k tokens at the end of the session by a count of characters, and the message needs 12.5k, a quarter of the 50k threshold, when a prompt arrives. For most of the session it was well under that. The replays above remain the only evidence for the message.
 - A difference in cost or context. From turn 119 to 209 the model handed each request to a `fork`, 92 in all, which no other session did more than 6 times; the forks cost $0.28 of the $1.11, kept their output out of the main context, and no fold was made in those 90 turns. Peak and cost are not comparable with the other two columns.
 
 Not measured: a full session in which a merge is asked for and the notes are kept.
