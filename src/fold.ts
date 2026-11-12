@@ -565,6 +565,14 @@ function holdsNote(content: readonly (TextContent | ImageContent)[], note: strin
   return text.includes(note) || text.includes(JSON.stringify(note).slice(1, -1));
 }
 
+/** How much text a script's result holds next to the note of its fold, in characters. */
+export function besideNote(content: readonly (TextContent | ImageContent)[], note: string): number {
+  const text = textOf(content);
+  const printed = JSON.stringify(note).slice(1, -1);
+  const held = text.includes(note) ? note.length : text.includes(printed) ? printed.length : 0;
+  return text.length - held;
+}
+
 type PendingDraft = { type: string; targetId?: string; replacement?: unknown };
 
 /**

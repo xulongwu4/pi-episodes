@@ -17,7 +17,7 @@ import { cacheAnchor, placeAnchor } from './cache.js';
 import { registerCompactionNotice } from './compaction.js';
 import { registerStampDisplay } from './display.js';
 import { recordEvent, recordMeta } from './events.js';
-import { codemodeOnly, registerFold } from './fold.js';
+import { besideNote, codemodeOnly, registerFold } from './fold.js';
 import { registerFork } from './fork.js';
 import { ForkRegistry, registerForksView } from './forks-view.js';
 import { absolutePath, type FileTouch, fileTouch, withFiles } from './messages.js';
@@ -202,6 +202,7 @@ export default function episodes(pi: ExtensionAPI): void {
     const settings = episodesSettings(pi.getSettings());
     const dir = archiveDir(ctx.sessionManager);
     const details = event.details;
+    const folded = state.pendingFolds.get(event.toolCallId)?.script;
     if (
       !settings.outputCap ||
       !dir ||
@@ -209,8 +210,9 @@ export default function episodes(pi: ExtensionAPI): void {
       event.isError ||
       UNCAPPED_TOOLS.has(event.toolName) ||
       // The result of a script that folded stands as the note, as the fold tool's own does:
-      // cut, it would get the whole note added after the cut one.
-      state.pendingFolds.get(event.toolCallId)?.script !== undefined ||
+      // cut, it would get the whole note added after the cut one. What the script printed
+      // next to the note is cut like any output once that alone is over the limit.
+      (folded !== undefined && besideNote(event.content, folded.note) < settings.outputCapChars) ||
       // Details that are not an object could not also say where the rest is.
       (details !== undefined &&
         (typeof details !== 'object' || details === null || Array.isArray(details)))

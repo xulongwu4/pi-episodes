@@ -560,35 +560,42 @@ test('a note that a handler rewrote is kept as the handler left it', async () =>
   }
 });
 
-test('the result of a script that folded is not cut by the output cap', async () => {
+test('the output cap does not cut the note of a script that folded, only what it printed next to it', async () => {
   const note = `Learned a lot. ${'detail '.repeat(600)}end.`;
-  const harness = await createSession(
-    'only',
-    [
-      () => script('text(await tools.bash({ command: "echo one" }));'),
-      () => script(`text(await tools.fold({ since: "t2", note: ${JSON.stringify(note)} }));`),
-      (context) => {
-        const result = text(conversation(context).at(-1)!);
-        assert.equal(result.split('detail end.').length - 1, 1);
-        assert.doesNotMatch(result, /characters left out here/);
-        return fauxAssistantMessage('ok');
-      }
-    ],
-    [],
-    { outputCapChars: 2000, outputCapKeepChars: 600 },
-    {},
-    undefined,
-    [],
-    [],
-    true
-  );
-  try {
-    await harness.run('go');
-    const branch = harness.session.sessionManager.getBranch();
-    assert.equal(threadRecords(branch).length, 1);
-    assert.equal(episodeStats(branch, harness.dir).outputs.capped, 0);
-  } finally {
-    await harness.cleanup();
+  for (const beside of [0, 3000]) {
+    const harness = await createSession(
+      'only',
+      [
+        () => script('text(await tools.bash({ command: "echo one" }));'),
+        () =>
+          script(
+            `text(await tools.fold({ since: "t2", note: ${JSON.stringify(note)} })); text("row ".repeat(${beside}));`
+          ),
+        (context) => {
+          const result = text(conversation(context).at(-1)!);
+          // The whole note, once: cut with the output around it, it is added after the cut.
+          assert.equal(result.split('detail end.').length - 1, 1, `${beside}`);
+          assert.equal(result.split('characters left out here').length - 1, beside ? 1 : 0);
+          assert.ok(result.length < (beside ? 6000 : 5000), `${result.length}`);
+          return fauxAssistantMessage('ok');
+        }
+      ],
+      [],
+      { outputCapChars: 2000, outputCapKeepChars: 600 },
+      {},
+      undefined,
+      [],
+      [],
+      true
+    );
+    try {
+      await harness.run('go');
+      const branch = harness.session.sessionManager.getBranch();
+      assert.equal(threadRecords(branch).length, 1, `${beside}`);
+      assert.equal(episodeStats(branch, harness.dir).outputs.capped, beside ? 1 : 0);
+    } finally {
+      await harness.cleanup();
+    }
   }
 });
 
