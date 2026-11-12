@@ -591,15 +591,12 @@ function editedContent(
   for (const entry of [...branch, ...pending]) {
     if (entry.type !== 'context_edit' || entry.targetId !== id) continue;
     const replacement = entry.replacement as { content?: unknown } | null | undefined;
-    const shown = replacement?.content;
-    content =
-      replacement === null || replacement === undefined
-        ? null
-        : typeof shown === 'string'
-          ? [{ type: 'text', text: shown }]
-          : Array.isArray(shown)
-            ? (shown as (TextContent | ImageContent)[])
-            : [];
+    // A tool result's content is a list of blocks; anything else holds no note.
+    content = !replacement
+      ? null
+      : Array.isArray(replacement.content)
+        ? (replacement.content as (TextContent | ImageContent)[])
+        : [];
   }
   return content;
 }

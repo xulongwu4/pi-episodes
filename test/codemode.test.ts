@@ -455,62 +455,82 @@ test('a fold whose result lost the notes it covers to a later handler does not t
   }
 });
 
-test('a fold whose result an earlier handler of its boundary cuts to less than the notes it covers does not take effect', async () => {
-  const cutAtBoundary: ExtensionFactory = (pi) => {
-    pi.on('turn_end', (event, ctx) => {
-      const kept = ctx.sessionManager
-        .getBranch()
-        .findLast(
-          (entry) =>
-            entry.type === 'message' &&
-            entry.message.role === 'toolResult' &&
-            /Notes of the earlier folds covered here/.test(JSON.stringify(entry.message.content))
-        );
-      if (!kept) return undefined;
-      return {
-        entries: [
-          ...event.entries,
-          {
-            type: 'context_edit' as const,
-            targetId: kept.id,
-            replacement: { content: [{ type: 'text' as const, text: 'A preview of the result.' }] }
-          }
-        ]
-      };
-    });
+test('a fold whose result an earlier handler of its boundary leaves without the notes it covers does not take effect', async () => {
+  const preview = { content: [{ type: 'text' as const, text: 'A preview of the result.' }] };
+  // What the handler queues for the result, in order: the last edit is the one that stands.
+  const cases = {
+    cut: { edits: (_whole: object) => [preview], folds: 1 },
+    'whole, then cut': { edits: (whole: object) => [whole, preview], folds: 1 },
+    'removed, then whole again': { edits: (whole: object) => [null, whole], folds: 2 }
   };
-  for (const mode of ['off', 'only'] as const) {
-    const call = (tool: string, args: Record<string, string>) => () =>
-      mode === 'only'
-        ? script(`text(await tools.${tool}(${JSON.stringify(args)}));`)
-        : fauxAssistantMessage(fauxToolCall(tool, args), { stopReason: 'toolUse' });
-    const harness = await createSession(
-      mode,
-      [
-        call('bash', { command: 'echo one' }),
-        call('fold', { since: 't2', note: 'Learned: alpha is 7.' }),
-        call('bash', { command: 'echo two' }),
-        call('fold', { since: 't3', note: 'second' }),
-        (context) => {
-          // The preview is what the second fold left; the first note stands, with the work.
-          const all = conversation(context).map(text).join('\n');
-          assert.match(all, /A preview of the result\./, mode);
-          assert.match(all, /\[fold ep-[0-9a-f]{8}: [^\n]*\n\nLearned: alpha is 7\./, mode);
-          assert.match(all, /two/, mode);
-          return fauxAssistantMessage('ok');
-        }
-      ],
-      [],
-      {},
-      {},
-      undefined,
-      [cutAtBoundary]
-    );
-    try {
-      await harness.run('go');
-      assert.equal(threadRecords(harness.session.sessionManager.getBranch()).length, 1, mode);
-    } finally {
-      await harness.cleanup();
+  for (const [name, { edits, folds }] of Object.entries(cases)) {
+    const editAtBoundary: ExtensionFactory = (pi) => {
+      pi.on('turn_end', (event, ctx) => {
+        const kept = ctx.sessionManager
+          .getBranch()
+          .findLast(
+            (entry) =>
+              entry.type === 'message' &&
+              entry.message.role === 'toolResult' &&
+              /Notes of the earlier folds covered here/.test(JSON.stringify(entry.message.content))
+          );
+        if (kept?.type !== 'message' || kept.message.role !== 'toolResult') return undefined;
+        return {
+          entries: [
+            ...event.entries,
+            ...edits({ content: kept.message.content }).map((replacement) => ({
+              type: 'context_edit' as const,
+              targetId: kept.id,
+              replacement: replacement as typeof preview | null
+            }))
+          ]
+        };
+      });
+    };
+    for (const mode of ['off', 'only'] as const) {
+      const call = (tool: string, args: Record<string, string>) => () =>
+        mode === 'only'
+          ? script(`text(await tools.${tool}(${JSON.stringify(args)}));`)
+          : fauxAssistantMessage(fauxToolCall(tool, args), { stopReason: 'toolUse' });
+      const harness = await createSession(
+        mode,
+        [
+          call('bash', { command: 'echo one' }),
+          call('fold', { since: 't2', note: 'Learned: alpha is 7.' }),
+          call('bash', { command: 'echo two' }),
+          call('fold', { since: 't3', note: 'second' }),
+          (context) => {
+            const all = conversation(context).map(text).join('\n');
+            const label = `${name} ${mode}`;
+            assert.equal(all.split('alpha is 7').length - 1, 1, label);
+            if (folds === 1) {
+              // The preview is what the second fold left; the first note stands, with the work.
+              assert.match(all, /A preview of the result\./, label);
+              assert.match(all, /\[fold ep-[0-9a-f]{8}: [^\n]*\n\nLearned: alpha is 7\./, label);
+              assert.match(all, /two/, label);
+            } else {
+              assert.match(
+                all,
+                /\[note of ep-[0-9a-f]{8}, t2, 20 characters\]\nLearned: alpha is 7\./
+              );
+              assert.doesNotMatch(all, /two/, label);
+            }
+            return fauxAssistantMessage('ok');
+          }
+        ],
+        [],
+        {},
+        {},
+        undefined,
+        [editAtBoundary]
+      );
+      try {
+        await harness.run('go');
+        const records = threadRecords(harness.session.sessionManager.getBranch());
+        assert.equal(records.length, folds, `${name} ${mode}`);
+      } finally {
+        await harness.cleanup();
+      }
     }
   }
 });
