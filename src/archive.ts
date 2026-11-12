@@ -86,10 +86,11 @@ export interface FoldDetails {
   /** Estimated tokens of the earlier notes kept under it, which the fold did not free. */
   keptTokens?: number;
   /**
-   * Length and hash of the text in which the fold wrote those notes under its own. A later
-   * fold that covers this one takes that text apart only if it still stands as written.
+   * Length and hash of the text in which the fold wrote those notes under its own, and which
+   * block of its result ends in it. A later fold that covers this one takes that text apart
+   * only if it still stands there as written.
    */
-  kept?: { chars: number; sha256: string };
+  kept?: { chars: number; sha256: string; block: number };
   /**
    * Set when the user asked for the fold with /fold: `since` when they picked where the span
    * starts, `request` when the agent picked. Absent for folds the agent chose on its own.

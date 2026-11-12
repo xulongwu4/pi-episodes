@@ -349,7 +349,7 @@ One full session with the second rule, same task, model and setup as the two abo
 | Calls to `fork` | 0 | 6 | 92 |
 | Cost, forks included | $1.12 | $1.01 | $1.11 |
 
-What it shows: the 9 covering folds, none of them asked for, each started at the stamp of the note before it and kept that note with the ones already kept under it, up to 3; at the end the text of each of the 33 notes the agent wrote stood in context once. Under the first rule 27 such folds each left a short note about the last request in place of the note before it, and 7 did in the session where every note was meant to stand.
+What it shows: the 9 covering folds, none of them asked for, each started at the stamp of the note before it and kept that note with the ones already kept under it, up to 3; at the end the text of each of the 33 notes the agent wrote stood once among the results in context (the calls that wrote the notes hold their text too, as far as those calls are still in context). Under the first rule 27 such folds each left a short note about the last request in place of the note before it, and 7 did in the session where every note was meant to stand.
 
 What it does not show:
 

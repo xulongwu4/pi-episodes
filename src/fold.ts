@@ -98,8 +98,15 @@ function isFoldNote(entry: ProjectedSessionEntry, applied: ReadonlySet<string>):
 }
 
 /** What a fold records of the kept notes it wrote, to know that text again. */
-export function keptMark(carried: string): { chars: number; sha256: string } {
-  return { chars: carried.length, sha256: createHash('sha256').update(carried).digest('hex') };
+export function keptMark(
+  carried: string,
+  block = 0
+): { chars: number; sha256: string; block: number } {
+  return {
+    chars: carried.length,
+    sha256: createHash('sha256').update(carried).digest('hex'),
+    block
+  };
 }
 
 /** The notes in text that `renderCovered` wrote: each under its line, as long as the line says. */
@@ -121,35 +128,37 @@ function keptUnder(text: string): CoveredNote[] | undefined {
 /**
  * A note's result as it stands in context: its own text, and the notes kept under it, which
  * `renderCovered` wrote at the end of one of its text blocks. They are taken apart only if
- * that text stands there as the fold wrote it, by the length and hash the fold recorded in
- * `mark`. Anything else stays in the note's own text, whole: kept notes that something
- * changed since, and whatever a note says that reads like kept notes, to any reader that
- * looks for them by their form.
+ * that text stands where the fold wrote it and as it wrote it: in the block, and with the
+ * length and hash, that the fold recorded in `mark`. Anything else stays in the note's own
+ * text, whole: kept notes that something changed or moved since, a copy of them elsewhere
+ * in the result, and whatever a note says that reads like kept notes.
  */
 function standing(
   content: readonly (TextContent | ImageContent)[],
-  mark: { chars?: unknown; sha256?: unknown } | undefined
+  mark: { chars?: unknown; sha256?: unknown; block?: unknown } | undefined
 ): {
   own: string;
   kept: CoveredNote[];
 } {
-  const blocks = content.flatMap((block, index) =>
+  const texts = content.map((block, index) =>
     block.type !== 'text' || (index === content.length - 1 && isStampBlock(block))
-      ? []
-      : [block.text]
+      ? undefined
+      : block.text
   );
-  const underAt = (text: string) => {
-    const at = typeof mark?.chars === 'number' ? text.length - mark.chars : -1;
-    if (at < 0 || (at > 0 && !text.slice(0, at).endsWith('\n\n'))) return undefined;
-    const tail = text.slice(at);
-    const under = keptMark(tail).sha256 === mark?.sha256 ? keptUnder(tail) : undefined;
-    return under?.length ? { at, under } : undefined;
-  };
-  // The fold wrote its kept notes last: of two blocks that end alike, the later one is theirs.
-  const holder = blocks.findLastIndex((text) => underAt(text) !== undefined);
-  const found = holder < 0 ? undefined : underAt(blocks[holder]!);
-  const own = blocks.map((text, index) => (index === holder ? text.slice(0, found!.at) : text));
-  return { own: own.join('\n').trim(), kept: found?.under ?? [] };
+  const holder = typeof mark?.block === 'number' ? mark.block : -1;
+  const text = texts[holder];
+  const at = text !== undefined && typeof mark?.chars === 'number' ? text.length - mark.chars : -1;
+  const tail =
+    text !== undefined && at >= 0 && (at === 0 || text.slice(0, at).endsWith('\n\n'))
+      ? text.slice(at)
+      : undefined;
+  const under =
+    tail !== undefined && keptMark(tail).sha256 === mark?.sha256 ? keptUnder(tail) : undefined;
+  const kept = under ?? [];
+  const own = texts.flatMap((block, index) =>
+    block === undefined ? [] : [index === holder && kept.length > 0 ? block.slice(0, at) : block]
+  );
+  return { own: own.join('\n').trim(), kept };
 }
 
 /**
@@ -1296,6 +1305,10 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       ...(holdsNote(event.content, script.note) ? [] : [script.note]),
       ...(pending.carried ? [pending.carried] : [])
     ];
+    // Where the kept notes stand in this result, for the fold that reads them back.
+    if (pending.carried) {
+      script.details.kept = keptMark(pending.carried, event.content.length + added.length - 1);
+    }
     if (added.length === 0) return { details };
     const content = [...event.content, ...added.map((text) => ({ type: 'text' as const, text }))];
     return event.structuredContent === undefined

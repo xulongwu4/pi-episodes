@@ -819,6 +819,8 @@ function foldChain() {
       recorded?: boolean;
       /** What something did to all of the result afterwards. */
       edit?: (text: string) => string;
+      /** A block before the result's own that holds the kept notes too, as written. */
+      copy?: boolean;
     } = {}
   ) => {
     const since = from;
@@ -827,8 +829,11 @@ function foldChain() {
     const kept = renderCovered(plan.covers);
     const text = noteBody(plan.handle, options.shown ?? note);
     const whole = kept ? `${text}\n\n${kept}` : text;
+    const message = result(id, 'fold', options.edit ? options.edit(whole) : whole, ++stamp);
+    const copied = options.copy && kept ? [{ type: 'text' as const, text: kept }] : [];
     manager.appendMessage({
-      ...result(id, 'fold', options.edit ? options.edit(whole) : whole, ++stamp),
+      ...message,
+      content: [...copied, ...message.content],
       details: {
         kind: 'fold',
         handle: plan.handle,
@@ -836,7 +841,7 @@ function foldChain() {
         since: `t${since}`,
         ...(stamp - 1 === since ? {} : { until: `t${stamp - 1}` }),
         covers: plan.covers.map((covered) => covered.handle),
-        ...(kept ? { kept: keptMark(kept) } : {}),
+        ...(kept ? { kept: keptMark(kept, copied.length) } : {}),
         ...(options.recorded === false ? {} : { note })
       }
     } as Message);
@@ -995,6 +1000,26 @@ test('what does not read back as the fold wrote it is kept as it stands', () => 
   assert.deepEqual(
     capped('p2', 'second').covers.map((note) => note.text),
     ['Learned: eta is 5. And more.']
+  );
+
+  // The kept notes changed where the fold wrote them, and an exact copy of them as written
+  // stands in another block of the result: the copy is not read in their place.
+  const twice = foldChain();
+  twice('d1', 'Learned: zeta is 3.');
+  twice('d2', 'second', {
+    copy: true,
+    edit: (text) => text.replace(/zeta is 3/, 'zeta is [redacted]')
+  });
+  const moved = twice('d3', 'third');
+  assert.equal(moved.covers.length, 1);
+  assert.match(moved.covers[0]!.text, /zeta is \[redacted\]/);
+  // Unchanged, they are read from the block the fold recorded, and the copy is not kept.
+  const again = foldChain();
+  again('g1', 'Learned: zeta is 3.');
+  again('g2', 'second', { copy: true });
+  assert.deepEqual(
+    again('g3', 'third').covers.map((note) => note.text),
+    ['Learned: zeta is 3.', 'second']
   );
 
   // Changed by one character, at the same length, the kept notes stay whole as well.
