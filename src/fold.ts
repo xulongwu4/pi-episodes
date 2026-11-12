@@ -58,6 +58,8 @@ export interface FoldPlan {
   keptUserTurns: string[];
   /** The notes of earlier folds that the new note stands for from now on, oldest first. */
   covers: CoveredNote[];
+  /** The images in the results of the notes the fold covers, which its result takes over. */
+  images: ImageContent[];
   edits: ContextEditEntryDraft[];
 }
 
@@ -97,7 +99,9 @@ function isFoldNote(entry: ProjectedSessionEntry, applied: ReadonlySet<string>):
   return details !== undefined && applied.has(details.handle);
 }
 
-const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
+// Over the code units of the string: as UTF-8 a lone surrogate and U+FFFD would hash alike.
+const sha256 = (text: string) =>
+  createHash('sha256').update(Buffer.from(text, 'utf16le')).digest('hex');
 
 /**
  * What a fold records of its result as it left it: how many blocks, their hash, and the
@@ -113,7 +117,9 @@ export function writtenMark(
 ): NonNullable<FoldDetails['written']> {
   const blocks = content
     .map((block) =>
-      block.type === 'text' ? `text ${block.text.length}\n${block.text}\n` : 'image\n'
+      block.type === 'text'
+        ? `text ${block.text.length}\n${block.text}\n`
+        : `image ${block.mimeType} ${block.data.length}\n${block.data}\n`
     )
     .join('');
   return {
@@ -252,6 +258,35 @@ export function coveredNotes(
     });
   }
   return [...covered.values()].sort((a, b) => a.at - b.at).map(({ note }) => note);
+}
+
+/**
+ * The images that stand in the results of the notes in `span`: another extension put them
+ * there, and the images of notes covered before are among them. The fold that covers the notes
+ * puts them after its own result, since the text it keeps cannot hold them.
+ */
+export function coveredImages(
+  span: readonly ProjectedSessionEntry[],
+  applied: ReadonlySet<string>
+): ImageContent[] {
+  return span.flatMap((entry) => {
+    const shown = entry.messages[0];
+    if (shown?.role !== 'toolResult' || !isFoldNote(entry, applied)) return [];
+    return shown.content.filter((block) => block.type === 'image');
+  });
+}
+
+/** Whether every one of `images` is among the blocks of `content`. */
+export function holdsImages(
+  content: readonly (TextContent | ImageContent)[],
+  images: readonly ImageContent[]
+): boolean {
+  return images.every((image) =>
+    content.some(
+      (block) =>
+        block.type === 'image' && block.data === image.data && block.mimeType === image.mimeType
+    )
+  );
 }
 
 /** Estimated tokens of the notes a fold keeps as written: what covering them does not free. */
@@ -914,6 +949,7 @@ export function planFold(
     sent: entries.slice(0, foldIndex).flatMap((entry) => entry.messages),
     keptUserTurns,
     covers: coveredNotes(entries, span, applied),
+    images: coveredImages(span, applied),
     edits
   };
 }
@@ -1259,6 +1295,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         tokens,
         edits: plan.edits,
         ...(carried ? { carried } : {}),
+        ...(plan.images.length > 0 ? { images: plan.images } : {}),
         ...(scriptCall ? { script: { foldCallId: toolCallId, note: text, details } } : {})
       });
 
@@ -1269,10 +1306,12 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       // A script gets its own note only. The notes it covers are added to the script's result:
       // printed by the script they would be there twice, or cut where codemode cuts long output.
       const shown = carried && !scriptCall ? `${text}\n\n${carried}` : text;
-      const content = [{ type: 'text' as const, text: shown }];
+      const written = [{ type: 'text' as const, text: shown }];
       // A script's result is recorded when it is there, with what the script printed.
-      if (!scriptCall) details.written = writtenMark(content, carried);
-      return { content, details, terminate };
+      if (scriptCall) return { content: written, details, terminate };
+      details.written = writtenMark(written, carried);
+      // The images of the covered notes follow what the fold wrote, as blocks added to it.
+      return { content: [...written, ...plan.images], details, terminate };
     }
   });
 
@@ -1321,12 +1360,15 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       ...(holdsNote(event.content, script.note) ? [] : [script.note]),
       ...(pending.carried ? [pending.carried] : [])
     ];
-    const content = [...event.content, ...added.map((text) => ({ type: 'text' as const, text }))];
+    const written = [...event.content, ...added.map((text) => ({ type: 'text' as const, text }))];
     // The result as the fold leaves it, for the fold that covers this note to know it by;
     // not when a hook changed the note on its way to the script, which that fold must keep
     // as the result has it.
-    script.details.written = writtenMark(content, pending.carried, script.changed);
-    if (added.length === 0) return { details };
+    script.details.written = writtenMark(written, pending.carried, script.changed);
+    const images = pending.images ?? [];
+    if (added.length === 0 && images.length === 0) return { details };
+    // The images of the covered notes follow what the fold wrote, as blocks added to it.
+    const content = [...written, ...images];
     return event.structuredContent === undefined
       ? { content, details }
       : { content, details, structuredContent: event.structuredContent };
@@ -1350,8 +1392,8 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         // What will stand in context for the result: a later hook may have rewritten it, and
         // an earlier handler of this boundary may have queued an edit of it. Without the note
         // in a script's result, the span would leave with nothing in its place; without the
-        // notes the fold covers, those would leave with it; and a result that is removed
-        // leaves nothing to stand for the span.
+        // notes the fold covers, or the images that stood in their results, those would leave
+        // with it; and a result that is removed leaves nothing to stand for the span.
         const edited = note && editedContent(note.id, branch, event.entries);
         const content = edited ?? result.content;
         const stands =
@@ -1360,7 +1402,8 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
             ? foldNoteDetails(result)?.handle === pending.handle &&
               holdsNote(content, pending.script.note)
             : result.toolName === FOLD_TOOL) &&
-          (pending?.carried === undefined || textOf(content).includes(pending.carried));
+          (pending?.carried === undefined || textOf(content).includes(pending.carried)) &&
+          holdsImages(content, pending?.images ?? []);
         if (!pending || !stands) return [];
         state.pendingFolds.delete(result.toolCallId);
         return [pending];

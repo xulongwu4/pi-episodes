@@ -19,6 +19,7 @@ import {
   cutShortFold,
   foldableTurns,
   headline,
+  holdsImages,
   mergeStart,
   openItems,
   planFold,
@@ -802,7 +803,10 @@ const noteBody = (handle: string, note: string) =>
   `[fold ${handle}: archived]\n\n${note}\n\nTo go back: recall.`;
 
 /** A session in which each fold starts at the stamp of the note before it, and so covers it. */
-function foldChain() {
+const picture = (data: string) => ({ type: 'image' as const, data, mimeType: 'image/png' });
+
+/** `shot`: an image in the result of the work done after each fold, a screenshot say. */
+function foldChain(shot?: string) {
   const { manager } = session([
     user('go', 1),
     assistant(call('a', 'bash')),
@@ -828,6 +832,8 @@ function foldChain() {
       cue?: string;
       /** Handles the record names as covered, when not the ones the fold kept. */
       names?: string[];
+      /** An image another extension added to the result. */
+      image?: string;
     } = {}
   ) => {
     const since = from;
@@ -844,6 +850,8 @@ function foldChain() {
       content: [
         ...copied,
         ...message.content.slice(0, -1),
+        ...plan.images,
+        ...(options.image ? [picture(options.image)] : []),
         ...(options.cue ? [{ type: 'text' as const, text: options.cue }] : []),
         ...message.content.slice(-1)
       ],
@@ -863,10 +871,41 @@ function foldChain() {
     manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
     from = stamp;
     manager.appendMessage(assistant(call(`${id}-work`, 'bash')));
-    manager.appendMessage(result(`${id}-work`, 'bash', 'out', ++stamp));
+    const work = result(`${id}-work`, 'bash', 'out', ++stamp);
+    const shown = shot
+      ? [...work.content.slice(0, -1), picture(shot), ...work.content.slice(-1)]
+      : work.content;
+    manager.appendMessage({ ...work, content: shown } as Message);
     return plan;
   };
 }
+
+test('a fold takes over the images that stand in the results of the notes it covers', () => {
+  // Not the images in the work it folds, which leave with the work.
+  const fold = foldChain('WORK');
+  assert.deepEqual(fold('f1', 'first', { image: 'AAAA' }).images, []);
+  assert.deepEqual(fold('f2', 'second', { image: 'BBBB' }).images, [picture('AAAA')]);
+  // The first image stands in the second note's result by now, before the one added there.
+  const third = fold('f3', 'third');
+  assert.deepEqual(third.images, [picture('AAAA'), picture('BBBB')]);
+  // The images follow what the fold wrote, so the notes are still the ones the agent wrote.
+  assert.deepEqual(
+    third.covers.map((note) => note.text),
+    ['first', 'second']
+  );
+  assert.deepEqual(fold('f4', 'fourth').images, third.images);
+
+  assert.equal(holdsImages([picture('AAAA'), picture('BBBB')], [picture('BBBB')]), true);
+  assert.equal(holdsImages([{ type: 'text', text: 'AAAA' }], [picture('AAAA')]), false);
+  assert.equal(holdsImages([picture('AAAA')], [picture('AAAA'), picture('BBBB')]), false);
+  // The same data as another kind of image is not the image.
+  assert.equal(
+    holdsImages([{ ...picture('AAAA'), mimeType: 'image/jpeg' }], [picture('AAAA')]),
+    false
+  );
+  // An image a script put in its result is part of what the fold left: another is not it.
+  assert.notEqual(writtenMark([picture('AAAA')]).sha256, writtenMark([picture('BBBB')]).sha256);
+});
 
 test('a fold keeps the notes it covers and the notes under them, each once and as it stands', () => {
   const fold = foldChain();
@@ -1072,6 +1111,16 @@ test('what does not read back as the fold wrote it is kept as it stands', () => 
     [changed.handle]
   );
   assert.match(later.covers[0]!.text, /, 20 characters\]\nLearned: delta is 2\.\n\n\[note of /);
+
+  // So does a character changed for one that reads the same once encoded as UTF-8.
+  const lone = foldChain();
+  lone('u1', 'before \ud800 after', { edit: (text) => text.replace('\ud800', '\ufffd') });
+  const [encoded] = lone('u2', 'second').covers;
+  assert.match(encoded!.text, /\n\nbefore \ufffd after\n\n/);
+  assert.notEqual(
+    writtenMark([{ type: 'text', text: 'a' }], '\ud800').kept!.sha256,
+    writtenMark([{ type: 'text', text: 'a' }], '\ufffd').kept!.sha256
+  );
 
   // A note that is empty reads back, also as the last one.
   const empty = foldChain();

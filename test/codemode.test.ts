@@ -455,6 +455,77 @@ test('a fold whose result lost the notes it covers to a later handler does not t
   }
 });
 
+test('an image in the result of a note stays in context when a fold covers the note, or the fold does not take effect', async () => {
+  const image = { type: 'image' as const, data: 'AAAA', mimeType: 'image/png' };
+  // Another extension puts an image into the result of the first note.
+  const addImage: ExtensionFactory = (pi) => {
+    pi.on('tool_result', (event) => {
+      const words = event.content.map((block) => (block.type === 'text' ? block.text : ''));
+      if (
+        !/alpha is 7/.test(words.join('\n')) ||
+        /Notes of the earlier folds/.test(words.join('\n'))
+      )
+        return undefined;
+      return { content: [...event.content, image] };
+    });
+  };
+  // And one takes the images out of the result of the second.
+  const dropImage: ExtensionFactory = (pi) => {
+    pi.on('tool_result', (event) => {
+      const words = event.content.map((block) => (block.type === 'text' ? block.text : ''));
+      // Not "seconds", which a script's result says, and not the third note's result.
+      if (!/second(?!s)/.test(words.join('\n')) || /third/.test(words.join('\n'))) return undefined;
+      return { content: event.content.filter((block) => block.type !== 'image') };
+    });
+  };
+  for (const mode of ['off', 'only'] as const) {
+    for (const dropped of [false, true]) {
+      const call = (tool: string, args: Record<string, string>) => () =>
+        mode === 'only'
+          ? script(`text(JSON.stringify(await tools.${tool}(${JSON.stringify(args)})));`)
+          : fauxAssistantMessage(fauxToolCall(tool, args), { stopReason: 'toolUse' });
+      const harness = await createSession(
+        mode,
+        [
+          call('bash', { command: 'echo one' }),
+          call('fold', { since: 't2', note: 'Learned: alpha is 7.' }),
+          call('bash', { command: 'echo two' }),
+          call('fold', { since: 't3', note: 'second' }),
+          call('bash', { command: 'echo three' }),
+          call('fold', { since: 't5', note: 'third' }),
+          (context) => {
+            const view = conversation(context);
+            const images = view.flatMap((message) =>
+              typeof message.content === 'string'
+                ? []
+                : message.content.filter((block) => block.type === 'image')
+            );
+            // Once, whichever note's result it stands in by now.
+            assert.deepEqual(images, [image], `${mode} ${dropped}`);
+            const all = view.map(text).join('\n');
+            assert.equal(all.split('alpha is 7').length - 1, 1, `${mode} ${dropped}`);
+            return fauxAssistantMessage('ok');
+          }
+        ],
+        dropped ? [addImage, dropImage] : [addImage]
+      );
+      try {
+        await harness.run('go');
+        const records = threadRecords(harness.session.sessionManager.getBranch());
+        // Without the image in its result the second fold left the first note standing, and
+        // the third, from the stamp of the work after it, covered nothing.
+        assert.deepEqual(
+          (records as { covers?: string[] }[]).map((record) => record.covers?.length ?? 0),
+          dropped ? [0, 0] : [0, 1, 2],
+          `${mode} ${dropped}`
+        );
+      } finally {
+        await harness.cleanup();
+      }
+    }
+  }
+});
+
 test('a fold whose result an earlier handler of its boundary leaves without the notes it covers does not take effect', async () => {
   const preview = { content: [{ type: 'text' as const, text: 'A preview of the result.' }] };
   // What the handler queues for the result, in order: the last edit is the one that stands.

@@ -1,4 +1,5 @@
 import { realpathSync } from 'node:fs';
+import type { ImageContent } from '@earendil-works/pi-ai';
 import type { ContextEditEntryDraft, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { FoldDetails, ForkArchive } from './archive.js';
 import type { RecallIndex } from './search.js';
@@ -12,6 +13,8 @@ export interface PendingFold {
   edits: ContextEditEntryDraft[];
   /** The notes the fold covers, as its result holds them under its own note. */
   carried?: string;
+  /** The images that stood in the results of those notes, which the result takes over. */
+  images?: ImageContent[];
   /**
    * Set when a codemode script made the fold call: the pending fold is keyed by the script's
    * call instead, and its result carries the details, the note if the script did not print it,
