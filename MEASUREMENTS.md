@@ -357,7 +357,25 @@ What it does not show:
 - The message that asks for a merge. It was never sent: what a fold of all the notes would free, the calls that wrote them and the replies after them, came to about 13k tokens at the end of the session by a count of characters, and the message needs 12.5k, a quarter of the 50k threshold, when a prompt arrives. For most of the session it was well under that. The replays above remain the only evidence for the message.
 - A difference in cost or context. From turn 119 to 209 the model handed each request to a `fork`, 92 in all, which no other session did more than 6 times; the forks cost $0.28 of the $1.11, kept their output out of the main context, and no fold was made in those 90 turns. Peak and cost are not comparable with the other two columns.
 
-Not measured: a full session in which a merge is asked for and the notes are kept.
+A second full session, same task, model and setup, package at 17fb8c7 (n = 1, 2026-11-12), in which the message was sent once:
+
+| | Covering fold keeps the notes, second session |
+| --- | --- |
+| Quiz from context | 12 of 12 |
+| Found with `recall` | 12 of 12 |
+| Checks | 769 of 843 |
+| Peak context | 144k |
+| First request after the last fold | 85k |
+| Folds, of them covering earlier notes | 48, 13 |
+| Messages asking for a merge | 1 |
+| Calls to `fork` | 2 |
+| Cost, forks included | $1.11 |
+
+The message came at turn 146, with 116k tokens in context, when what a fold of the notes would free had reached 13k. It named `t18` as the stamp at the end of the first note, and the model folded from there in its next call: 74k tokens removed, and the 17 notes written until then kept under a new note of 385 tokens, 10.4k tokens of them at four characters a token. The next request held 33k tokens; the first request after the fold before it, 11 turns earlier, had held 49k. The 12 other covering folds were not asked for and kept 1 to 7 notes each. When the quiz was asked, the text of each of the 48 notes the agent wrote stood once among the results in context, the first note under the note of turn 146, and all 12 questions were answered from context.
+
+What this adds: one merge that was asked for, made at once from the stamp named, after which nothing the notes said was missing at the end. What it does not show: how often the model follows the message, for which the replays remain the evidence, this being one try; a second merge in one session (the calls and replies that a further one would free had come to about 11k tokens by the end, by a count of characters, under the 12.5k the message needs); or a difference in cost: $1.110 here against $1.115 in the session in which every note stood. The checks passed, 769, compare with 716 to 834 in the seven other complete sessions of this task with codemode.
+
+Not measured: a session with more than one such merge, and several sessions per rule.
 
 <br />
 
