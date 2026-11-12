@@ -601,7 +601,10 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       if (fold.tokens < SMALL_SPAN_TOKENS) folds.small++;
       if (fold.keptFrom) folds.bounded++;
       folds.noteTokens += fold.noteTokens ?? 0;
-      foldNet.set(fold.handle, Math.max(0, fold.tokens - (fold.noteTokens ?? 0)));
+      foldNet.set(
+        fold.handle,
+        Math.max(0, fold.tokens - (fold.noteTokens ?? 0) - (fold.keptTokens ?? 0))
+      );
       foldNote.set(fold.handle, fold.noteTokens ?? 0);
       if (fold.anchor?.placed !== undefined) {
         folds.anchorKnown++;

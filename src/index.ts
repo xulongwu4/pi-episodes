@@ -208,6 +208,9 @@ export default function episodes(pi: ExtensionAPI): void {
       event.parentToolCallId ||
       event.isError ||
       UNCAPPED_TOOLS.has(event.toolName) ||
+      // The result of a script that folded stands as the note, as the fold tool's own does:
+      // cut, it would get the whole note added after the cut one.
+      state.pendingFolds.get(event.toolCallId)?.script !== undefined ||
       // Details that are not an object could not also say where the rest is.
       (details !== undefined &&
         (typeof details !== 'object' || details === null || Array.isArray(details)))

@@ -21,7 +21,7 @@ export type CacheAnchor = { toolUseId: string } | { stamp: string };
 
 /**
  * The newest fold note or user message. A fold usually starts after the latest note (one
- * that starts before it merges notes, and the nudge asks for that rarely), and episodes
+ * that starts before it covers notes, and the nudge asks for that rarely), and episodes
  * usually start after a user message, so whichever is newer is the closest point
  * before the next fold that is already known. A codemode script's result counts as a note
  * only once its fold is among `applied`: until then the span it names is still in context.

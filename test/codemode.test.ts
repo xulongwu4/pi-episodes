@@ -80,7 +80,9 @@ async function createSession(
   /** Extensions whose handlers run before those of episodes. */
   before: ExtensionFactory[] = [],
   /** Tools of `extensions` to make active. */
-  tools: string[] = []
+  tools: string[] = [],
+  /** A session with a file, next to which large outputs are kept. */
+  persist = false
 ) {
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-codemode-'));
   const faux = fauxProvider();
@@ -129,7 +131,9 @@ async function createSession(
       ...tools,
       ...(mode === 'off' ? [] : ['codemode'])
     ],
-    sessionManager: SessionManager.inMemory(dir, undefined, entries),
+    sessionManager: persist
+      ? SessionManager.create(dir, join(dir, 'sessions'))
+      : SessionManager.inMemory(dir, undefined, entries),
     settingsManager: SettingsManager.inMemory({
       compaction: { enabled: false, ...compaction },
       // Pi's settings type has no slot for extension keys.
@@ -339,6 +343,195 @@ test('one fold per response, across the folds of a script', async () => {
   }
 });
 
+test('a fold keeps the notes it covers under its own as written, also through a second such fold', async () => {
+  const first = 'Ran "it".\nLearned: alpha is 7.';
+  const second = 'Ran more.\nLearned: beta is 8.';
+  const literal = (words: string) => words.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const mode of ['off', 'only'] as const) {
+    const call = (tool: string, args: Record<string, string>) => () =>
+      mode === 'only'
+        ? script(`text(JSON.stringify(await tools.${tool}(${JSON.stringify(args)})));`)
+        : fauxAssistantMessage(fauxToolCall(tool, args), { stopReason: 'toolUse' });
+    const harness = await createSession(mode, [
+      call('bash', { command: 'echo one' }),
+      call('fold', { since: 't2', note: first }),
+      call('bash', { command: 'echo two' }),
+      // From the stamp of the first note, which it covers.
+      call('fold', { since: 't3', note: second }),
+      call('bash', { command: 'echo three' }),
+      call('fold', { since: 't5', note: 'Ran the last.' }),
+      (context) => {
+        const view = conversation(context);
+        const note = text(view.at(-1)!);
+        assert.match(
+          note,
+          /covers the notes of 2 earlier folds, which follow this note as written/
+        );
+        // A script printed its own note as JSON; the notes it covers are added as they were.
+        assert.match(
+          note,
+          new RegExp(
+            `Notes of the earlier folds covered here, oldest first, as they were written:\n\n\\[note of ep-[0-9a-f]{8}, t2\\]\n${literal(first)}\n\n\\[note of ep-[0-9a-f]{8}, t3-t4\\]\n${literal(second)}\n\\[t7\\]$`
+          ),
+          mode
+        );
+        const all = view.map(text).join('\n');
+        for (const fact of ['alpha is 7', 'beta is 8', 'Ran the last']) {
+          assert.equal(all.split(fact).length - 1, 1, `${mode} ${fact}`);
+        }
+        assert.doesNotMatch(all, /echo (one|two|three)/, mode);
+        return fauxAssistantMessage('ok');
+      }
+    ]);
+    try {
+      await harness.run('go');
+      const branch = harness.session.sessionManager.getBranch();
+      const records = threadRecords(branch) as { handle: string; covers?: string[] }[];
+      assert.equal(records.length, 3, mode);
+      assert.deepEqual(records[1]!.covers, [records[0]!.handle], mode);
+      assert.deepEqual(records[2]!.covers, [records[0]!.handle, records[1]!.handle], mode);
+      // The agent wrote each note once, and a fold did not free the notes it kept.
+      const tokens = (words: string) => Math.ceil(words.length / 4);
+      const folds = episodeStats(branch, harness.dir).folds;
+      assert.equal(folds.noteTokens, tokens(first) + tokens(second) + 4, mode);
+      const spans = records as unknown as { tokens: number }[];
+      assert.deepEqual(
+        folds.each.map((fold) => [fold.note, fold.net]),
+        [
+          [tokens(first), spans[0]!.tokens - tokens(first)],
+          [tokens(second), spans[1]!.tokens - tokens(second) - tokens(first)],
+          [4, spans[2]!.tokens - 4 - tokens(first) - tokens(second)]
+        ],
+        mode
+      );
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+const dropCovered: ExtensionFactory = (pi) => {
+  pi.on('tool_result', (event) => {
+    const title = 'Notes of the earlier folds covered here';
+    const content: typeof event.content = [];
+    for (const block of event.content) {
+      const kept = block.type === 'text' ? block.text.split(`\n\n${title}`)[0]! : undefined;
+      if (block.type !== 'text' || kept === undefined) content.push(block);
+      else if (!kept.startsWith(title)) content.push({ ...block, text: kept });
+    }
+    return { content };
+  });
+};
+
+test('a fold whose result lost the notes it covers to a later handler does not take effect', async () => {
+  for (const mode of ['off', 'only'] as const) {
+    const call = (tool: string, args: Record<string, string>) => () =>
+      mode === 'only'
+        ? script(`text(await tools.${tool}(${JSON.stringify(args)}));`)
+        : fauxAssistantMessage(fauxToolCall(tool, args), { stopReason: 'toolUse' });
+    const harness = await createSession(
+      mode,
+      [
+        call('bash', { command: 'echo one' }),
+        call('fold', { since: 't2', note: 'Learned: alpha is 7.' }),
+        call('bash', { command: 'echo two' }),
+        call('fold', { since: 't3', note: 'second' }),
+        (context) => {
+          // The first note still stands, with the work after it.
+          const all = conversation(context).map(text).join('\n');
+          assert.match(all, /\[fold ep-[0-9a-f]{8}: [^\n]*\n\nLearned: alpha is 7\./, mode);
+          assert.match(all, /two\n/, mode);
+          return fauxAssistantMessage('ok');
+        }
+      ],
+      [dropCovered]
+    );
+    try {
+      await harness.run('go');
+      assert.equal(threadRecords(harness.session.sessionManager.getBranch()).length, 1, mode);
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+test('a note that a handler rewrote is kept as the handler left it', async () => {
+  const redact: ExtensionFactory = (pi) => {
+    pi.on('tool_result', (event) =>
+      event.toolName === 'fold' && !event.isError
+        ? {
+            content: event.content.map((block) =>
+              block.type === 'text'
+                ? { ...block, text: block.text.replace('The key is 42.', 'The key is [redacted].') }
+                : block
+            )
+          }
+        : undefined
+    );
+  };
+  for (const mode of ['off', 'only'] as const) {
+    const call = (tool: string, args: Record<string, string>) => () =>
+      mode === 'only'
+        ? script(`text(await tools.${tool}(${JSON.stringify(args)}));`)
+        : fauxAssistantMessage(fauxToolCall(tool, args), { stopReason: 'toolUse' });
+    const harness = await createSession(
+      mode,
+      [
+        call('bash', { command: 'echo one' }),
+        call('fold', { since: 't2', note: 'The key is 42.' }),
+        call('bash', { command: 'echo two' }),
+        call('fold', { since: 't3', note: 'second' }),
+        (context) => {
+          // What the agent wrote does not come back over the handler's text.
+          const all = conversation(context).map(text).join('\n');
+          assert.equal(all.split('The key is [redacted].').length - 1, 1, mode);
+          assert.doesNotMatch(all, /The key is 42/, mode);
+          return fauxAssistantMessage('ok');
+        }
+      ],
+      [redact]
+    );
+    try {
+      await harness.run('go');
+      assert.equal(threadRecords(harness.session.sessionManager.getBranch()).length, 2, mode);
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+test('the result of a script that folded is not cut by the output cap', async () => {
+  const note = `Learned a lot. ${'detail '.repeat(600)}end.`;
+  const harness = await createSession(
+    'only',
+    [
+      () => script('text(await tools.bash({ command: "echo one" }));'),
+      () => script(`text(await tools.fold({ since: "t2", note: ${JSON.stringify(note)} }));`),
+      (context) => {
+        const result = text(conversation(context).at(-1)!);
+        assert.equal(result.split('detail end.').length - 1, 1);
+        assert.doesNotMatch(result, /characters left out here/);
+        return fauxAssistantMessage('ok');
+      }
+    ],
+    [],
+    { outputCapChars: 2000, outputCapKeepChars: 600 },
+    {},
+    undefined,
+    [],
+    [],
+    true
+  );
+  try {
+    await harness.run('go');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(threadRecords(branch).length, 1);
+    assert.equal(episodeStats(branch, harness.dir).outputs.capped, 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test('a later fold covers a note a script left, and both spans stay recallable', async () => {
   const harness = await createSession('only', [
     () => script('text(await tools.bash({ command: "echo first-output" }));'),
@@ -348,10 +541,10 @@ test('a later fold covers a note a script left, and both spans stay recallable',
     () => script('text(await tools.fold({ since: "t1", note: "again" }));'),
     (context) => {
       const view = conversation(context);
-      assert.match(
-        text(view.at(-1)!),
-        /covers the notes of earlier folds; .*ep-[0-9a-f]+ \(first\)/
-      );
+      // The script printed its own note; the note it covers is added once, as written.
+      const note = text(view.at(-1)!);
+      assert.match(note, /covers the note of an earlier fold, which follows this note as written/);
+      assert.equal(note.match(/\[note of ep-[0-9a-f]+, t1-t2\]\nfirst\n/g)?.length, 1);
       assert.doesNotMatch(view.slice(0, -1).map(text).join('\n'), /\bfirst\b|echo two/);
       return script('text(await tools.recall({ query: "first-output" }));');
     },
@@ -1156,11 +1349,16 @@ test('a nudge on the next prompt leads to a fold from the earliest stamp', async
 
 test('once notes take up room, the nudge names the earliest of them to merge them, close to compaction or not', async () => {
   const long = `Printed a long line. ${'detail '.repeat(400)}`;
+  // A note of 300 tokens: with its call it is over a quarter of the threshold, and a fold
+  // that covers it keeps it and frees less than that.
+  const medium = `Printed a long line. ${'detail '.repeat(170)}`;
   // Far from compaction a run is nudged at twice the threshold. The note is at t3.
   for (const [note, since, merges, reserveTokens, size] of [
     ['Printed a long line.', 't4', false, 127_000, 4000],
+    [medium, 't4', false, 127_000, 4000],
     [long, 't3', true, 127_000, 4000],
     ['Printed a long line.', 't4', false, 16_384, 17_000],
+    [medium, 't4', false, 16_384, 17_000],
     [long, 't3', true, 16_384, 17_000]
   ] as const) {
     const bash = () =>
@@ -1187,21 +1385,38 @@ test('once notes take up room, the nudge names the earliest of them to merge the
         (context) => {
           const last = nudge(context);
           assert.equal(/since "(t\d+)"/.exec(last)![1], since, note);
-          assert.equal(/which it merges/.test(last), merges, note);
-          assert.equal(/early enough to take in all your notes/.test(last), merges, note);
-          // Why it pays: Pi would compact, or the notes are sent with every request.
+          assert.equal(/under the new one as you wrote it/.test(last), merges, note);
+          // It says whose stamp that is: the note is something the agent can find.
+          assert.equal(
+            /since "t3", the stamp at the end of your note ep-[0-9a-f]{8}, early enough to take in all your notes/.test(
+              last
+            ),
+            merges,
+            note
+          );
+          // Why it pays: Pi would compact, or the calls are sent with every request.
           const pressed = reserveTokens > 100_000;
           assert.equal(/pi would compact soon otherwise/.test(last), merges && pressed, note);
-          assert.equal(/are sent again with every request/.test(last), merges && !pressed, note);
+          assert.equal(
+            /tokens, sent again with every request\)/.test(last),
+            merges && !pressed,
+            note
+          );
           return fauxAssistantMessage(fauxToolCall('fold', { since, note: 'Both lines.' }), {
             stopReason: 'toolUse'
           });
         },
-        () => fauxAssistantMessage('done')
+        (context) => {
+          // The covered note is still in context, whole, under the note of the fold asked for.
+          const view = conversation(context).map(text).join('\n');
+          if (merges) assert.equal(view.split('Both lines.')[1]?.split(note.trim()).length, 2);
+          return fauxAssistantMessage('done');
+        }
       ],
       [],
-      // A quarter of the threshold, 500 tokens, of notes and their calls is enough to merge;
-      // under pressure it is enough to nudge as well.
+      // A quarter of the threshold, 500 tokens, that a fold of the notes would free is enough
+      // to ask for it: here the call that wrote the long note, whose argument is the note again.
+      // Under pressure it is enough to nudge as well.
       { foldNudgeTokens: 2000 },
       { reserveTokens }
     );
@@ -1240,7 +1455,10 @@ test('close to compaction, work a fold left behind its note is nudged to merge w
         // It names where that work starts, not the first stamp.
         const last = text(conversation(context).at(-1)!);
         assert.match(last, /About 1k tokens of work that later folds did not cover/);
-        assert.match(last, /since "t2" and .*which it merges into one; pi would compact soon/);
+        assert.match(
+          last,
+          /since "t2" and .*under the new one as you wrote it.*; pi would compact soon otherwise\)/
+        );
         return fauxAssistantMessage('done');
       }
     ],
@@ -1283,7 +1501,10 @@ test('far from compaction, work a fold left behind its note is nudged from where
           if (nudges === 0) assert.doesNotMatch(last, /tokens of work/);
           else {
             assert.match(last, /About 2k tokens of work that later folds did not cover/);
-            assert.match(last, /with since "t2" and a note .*which it merges into one; then/);
+            assert.match(
+              last,
+              /with since "t2" and a note .*under the new one as you wrote it.* tokens\); then/
+            );
             assert.doesNotMatch(last, /pi would compact/);
           }
           return folds
@@ -1338,7 +1559,7 @@ test('the nudge for work left behind a note counts what a fold from its stamp re
         const last = text(conversation(context).at(-1)!);
         // The first note and its call, 1400 tokens, lie before t5 and are not counted.
         assert.match(last, /About 2k tokens of work that later folds did not cover .* from t5 on/);
-        assert.match(last, /since "t5" and .*\(about 2k tokens with what they left behind\)/);
+        assert.match(last, /since "t5" and .*what they left behind \(about 2k tokens\); then/);
         return fauxAssistantMessage('two');
       }
     ],
@@ -1729,7 +1950,10 @@ test('what the agent wrote after its folds is asked about with the notes it foll
           // Some of it was written before the last fold.
           assert.match(nudge, /tokens of work built up that no fold has removed, since/);
           // No stamp after the first note reaches the reply that followed it.
-          assert.match(nudge, /since "t3", early enough to take in all your notes/);
+          assert.match(
+            nudge,
+            /since "t3", the stamp at the end of your note ep-[0-9a-f]{8}, early enough to take in all your notes/
+          );
           return fauxAssistantMessage(fauxToolCall('fold', { since: 't3', note: 'All of it.' }), {
             stopReason: 'toolUse'
           });
@@ -1867,8 +2091,14 @@ test('what a script printed next to its fold counts as room its note takes, and 
       // Once new work is due for a fold, the nudge asks for one that takes in the note.
       (context) => {
         const nudge = text(conversation(context).at(-1)!);
-        assert.match(nudge, /since "t3", early enough to take in all your notes/);
-        assert.match(nudge, /about 3k tokens with what they left behind/);
+        assert.match(
+          nudge,
+          /since "t3", the stamp at the end of your note ep-[0-9a-f]{8}, early enough to take in all your notes/
+        );
+        assert.match(
+          nudge,
+          /what they left behind \(about 3k tokens, sent again with every request\)/
+        );
         return script('text(await tools.fold({ since: "t3", note: "Ran it, and printed." }));');
       },
       (context) => {

@@ -219,7 +219,11 @@ test('a fold that reaches behind the previous note merges it', async () => {
     () => fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'second' })),
     (context) => {
       const view = conversation(context);
-      assert.match(text(view.at(-1)!), /This fold covers the notes of earlier folds/);
+      // The earlier note stays, as written, under the new one.
+      assert.match(
+        text(view.at(-1)!),
+        /second\n[\s\S]*This fold covers the note of an earlier fold, which follows this note as written[\s\S]*\n\n\[note of ep-[0-9a-f]{8}, t1-t2\]\nfirst\n/
+      );
       assert.equal(view.filter((message) => message.role === 'toolResult').length, 1);
       return fauxAssistantMessage('ok');
     }
@@ -705,6 +709,49 @@ test('a fork folds with until and keeps its later work', async () => {
         text(messages.at(-1)!),
         /The turns from t\d+ on were not folded and stay above\./
       );
+      return fauxAssistantMessage('Build passes.\n- Open: none.');
+    },
+    () => fauxAssistantMessage('done')
+  ]);
+
+  try {
+    await harness.session.prompt('make it build in a fork');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a fold in a fork keeps the note it covers under its own', async () => {
+  const last = (context: Parameters<typeof conversation>[0]) => text(conversation(context).at(-1)!);
+  const stamp = (context: Parameters<typeof conversation>[0]) =>
+    /\[(t\d+)\]$/.exec(last(context))![1]!;
+  let first = '';
+  const harness = await createSession([
+    () => fauxAssistantMessage(fauxToolCall('fork', { task: 'Make the build pass.' })),
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo one' })),
+    (context) => {
+      first = stamp(context);
+      return fauxAssistantMessage(
+        fauxToolCall('fold', { since: first, note: 'Ran one.\nLearned: alpha is 7.' })
+      );
+    },
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo two' })),
+    (context) => {
+      // From the stamp of the first note, two before this result's.
+      const since = `t${Number(stamp(context).slice(1)) - 1}`;
+      return fauxAssistantMessage(fauxToolCall('fold', { since, note: 'second' }));
+    },
+    (context) => {
+      const messages = conversation(context);
+      assert.match(
+        last(context),
+        new RegExp(
+          `second\n[\\s\\S]*\n\n\\[note of ep-[0-9a-f]{8}, ${first}\\]\nRan one\\.\nLearned: alpha is 7\\.\n`
+        )
+      );
+      assert.equal(messages.map(text).join('\n').split('alpha is 7').length - 1, 1);
       return fauxAssistantMessage('Build passes.\n- Open: none.');
     },
     () => fauxAssistantMessage('done')

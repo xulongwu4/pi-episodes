@@ -64,16 +64,27 @@ export interface FoldDetails {
   keptUserTurns: string[];
   /** First stamp kept after the span, when the fold stopped before the call that made it. */
   keptFrom?: string;
-  /** Handles of earlier folds whose notes were inside the span. */
+  /**
+   * Handles of the earlier folds whose notes this fold's note stands for, oldest first: those
+   * inside the span and those kept under each of them.
+   */
   covers?: string[];
+  /**
+   * The note as the agent wrote it, which a later fold that covers this one keeps under its
+   * own while the note's result still holds it. Absent for a fold made before notes were
+   * recorded.
+   */
+  note?: string;
   /** Absolute paths touched or changed inside the span. */
   files: string[];
   /** Working tree at fold time, to tell later readers which of `files` changed since. */
   treeAfter?: string;
   /** Files the span only read, not changed. */
   readOnly?: string[];
-  /** Estimated tokens of the note that replaced the span. */
+  /** Estimated tokens of the note the agent wrote for the span. */
   noteTokens?: number;
+  /** Estimated tokens of the earlier notes kept under it, which the fold did not free. */
+  keptTokens?: number;
   /**
    * Set when the user asked for the fold with /fold: `since` when they picked where the span
    * starts, `request` when the agent picked. Absent for folds the agent chose on its own.

@@ -5,7 +5,10 @@ import {
   estimateTokens as estimateMessageTokens,
   type ProjectedSessionEntry
 } from '@earendil-works/pi-coding-agent';
+import { foldNoteDetails } from './archive.js';
 import {
+  coveredNotes,
+  coveredTokens,
   foldBoundary,
   foldInstruction,
   foldStart,
@@ -17,7 +20,7 @@ import {
 } from './fold.js';
 import { estimateTokens } from './messages.js';
 import { episodesSettings } from './settings.js';
-import { stampLabel } from './stamps.js';
+import { readStamp, stampLabel } from './stamps.js';
 
 export const NUDGE_TYPE = 'episodes-nudge';
 
@@ -50,18 +53,19 @@ export function nudgeGrowth(entries: readonly ProjectedSessionEntry[], notes = t
 }
 
 /**
- * Tokens that a fold from `start`, by default where a fold that merges the notes starts, could
- * remove and a fold from the earliest stamp after the latest note could not: the notes with
- * the calls that wrote them, work a fold that started later left behind them, and what stands
- * between a note and the next stamp, such as the reply that followed its fold, also after the
- * latest note.
+ * Tokens that a fold from `start`, by default where a fold that covers the notes starts, could
+ * free and a fold from the earliest stamp after the latest note could not: the calls that
+ * wrote the notes, work a fold that started later left behind them, and what stands between
+ * a note and the next stamp, such as the reply that followed its fold, also after the latest
+ * note. Not the notes themselves: the fold keeps them as written under its own.
  */
 export function tokensBehindNote(
   entries: readonly ProjectedSessionEntry[],
   start = mergeStart(entries)
 ): number {
   if (!start || start.index > foldBoundary(entries)) return 0;
-  return foldableTokens(entries.slice(start.index, foldStart(entries)?.index));
+  const span = entries.slice(start.index, foldStart(entries)?.index);
+  return Math.max(0, foldableTokens(span) - coveredTokens(coveredNotes(entries, span)));
 }
 
 /**
@@ -88,6 +92,21 @@ function dueBehindNote(
   if (decided < 0) return true;
   const { folded, left: since } = workSince(entries, decided);
   return folded || foldableTokens(since) >= quarter;
+}
+
+/**
+ * Says whose stamp a fold of the notes starts at, when it is a note's. Asked to fold from a
+ * stamp far back, one model answered more than once that the stamp was behind a compaction
+ * and folded its last request instead; the note is something it can find in its context.
+ */
+function noteAt(entries: readonly ProjectedSessionEntry[], stamp: number): string {
+  for (const entry of entries) {
+    const message = entry.messages[0];
+    if (!message || readStamp(message) !== stamp) continue;
+    const fold = foldNoteDetails(message);
+    return fold ? `, the stamp at the end of your note ${fold.handle}` : '';
+  }
+  return '';
 }
 
 function foldableTokens(entries: readonly ProjectedSessionEntry[]): number {
@@ -138,12 +157,13 @@ function continues(message: AssistantMessage): boolean {
  * A model that folds only its last request would otherwise not be asked about the work
  * before it until pi compacts; and asked then to fold from the first stamp of a long session,
  * one model did not, where it did fold from the stamp its unfolded work started at. Notes
- * take up room as well: each stays with the call that wrote it, and a session that folds on
- * every nudge can stay far from compaction, where alone they were merged at first. In one
- * of 302 turns, 32 notes and their calls were 49k of the 124k tokens in context at the end.
- * So once a quarter of the threshold sits up to the first stamp after the latest note, the
- * nudge for new work names `mergeStart`, the earliest note as a rule, and asks for one
- * note in place of all.
+ * take up room as well: each stays with the call that wrote it, whose argument is the note
+ * again, and a session that folds on every nudge can stay far from compaction, where alone
+ * they were merged at first. In one of 302 turns, 32 notes were 29k and their calls 20k of
+ * the 124k tokens in context at the end. A fold that covers notes keeps them as written
+ * (`coveredNotes` says why) and frees the rest. So once a quarter of the threshold that such
+ * a fold would free sits up to the first stamp after the latest note, the nudge for new work
+ * names `mergeStart`, the earliest note as a rule.
  * It is appended, never edited in, so the cached prefix is untouched.
  */
 export function registerNudge(pi: ExtensionAPI): void {
@@ -186,10 +206,10 @@ export function registerNudge(pi: ExtensionAPI): void {
     const start = stranded
       ? `with since "${since}"`
       : merge
-        ? `with since "${since}", early enough to take in all your notes,`
+        ? `with since "${since}"${noteAt(entries, earliest.stamp)}, early enough to take in all your notes,`
         : `with since "${since}", the earliest stamp you can fold from,`;
     const covering = merge
-      ? `a note covering everything from there, including the notes of ${stranded ? 'the folds made since' : 'earlier folds there'} (about ${k(behind)}k tokens with what they left behind), which it merges into one${pressed ? '; pi would compact soon otherwise' : stranded ? '' : ': the notes and the calls that wrote them are sent again with every request'}`
+      ? `a note covering everything from there that your notes do not say already: the fold keeps each note of ${stranded ? 'the folds made since' : 'earlier folds there'} under the new one as you wrote it, and removes the calls that wrote them and what they left behind (about ${k(behind)}k tokens${pressed ? '; pi would compact soon otherwise' : stranded ? '' : ', sent again with every request'})`
       : 'a note covering everything from there';
     return (
       lead +

@@ -26,7 +26,7 @@ import { anchorGapTokens } from './cache.js';
 import { type FoldRejection, recordEvent } from './events.js';
 import { estimateTokens, readOnlyPaths, skillPaths, textOf, touchedPaths } from './messages.js';
 import type { DiskChange } from './snapshots.js';
-import { parseStamp, readStamp, stampLabel, unstampedText } from './stamps.js';
+import { isStampBlock, parseStamp, readStamp, stampLabel, unstampedText } from './stamps.js';
 import type { EpisodeState } from './state.js';
 import { episodeStats, statsLines } from './stats.js';
 import { foldRenderers, formatTokens, refreshStatus } from './ui.js';
@@ -56,10 +56,22 @@ export interface FoldPlan {
   before: AgentMessage[];
   sent: AgentMessage[];
   keptUserTurns: string[];
-  /** Earlier fold notes inside the span, which the new note stands for from now on. */
-  covers: { handle: string; headline: string }[];
+  /** The notes of earlier folds that the new note stands for from now on, oldest first. */
+  covers: CoveredNote[];
   edits: ContextEditEntryDraft[];
 }
+
+/** The note of an earlier fold, as a later fold that covers it keeps it. */
+export interface CoveredNote {
+  handle: string;
+  /** The stamps its span ran over, such as "t13-t20". */
+  range: string;
+  /** What the note said, as it stood in context when it was covered. */
+  text: string;
+}
+
+const KEPT_TITLE = 'Notes of the earlier folds covered here, oldest first, as they were written:';
+const KEPT_HEAD = /^\[note of (ep-[0-9a-f]{8}), ([^\]\n]*)\]$/;
 
 function entryMessage(entry: ProjectedSessionEntry): AgentMessage | undefined {
   return entry.sourceEntry.type === 'message' ? entry.sourceEntry.message : undefined;
@@ -78,6 +90,99 @@ function isFoldNote(entry: ProjectedSessionEntry, applied: ReadonlySet<string>):
   const details = foldNoteDetails(entryMessage(entry));
   // A note whose edits never landed left its span in context; it is not a boundary.
   return details !== undefined && applied.has(details.handle);
+}
+
+/**
+ * A note's result as it stands in context: its own text, and the notes kept under it, which
+ * `renderCovered` wrote at the end of one of its text blocks. A block that only quotes the
+ * title, with other text before the first note under it, is all the note's own.
+ */
+function standing(content: readonly (TextContent | ImageContent)[]): {
+  own: string;
+  kept: CoveredNote[];
+} {
+  const own: string[] = [];
+  let kept: CoveredNote[] = [];
+  content.forEach((block, index) => {
+    if (block.type !== 'text' || (index === content.length - 1 && isStampBlock(block))) return;
+    // The last title in the block: a note can quote it, and the kept notes follow the note.
+    const last = block.text.lastIndexOf(`\n\n${KEPT_TITLE}`);
+    const at = kept.length > 0 ? -1 : last >= 0 ? last : block.text.startsWith(KEPT_TITLE) ? 0 : -1;
+    const under: CoveredNote[] = [];
+    let whole = at >= 0;
+    if (whole) {
+      const lines = block.text.slice(block.text.indexOf(KEPT_TITLE, at) + KEPT_TITLE.length);
+      for (const line of lines.split('\n')) {
+        const head = KEPT_HEAD.exec(line);
+        const last = under.at(-1);
+        if (head) under.push({ handle: head[1]!, range: head[2]!, text: '' });
+        else if (last) last.text += `${line}\n`;
+        else if (line.trim()) whole = false;
+      }
+    }
+    if (!whole || under.length === 0) {
+      own.push(block.text);
+      return;
+    }
+    if (at > 0) own.push(block.text.slice(0, at));
+    kept = under.map((note) => ({ ...note, text: note.text.trim() }));
+  });
+  return { own: own.join('\n').trim(), kept };
+}
+
+/**
+ * The notes a fold of `span` covers, in the order they were written: the applied notes inside
+ * it and the notes each of them kept. The fold keeps them under its own note, so covering a
+ * note loses nothing it said. Left to write one note in place of many, one model wrote 400
+ * to 800 tokens whatever the note covered: over three such merges in a session of 302 turns
+ * the facts of its first note went, and it answered 2 of 12 questions from context where it
+ * answered 12 with every note standing.
+ *
+ * What is kept is read from the note's result as it stands in context, not from a record: a
+ * handler or another extension may have changed it since, and the notes under it are there
+ * and nowhere else in context. The note's own text is the one the agent wrote when the result
+ * still holds it, plain or as a script printed it; otherwise all of the result but the notes
+ * under it, which is also what a fold made before notes were recorded gets.
+ */
+export function coveredNotes(
+  entries: readonly ProjectedSessionEntry[],
+  span: readonly ProjectedSessionEntry[],
+  applied: ReadonlySet<string> = appliedFolds(entries.map((entry) => entry.sourceEntry))
+): CoveredNote[] {
+  if (!span.some((entry) => isFoldNote(entry, applied))) return [];
+  // Where a note stands on the branch is when it was written: a fold with `until` can cover a
+  // note older than one that precedes it in the span.
+  const written = new Map<string, number>();
+  entries.forEach((entry, index) => {
+    const fold = foldNoteDetails(entryMessage(entry));
+    if (fold) written.set(fold.handle, index);
+  });
+  const covered = new Map<string, { note: CoveredNote; at: number }>();
+  for (const entry of span) {
+    const shown = entry.messages[0];
+    const fold = isFoldNote(entry, applied) ? foldNoteDetails(entryMessage(entry)) : undefined;
+    if (!fold || shown?.role !== 'toolResult') continue;
+    const { own, kept } = standing(shown.content);
+    const at = written.get(fold.handle) ?? 0;
+    for (const note of kept) {
+      if (!covered.has(note.handle))
+        covered.set(note.handle, { note, at: written.get(note.handle) ?? at });
+    }
+    covered.set(fold.handle, {
+      note: {
+        handle: fold.handle,
+        range: fold.until ? `${fold.since}-${fold.until}` : fold.since,
+        text: fold.note !== undefined && holdsNote(shown.content, fold.note) ? fold.note : own
+      },
+      at
+    });
+  }
+  return [...covered.values()].sort((a, b) => a.at - b.at).map(({ note }) => note);
+}
+
+/** Estimated tokens of the notes a fold keeps as written: what covering them does not free. */
+export function coveredTokens(covers: readonly CoveredNote[]): number {
+  return covers.reduce((sum, fold) => sum + Math.ceil(fold.text.length / 4), 0);
 }
 
 const CAPPED =
@@ -128,8 +233,8 @@ const PREVIEW_WIDTH = 72;
 
 /**
  * Index of the latest compaction, or with `notes` of the latest applied fold note too. No fold
- * reaches back past a compaction; one that reaches back to a note merges it, which the nudge
- * asks for only when notes take up room.
+ * reaches back past a compaction; one that reaches back to a note covers it and keeps it under
+ * its own, which the nudge asks for only when what stands around the notes takes up room.
  */
 export function foldBoundary(entries: readonly ProjectedSessionEntry[], notes = true): number {
   const applied = appliedFolds(entries.map((entry) => entry.sourceEntry));
@@ -209,7 +314,7 @@ function* stampedStarts(
 }
 
 /**
- * Where a fold that merges the notes in context starts: at the earliest thing behind the
+ * Where a fold that covers the notes in context starts: at the earliest thing behind the
  * latest note that a fold removes or cuts, which is the earliest note unless work was left
  * before it. A fold from an earlier stamp removes no more, since user messages stay; and one
  * model, asked to fold from the first stamp of a long session, would not, where it did fold
@@ -668,7 +773,6 @@ export function planFold(
   const omitted: AgentMessage[] = [];
   const keptUserTurns: string[] = [];
   const laterStamps: number[] = [];
-  const covers: { handle: string; headline: string }[] = [];
   let reachedResponse = false;
 
   for (const entry of span) {
@@ -681,8 +785,6 @@ export function planFold(
       if (stamp !== undefined) laterStamps.push(stamp);
     }
 
-    const covered = isFoldNote(entry, applied) ? foldNoteDetails(message) : undefined;
-    if (covered) covers.push({ handle: covered.handle, headline: covered.headline });
     const edit = entryEdit(entry, handle);
     if (edit) edits.push(edit);
     if (message?.role === 'user' && projected.role === 'user') {
@@ -717,7 +819,7 @@ export function planFold(
     before: entries.slice(0, startIndex).flatMap((entry) => entry.messages),
     sent: entries.slice(0, foldIndex).flatMap((entry) => entry.messages),
     keptUserTurns,
-    covers,
+    covers: coveredNotes(entries, span, applied),
     edits
   };
 }
@@ -787,7 +889,7 @@ export function renderNote(options: {
   keptUserTurns: readonly string[];
   /** First turn kept after the span, when the fold stopped before the call. */
   keptFrom?: string | undefined;
-  covers?: readonly { handle: string; headline: string }[];
+  covers?: readonly CoveredNote[];
   /** Skill files read inside the span. */
   skills?: readonly string[];
   cwd: string;
@@ -813,7 +915,7 @@ export function renderNote(options: {
   if (options.covers?.length) {
     lines.push(
       '',
-      `This fold covers the notes of earlier folds; recall and ask still reach their spans by handle: ${options.covers.map((fold) => `${fold.handle} (${fold.headline})`).join('; ')}.`
+      `This fold covers ${options.covers.length === 1 ? 'the note of an earlier fold, which follows' : `the notes of ${options.covers.length} earlier folds, which follow`} this note as written; recall and ask still reach ${options.covers.length === 1 ? 'its span' : 'their spans'} by handle.`
     );
   }
 
@@ -829,6 +931,15 @@ export function renderNote(options: {
     `To go back: recall("<exact words>") searches this span; ask("${options.handle}", "<question>") asks it.`
   );
   return lines.join('\n');
+}
+
+/** The notes a fold covers, to stand under its own; `standing` reads them back. */
+export function renderCovered(covers: readonly CoveredNote[]): string | undefined {
+  if (covers.length === 0) return undefined;
+  return [
+    KEPT_TITLE,
+    ...covers.flatMap((fold) => ['', `[note of ${fold.handle}, ${fold.range}]`, fold.text.trim()])
+  ].join('\n');
 }
 
 const FoldParams = Type.Object({
@@ -998,6 +1109,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         files: [...files]
       };
       if (plan.covers.length > 0) details.covers = plan.covers.map((fold) => fold.handle);
+      details.note = note;
       if (keptFrom) details.keptFrom = keptFrom;
       if (treeAfter) details.treeAfter = treeAfter;
       const open = openItems(note);
@@ -1009,6 +1121,9 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       );
       if (readOnly.length > 0) details.readOnly = readOnly;
       details.noteTokens = Math.ceil(note.length / 4);
+      // The notes it covers stay in context under it: the agent did not write them again, and
+      // the fold did not free them.
+      if (plan.covers.length > 0) details.keptTokens = coveredTokens(plan.covers);
       if (manual) details.manual = manual;
       const gapTokens = anchorGapTokens(
         plan.sent,
@@ -1035,6 +1150,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         skills: skillPaths(plan.spanMessages, state.cwd),
         cwd: state.cwd
       });
+      const carried = renderCovered(plan.covers);
       // Snapshots take time; a run aborted meanwhile, or already settled, must not get edits.
       if (signal?.aborted || run !== state.run) throw new Error('The fold was cancelled.');
       // A fold from a script takes effect with the script's result, which then stands as the
@@ -1044,6 +1160,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         messages: plan.omitted.length,
         tokens,
         edits: plan.edits,
+        ...(carried ? { carried } : {}),
         ...(scriptCall ? { script: { foldCallId: toolCallId, note: text, details } } : {})
       });
 
@@ -1051,7 +1168,10 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       // does not pass this on from a script, so a /fold done there does not end the run.
       const terminate = manual !== undefined;
 
-      return { content: [{ type: 'text', text }], details, terminate };
+      // A script gets its own note only. The notes it covers are added to the script's result:
+      // printed by the script they would be there twice, or cut where codemode cuts long output.
+      const shown = carried && !scriptCall ? `${text}\n\n${carried}` : text;
+      return { content: [{ type: 'text', text: shown }], details, terminate };
     }
   });
 
@@ -1078,11 +1198,12 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     pending.script.note = note;
   });
   // A fold from a script takes effect only if the script succeeds. Its result then carries the
-  // fold's details, and the note too when the script did not print it, written once with the
-  // result rather than edited in later.
+  // fold's details, the note too when the script did not print it, and the notes the fold
+  // covers, written once with the result rather than edited in later.
   pi.on('tool_result', (event) => {
     if (event.parentToolCallId) return undefined;
-    const script = state.pendingFolds.get(event.toolCallId)?.script;
+    const pending = state.pendingFolds.get(event.toolCallId);
+    const script = pending?.script;
     if (!script) return undefined;
     if (event.isError) {
       state.pendingFolds.delete(event.toolCallId);
@@ -1093,8 +1214,12 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         ? event.details
         : {};
     const details = { ...own, [FOLD_DETAILS_KEY]: script.details };
-    if (holdsNote(event.content, script.note)) return { details };
-    const content = [...event.content, { type: 'text' as const, text: script.note }];
+    const added = [
+      ...(holdsNote(event.content, script.note) ? [] : [script.note]),
+      ...(pending.carried ? [pending.carried] : [])
+    ];
+    if (added.length === 0) return { details };
+    const content = [...event.content, ...added.map((text) => ({ type: 'text' as const, text }))];
     return event.structuredContent === undefined
       ? { content, details }
       : { content, details, structuredContent: event.structuredContent };
@@ -1109,12 +1234,15 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       .filter((result) => !result.isError)
       .flatMap((result) => {
         const pending = state.pendingFolds.get(result.toolCallId);
-        // A later hook may have rewritten the script's result; without the note in it, the
-        // span would leave with nothing in its place.
-        const stands = pending?.script
-          ? foldNoteDetails(result)?.handle === pending.handle &&
-            holdsNote(result.content, pending.script.note)
-          : result.toolName === FOLD_TOOL;
+        // A later hook may have rewritten the result. Without the note in a script's result,
+        // the span would leave with nothing in its place; without the notes the fold covers,
+        // those would leave with it.
+        const stands =
+          (pending?.script
+            ? foldNoteDetails(result)?.handle === pending.handle &&
+              holdsNote(result.content, pending.script.note)
+            : result.toolName === FOLD_TOOL) &&
+          (pending?.carried === undefined || textOf(result.content).includes(pending.carried));
         if (!pending || !stands) return [];
         state.pendingFolds.delete(result.toolCallId);
         // An earlier handler that removes the note leaves nothing to stand for the span.

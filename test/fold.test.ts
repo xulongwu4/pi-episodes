@@ -14,12 +14,14 @@ import {
 } from '../src/archive.js';
 import {
   completeCutShortFolds,
+  coveredTokens,
   cutShortFold,
   foldableTurns,
   headline,
   mergeStart,
   openItems,
   planFold,
+  renderCovered,
   renderNote,
   USER_TEXT_CAP,
   unfoldedBehindNote,
@@ -592,25 +594,26 @@ test('growth counts the work after a note and what was written after its fold, a
   apply(manager, plan.edits);
   manager.appendMessage({
     ...result('f', 'fold', 'n'.repeat(8000), 3),
-    details: { kind: 'fold', handle: plan.handle, headline: 'note' }
+    details: { kind: 'fold', handle: plan.handle, headline: 'note', note: 'n'.repeat(8000) }
   } as Message);
   manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
-  // The note and its call, 2,000 tokens each, take up room and are not work.
+  // The note and its call, 2,000 tokens each, are not work. A fold that covers the note
+  // keeps it as written, so it frees the call only.
   assert.equal(nudgeGrowth(entries(), false), 0);
-  near(tokensBehindNote(entries()), 4000);
+  near(tokensBehindNote(entries()), 2000);
 
   // The reply after the fold has no stamp of its own: only a fold from the note's reaches it.
   manager.appendMessage(assistant('r'.repeat(4000)));
   assert.equal(nudgeGrowth(entries()), 0);
   near(nudgeGrowth(entries(), false), 1000);
-  near(tokensBehindNote(entries()), 5000);
+  near(tokensBehindNote(entries()), 3000);
 
   // The first stamp after the note is on a result; the span starts at the call that made it.
   manager.appendMessage(assistant(call('b', 'bash', { command: 'x'.repeat(4000) })));
   manager.appendMessage(result('b', 'bash', 'out', 4));
   near(nudgeGrowth(entries()), 1000);
   near(nudgeGrowth(entries(), false), 2000);
-  near(tokensBehindNote(entries()), 5000);
+  near(tokensBehindNote(entries()), 3000);
 });
 test('work behind a note starts at the stamp a fold of it needs, whatever stands around it', () => {
   // A fold from `since`, applied, with its note at `stamp`.
@@ -755,7 +758,7 @@ test('work since an entry is told from folding itself and from what other extens
 function earlierFold(applied: boolean) {
   const note = {
     ...result('f0', 'fold', 'first note', 3),
-    details: { kind: 'fold', handle: 'ep-0', headline: 'first note' }
+    details: { kind: 'fold', handle: 'ep-0', headline: 'first note', since: 't2' }
   };
   const { manager } = session([
     user('go', 1),
@@ -779,7 +782,8 @@ test('a fold reaching behind an earlier fold note covers it', () => {
   const entries = earlierFold(true);
 
   const merged = planFold(entries, 'f1', 2);
-  assert.deepEqual(merged.covers, [{ handle: 'ep-0', headline: 'first note' }]);
+  // Recorded without its text, the note is kept as its result stands.
+  assert.deepEqual(merged.covers, [{ handle: 'ep-0', range: 't2', text: 'first note' }]);
   assert.equal(merged.anchorStamp, 1);
   // The note's own stamp starts the span at the response that called the earlier fold.
   assert.deepEqual(
@@ -789,6 +793,139 @@ test('a fold reaching behind an earlier fold note covers it', () => {
   const after = planFold(entries, 'f1', 4);
   assert.deepEqual(after.covers, []);
   assert.equal(after.anchorStamp, 3);
+});
+
+test('a fold keeps the notes it covers and the notes under them, each once and as it stands', () => {
+  const { manager } = session([
+    user('go', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'alpha-out', 2)
+  ]);
+  let stamp = 2;
+  // Each fold starts at the stamp of the note before it.
+  let from = 2;
+  // A result as the fold tool writes it: the note between harness lines, then the notes kept.
+  const body = (handle: string, note: string) =>
+    `[fold ${handle}: archived]\n\n${note}\n\nTo go back: recall.`;
+  const fold = (id: string, note: string, options: { shown?: string; recorded?: boolean } = {}) => {
+    const since = from;
+    manager.appendMessage(assistant(call(id, 'fold')));
+    const plan = planFold(manager.buildSessionProjection().entries, id, since);
+    const kept = renderCovered(plan.covers);
+    const text = body(plan.handle, options.shown ?? note);
+    manager.appendMessage({
+      ...result(id, 'fold', kept ? `${text}\n\n${kept}` : text, ++stamp),
+      details: {
+        kind: 'fold',
+        handle: plan.handle,
+        headline: id,
+        since: `t${since}`,
+        ...(stamp - 1 === since ? {} : { until: `t${stamp - 1}` }),
+        covers: plan.covers.map((covered) => covered.handle),
+        ...(options.recorded === false ? {} : { note })
+      }
+    } as Message);
+    apply(manager, plan.edits);
+    manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
+    from = stamp;
+    manager.appendMessage(assistant(call(`${id}-work`, 'bash')));
+    manager.appendMessage(result(`${id}-work`, 'bash', 'out', ++stamp));
+    return plan;
+  };
+
+  const alpha = 'Learned: alpha is 7.\n\nOpen: none.';
+  const first = fold('f1', alpha);
+  const second = fold('f2', 'Learned: beta is 8.');
+  const third = fold('f3', 'third');
+  assert.deepEqual(first.covers, []);
+  assert.deepEqual(second.covers, [{ handle: first.handle, range: 't2', text: alpha }]);
+  // The first note is out of context by now: it is read from under the second.
+  const two = [
+    { handle: first.handle, range: 't2', text: alpha },
+    { handle: second.handle, range: 't3-t4', text: 'Learned: beta is 8.' }
+  ];
+  assert.deepEqual(third.covers, two);
+  assert.equal(
+    renderCovered(third.covers),
+    [
+      'Notes of the earlier folds covered here, oldest first, as they were written:',
+      '',
+      `[note of ${first.handle}, t2]`,
+      alpha,
+      '',
+      `[note of ${second.handle}, t3-t4]`,
+      'Learned: beta is 8.'
+    ].join('\n')
+  );
+  assert.equal(coveredTokens(third.covers), Math.ceil(alpha.length / 4) + 5);
+  assert.equal(renderCovered([]), undefined);
+
+  // A note that a handler rewrote, and one of a fold made before notes were recorded, are
+  // kept as their results stand: what the agent wrote does not come back over the handler's
+  // text, and nothing of the older fold's result is dropped.
+  const fourth = fold('f4', 'The key is 42.', { shown: 'The key is [redacted].' });
+  const fifth = fold('f5', 'An older note.', { recorded: false });
+  const sixth = fold('f6', 'sixth');
+  assert.deepEqual(sixth.covers, [
+    ...two,
+    { handle: third.handle, range: 't5-t6', text: 'third' },
+    { handle: fourth.handle, range: 't7-t8', text: body(fourth.handle, 'The key is [redacted].') },
+    { handle: fifth.handle, range: 't9-t10', text: body(fifth.handle, 'An older note.') }
+  ]);
+
+  // A note that quotes the title of the kept notes, with its own words after it, is one note.
+  const quoting =
+    'Saw this in a note:\n\nNotes of the earlier folds covered here, oldest first, as they were written:\n\nand nothing under it.';
+  fold('f7', quoting, { recorded: false });
+  const eighth = fold('f8', 'eighth');
+  assert.equal(eighth.covers.length, 7);
+  assert.ok(eighth.covers.at(-1)!.text.includes(quoting));
+});
+
+test('kept notes stand in the order they were written, also when a fold with until kept an older one', () => {
+  const { manager } = session([user('go', 1)]);
+  let stamp = 1;
+  const work = (id: string) => {
+    manager.appendMessage(assistant(call(id, 'bash')));
+    manager.appendMessage(result(id, 'bash', 'out', ++stamp));
+  };
+  const fold = (id: string, since: number, until?: number) => {
+    manager.appendMessage(assistant(call(id, 'fold')));
+    const plan = planFold(
+      manager.buildSessionProjection().entries,
+      id,
+      since,
+      until === undefined ? {} : { until }
+    );
+    manager.appendMessage({
+      ...result(id, 'fold', [`${id} text`, renderCovered(plan.covers) ?? ''].join('\n\n'), ++stamp),
+      details: {
+        kind: 'fold',
+        handle: plan.handle,
+        headline: id,
+        since: `t${since}`,
+        covers: plan.covers.map((covered) => covered.handle),
+        note: id
+      }
+    } as Message);
+    apply(manager, plan.edits);
+    manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
+    return plan;
+  };
+  work('a');
+  fold('oldest', 2);
+  work('b');
+  fold('middle', 4);
+  // Covers the oldest note only, and stands after the middle one.
+  assert.deepEqual(
+    fold('newest', 3, 3).covers.map((covered) => covered.text),
+    ['oldest']
+  );
+  // From the stamp of the middle note: it comes first in the span, and was written second.
+  assert.deepEqual(
+    fold('last', 5).covers.map((covered) => covered.text),
+    ['oldest', 'middle', 'newest']
+  );
 });
 
 test('a fold over a span that an earlier fold with until emptied holds only what it removed', async () => {

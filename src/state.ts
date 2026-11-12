@@ -10,10 +10,12 @@ export interface PendingFold {
   messages: number;
   tokens: number;
   edits: ContextEditEntryDraft[];
+  /** The notes the fold covers, as its result holds them under its own note. */
+  carried?: string;
   /**
    * Set when a codemode script made the fold call: the pending fold is keyed by the script's
-   * call instead, and its result carries the details and, if the script did not print it, the
-   * note.
+   * call instead, and its result carries the details, the note if the script did not print it,
+   * and the notes the fold covers.
    */
   script?: { foldCallId: string; note: string; details: FoldDetails };
 }
