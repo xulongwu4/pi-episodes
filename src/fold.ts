@@ -163,12 +163,19 @@ function standing(
  * happens to hold them.
  */
 function holdsOwnNote(own: string, handle: string, note: string): boolean {
-  const head = own.indexOf(`[fold ${handle}: `);
-  const from = head < 0 ? -1 : own.indexOf(']', head);
-  if (from < 0) return false;
-  const rest = own.slice(from + 1);
+  const line = `[fold ${handle}: `;
   const printed = JSON.stringify(note.trim()).slice(1, -1);
-  return rest.startsWith(`\n\n${note.trim()}\n\n`) || rest.startsWith(`\\n\\n${printed}\\n\\n`);
+  // Every such line: the output cap can leave the start of the note in its preview, cut
+  // short, before the whole note that the fold then added.
+  for (let head = own.indexOf(line); head >= 0; head = own.indexOf(line, head + 1)) {
+    const from = own.indexOf(']', head);
+    if (from < 0) return false;
+    const rest = own.slice(from + 1);
+    if (rest.startsWith(`\n\n${note.trim()}\n\n`) || rest.startsWith(`\\n\\n${printed}\\n\\n`)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**

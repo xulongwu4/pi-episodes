@@ -985,6 +985,18 @@ test('what does not read back as the fold wrote it is kept as it stands', () => 
     assert.equal(next.covers[0]!.text.split(fact).length - 1, 1, fact);
   }
 
+  // A result that holds the start of the note, cut short, before the whole note, as the
+  // output cap leaves a script's result: the agent's note stands for it.
+  const capped = foldChain();
+  capped('p1', 'Learned: eta is 5. And more.', {
+    edit: (text) =>
+      `${text.slice(0, 44)}\n\n[episodes] 9 of 99 characters left out here.\n\nrow row\n${text}`
+  });
+  assert.deepEqual(
+    capped('p2', 'second').covers.map((note) => note.text),
+    ['Learned: eta is 5. And more.']
+  );
+
   // Changed by one character, at the same length, the kept notes stay whole as well.
   const same = foldChain();
   same('s1', 'Learned: delta is 1.');
