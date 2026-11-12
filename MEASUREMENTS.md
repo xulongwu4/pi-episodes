@@ -335,7 +335,29 @@ The rule did what it was for, and it failed the pass condition. The facts asked 
 
 The tries span three wordings. With the first, which asked for "a note covering only the work that no note describes yet", the model folded from `t19` in 1 of 3 tries and in the others from the stamp where that work started, as the words say. With "a note covering everything from there that your notes do not say already" it did in 4 of 5; in the fifth it wrote that `t19` lay behind a compaction and folded its last request, the answer section 13 reports for `t1`. With the message also saying which note the stamp ends ("the stamp at the end of your note ep-3b4b7333") it did in 6 of 6. In one of those the model then folded once more from the stamp of the new note: a fold of 17k tokens whose note, with the 27 it kept, came to 16k.
 
-Not measured yet: a full session with the second rule.
+One full session with the second rule, same task, model and setup as the two above (package at 8b552cc, which wrote the line over a kept note without its length; n = 1, 2026-11-11):
+
+| | Every note stands | One note in place of all | Covering fold keeps the notes |
+| --- | --- | --- | --- |
+| Quiz from context | 12 of 12 | 2 of 12 | 8 of 12 |
+| Found with `recall` | 12 of 12 | 12 of 12 | 12 of 12 |
+| Checks | 802 of 843 | 797 of 843 | 801 of 843 |
+| Peak context | 197k | 112k | 141k |
+| First request after the last fold | 135k | 44k | 78k |
+| Folds, of them covering earlier notes | 39, 7 | 64, 30 | 33, 9 |
+| Messages asking for a merge | 0 | 3 | 0 |
+| Calls to `fork` | 0 | 6 | 92 |
+| Cost, forks included | $1.12 | $1.01 | $1.11 |
+
+What it shows: the 9 covering folds, none of them asked for, each started at the stamp of the note before it and kept that note with the ones already kept under it, up to 3; at the end the text of each of the 33 notes the agent wrote stood in context once. Under the first rule 27 such folds each left a short note about the last request in place of the note before it, and 7 did in the session where every note was meant to stand.
+
+What it does not show:
+
+- That answers hold. Of the 4 questions missed, 3 asked for values that no note of this session ever held: its first note said "counts/docs basenames" where the first note of the other session gave them. The fourth, the latest commit, stood in that first note to the end, and the model answered null. So the quiz here measured what the model wrote down, which differs from one session to the next, more than what folds kept.
+- The message that asks for a merge. It was never due: what a fold of all the notes would free, the calls that wrote them and the replies after them, reached 13k tokens only at the end, against a quarter of the threshold of 12.5k. The replays above remain the only evidence for it.
+- A difference in cost or context. From turn 119 to 209 the model handed each request to a `fork`, 92 in all, which no other session did more than 6 times; the forks cost $0.28 of the $1.11, kept their output out of the main context, and no fold was made in those 90 turns. Peak and cost are not comparable with the other two columns.
+
+Not measured: a full session in which a merge is asked for and the notes are kept.
 
 <br />
 
