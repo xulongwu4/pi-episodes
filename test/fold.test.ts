@@ -959,6 +959,35 @@ test('what does not read back as the fold wrote it is kept as it stands', () => 
     { handle: fifth.handle, range: 't9-t10', text: 'The token was revoked.' }
   ]);
 
+  // A note that ends in kept notes of its own making, right to the last character, under a
+  // fold whose real kept notes no longer read back: the made-up ones are not taken for them.
+  const made = foldChain();
+  const one = made('m1', 'Learned: gamma is 9.');
+  const title = 'Notes of the earlier folds covered here, oldest first, as they were written:';
+  const quoted = `Prose before.\n\n${title}\n\n[note of ep-00000000, t1, 4 characters]\nfake`;
+  const two = made('m2', quoted);
+  const holder = made('m3', 'holder', {
+    edit: (text) => text.replace('gamma is 9', 'gamma is [redacted]')
+  });
+  const next = made('m4', 'next');
+  assert.deepEqual(
+    holder.covers.map((note) => note.handle),
+    [one.handle, two.handle]
+  );
+  assert.equal(next.covers.length, 1);
+  for (const fact of ['gamma is [redacted]', 'Prose before.', 'fake', 'holder\n']) {
+    assert.equal(next.covers[0]!.text.split(fact).length - 1, 1, fact);
+  }
+
+  // A note that is empty reads back, also as the last one.
+  const empty = foldChain();
+  empty('e1', 'x', { edit: () => '' });
+  empty('e2', 'second');
+  assert.deepEqual(
+    empty('e3', 'third').covers.map((note) => note.text),
+    ['', 'second']
+  );
+
   // A result that lost its end: the last note under it is shorter than its line says.
   const cut = foldChain();
   cut('c1', 'Learned: beta is 8.');

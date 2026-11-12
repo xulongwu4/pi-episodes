@@ -113,17 +113,21 @@ function keptUnder(text: string, at: number): CoveredNote[] | undefined {
     if (index > text.length) return undefined;
     notes.push({ handle: head[1]!, range: head[2]!, text: text.slice(start, index) });
   }
-  return notes.length > 0 ? notes : undefined;
+  return notes;
 }
 
 /**
  * A note's result as it stands in context: its own text, and the notes kept under it, which
  * `renderCovered` wrote at the end of one of its text blocks. They are taken apart only where
- * the text reads back as written, from a title to the end of its block; anything else, a note
- * that quotes the title or notes that something changed since, stays in the note's own text,
- * whole.
+ * the text reads back as written, from a title to the end of its block, as the notes of the
+ * folds in `covers`, the ones the fold recorded that it kept. Anything else stays in the
+ * note's own text, whole: a note that quotes the title, with kept notes of its own making
+ * under it or not, and kept notes that something changed since.
  */
-function standing(content: readonly (TextContent | ImageContent)[]): {
+function standing(
+  content: readonly (TextContent | ImageContent)[],
+  covers: readonly string[]
+): {
   own: string;
   kept: CoveredNote[];
 } {
@@ -131,22 +135,20 @@ function standing(content: readonly (TextContent | ImageContent)[]): {
   let kept: CoveredNote[] = [];
   content.forEach((block, index) => {
     if (block.type !== 'text' || (index === content.length - 1 && isStampBlock(block))) return;
-    const text = block.text.trimEnd();
+    const { text } = block;
     const titles = text.startsWith(KEPT_TITLE) ? [0] : [];
     const before = `\n\n${KEPT_TITLE}`;
     for (let at = text.indexOf(before); at >= 0; at = text.indexOf(before, at + 1)) {
       titles.push(at + 2);
     }
-    // The first title from which the rest reads back: the kept notes follow the note, and a
-    // title quoted in one of them comes after theirs.
-    for (const at of kept.length > 0 ? [] : titles) {
+    for (const at of kept.length > 0 || covers.length === 0 ? [] : titles) {
       const under = keptUnder(text, at);
-      if (!under) continue;
+      if (under?.map((note) => note.handle).join() !== covers.join()) continue;
       if (at > 0) own.push(text.slice(0, at));
       kept = under;
       return;
     }
-    own.push(block.text);
+    own.push(text);
   });
   return { own: own.join('\n').trim(), kept };
 }
@@ -199,12 +201,13 @@ export function coveredNotes(
     const shown = entry.messages[0];
     const fold = isFoldNote(entry, applied) ? foldNoteDetails(entryMessage(entry)) : undefined;
     if (!fold || shown?.role !== 'toolResult') continue;
-    const { own, kept } = standing(shown.content);
+    const covers = (fold.covers ?? []).filter((handle) => typeof handle === 'string');
+    const { own, kept } = standing(shown.content, covers);
     const at = written.get(fold.handle) ?? 0;
-    // A fold that kept notes of which none reads back has them in its own text still.
+    // A fold whose kept notes do not read back has them in its own text still.
     const recorded =
       fold.note !== undefined &&
-      (kept.length > 0 || !fold.covers?.length) &&
+      kept.length === covers.length &&
       holdsOwnNote(own, fold.handle, fold.note)
         ? fold.note.trim()
         : own;
