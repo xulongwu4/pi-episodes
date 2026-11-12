@@ -71,7 +71,12 @@ export interface CoveredNote {
 }
 
 const KEPT_TITLE = 'Notes of the earlier folds covered here, oldest first, as they were written:';
-const KEPT_HEAD = /^\[note of (ep-[0-9a-f]{8}), ([^\]\n]*)\]$/;
+/**
+ * The line over a kept note. It says how long the note is, so that the note is read back by
+ * length and nothing it says, a quoted title or a line like this one, can pass for the start
+ * of the next.
+ */
+const KEPT_HEAD = /\n\n\[note of (ep-[0-9a-f]{8}), ([^\]\n]*), (\d+) characters\]\n/y;
 
 function entryMessage(entry: ProjectedSessionEntry): AgentMessage | undefined {
   return entry.sourceEntry.type === 'message' ? entry.sourceEntry.message : undefined;
@@ -93,9 +98,30 @@ function isFoldNote(entry: ProjectedSessionEntry, applied: ReadonlySet<string>):
 }
 
 /**
+ * The notes under the title at `at`, when all of the text from there on is what `renderCovered`
+ * writes: each note under its line, as long as that line says.
+ */
+function keptUnder(text: string, at: number): CoveredNote[] | undefined {
+  const notes: CoveredNote[] = [];
+  let index = at + KEPT_TITLE.length;
+  while (index < text.length) {
+    KEPT_HEAD.lastIndex = index;
+    const head = KEPT_HEAD.exec(text);
+    if (!head) return undefined;
+    const start = index + head[0].length;
+    index = start + Number(head[3]);
+    if (index > text.length) return undefined;
+    notes.push({ handle: head[1]!, range: head[2]!, text: text.slice(start, index) });
+  }
+  return notes.length > 0 ? notes : undefined;
+}
+
+/**
  * A note's result as it stands in context: its own text, and the notes kept under it, which
- * `renderCovered` wrote at the end of one of its text blocks. A block that only quotes the
- * title, with other text before the first note under it, is all the note's own.
+ * `renderCovered` wrote at the end of one of its text blocks. They are taken apart only where
+ * the text reads back as written, from a title to the end of its block; anything else, a note
+ * that quotes the title or notes that something changed since, stays in the note's own text,
+ * whole.
  */
 function standing(content: readonly (TextContent | ImageContent)[]): {
   own: string;
@@ -105,29 +131,39 @@ function standing(content: readonly (TextContent | ImageContent)[]): {
   let kept: CoveredNote[] = [];
   content.forEach((block, index) => {
     if (block.type !== 'text' || (index === content.length - 1 && isStampBlock(block))) return;
-    // The last title in the block: a note can quote it, and the kept notes follow the note.
-    const last = block.text.lastIndexOf(`\n\n${KEPT_TITLE}`);
-    const at = kept.length > 0 ? -1 : last >= 0 ? last : block.text.startsWith(KEPT_TITLE) ? 0 : -1;
-    const under: CoveredNote[] = [];
-    let whole = at >= 0;
-    if (whole) {
-      const lines = block.text.slice(block.text.indexOf(KEPT_TITLE, at) + KEPT_TITLE.length);
-      for (const line of lines.split('\n')) {
-        const head = KEPT_HEAD.exec(line);
-        const last = under.at(-1);
-        if (head) under.push({ handle: head[1]!, range: head[2]!, text: '' });
-        else if (last) last.text += `${line}\n`;
-        else if (line.trim()) whole = false;
-      }
+    const text = block.text.trimEnd();
+    const titles = text.startsWith(KEPT_TITLE) ? [0] : [];
+    const before = `\n\n${KEPT_TITLE}`;
+    for (let at = text.indexOf(before); at >= 0; at = text.indexOf(before, at + 1)) {
+      titles.push(at + 2);
     }
-    if (!whole || under.length === 0) {
-      own.push(block.text);
+    // The first title from which the rest reads back: the kept notes follow the note, and a
+    // title quoted in one of them comes after theirs.
+    for (const at of kept.length > 0 ? [] : titles) {
+      const under = keptUnder(text, at);
+      if (!under) continue;
+      if (at > 0) own.push(text.slice(0, at));
+      kept = under;
       return;
     }
-    if (at > 0) own.push(block.text.slice(0, at));
-    kept = under.map((note) => ({ ...note, text: note.text.trim() }));
+    own.push(block.text);
   });
   return { own: own.join('\n').trim(), kept };
+}
+
+/**
+ * Whether a note's own text still holds what the agent wrote where the fold put it: after
+ * the line that names the fold and before a blank line, plain or as a script printed it.
+ * Finding the words anywhere would take a short note for standing inside any text that
+ * happens to hold them.
+ */
+function holdsOwnNote(own: string, handle: string, note: string): boolean {
+  const head = own.indexOf(`[fold ${handle}: `);
+  const from = head < 0 ? -1 : own.indexOf(']', head);
+  if (from < 0) return false;
+  const rest = own.slice(from + 1);
+  const printed = JSON.stringify(note.trim()).slice(1, -1);
+  return rest.startsWith(`\n\n${note.trim()}\n\n`) || rest.startsWith(`\\n\\n${printed}\\n\\n`);
 }
 
 /**
@@ -141,8 +177,9 @@ function standing(content: readonly (TextContent | ImageContent)[]): {
  * What is kept is read from the note's result as it stands in context, not from a record: a
  * handler or another extension may have changed it since, and the notes under it are there
  * and nowhere else in context. The note's own text is the one the agent wrote when the result
- * still holds it, plain or as a script printed it; otherwise all of the result but the notes
- * under it, which is also what a fold made before notes were recorded gets.
+ * still holds it where the fold put it, and the notes it kept read back; otherwise all of
+ * the result but the notes read back from under it, which is also what a fold made before
+ * notes were recorded gets. So what cannot be read back is kept as it stands, not dropped.
  */
 export function coveredNotes(
   entries: readonly ProjectedSessionEntry[],
@@ -164,6 +201,13 @@ export function coveredNotes(
     if (!fold || shown?.role !== 'toolResult') continue;
     const { own, kept } = standing(shown.content);
     const at = written.get(fold.handle) ?? 0;
+    // A fold that kept notes of which none reads back has them in its own text still.
+    const recorded =
+      fold.note !== undefined &&
+      (kept.length > 0 || !fold.covers?.length) &&
+      holdsOwnNote(own, fold.handle, fold.note)
+        ? fold.note.trim()
+        : own;
     for (const note of kept) {
       if (!covered.has(note.handle))
         covered.set(note.handle, { note, at: written.get(note.handle) ?? at });
@@ -172,7 +216,7 @@ export function coveredNotes(
       note: {
         handle: fold.handle,
         range: fold.until ? `${fold.since}-${fold.until}` : fold.since,
-        text: fold.note !== undefined && holdsNote(shown.content, fold.note) ? fold.note : own
+        text: recorded
       },
       at
     });
@@ -938,7 +982,11 @@ export function renderCovered(covers: readonly CoveredNote[]): string | undefine
   if (covers.length === 0) return undefined;
   return [
     KEPT_TITLE,
-    ...covers.flatMap((fold) => ['', `[note of ${fold.handle}, ${fold.range}]`, fold.text.trim()])
+    ...covers.flatMap((fold) => [
+      '',
+      `[note of ${fold.handle}, ${fold.range}, ${fold.text.length} characters]`,
+      fold.text
+    ])
   ].join('\n');
 }
 

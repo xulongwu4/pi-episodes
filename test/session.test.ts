@@ -222,7 +222,7 @@ test('a fold that reaches behind the previous note merges it', async () => {
       // The earlier note stays, as written, under the new one.
       assert.match(
         text(view.at(-1)!),
-        /second\n[\s\S]*This fold covers the note of an earlier fold, which follows this note as written[\s\S]*\n\n\[note of ep-[0-9a-f]{8}, t1-t2\]\nfirst\n/
+        /second\n[\s\S]*This fold covers the note of an earlier fold, which follows this note as written[\s\S]*\n\n\[note of ep-[0-9a-f]{8}, t1-t2, 5 characters\]\nfirst\n/
       );
       assert.equal(view.filter((message) => message.role === 'toolResult').length, 1);
       return fauxAssistantMessage('ok');
@@ -748,7 +748,7 @@ test('a fold in a fork keeps the note it covers under its own', async () => {
       assert.match(
         last(context),
         new RegExp(
-          `second\n[\\s\\S]*\n\n\\[note of ep-[0-9a-f]{8}, ${first}\\]\nRan one\\.\nLearned: alpha is 7\\.\n`
+          `second\n[\\s\\S]*\n\n\\[note of ep-[0-9a-f]{8}, ${first}, 29 characters\\]\nRan one\\.\nLearned: alpha is 7\\.\n`
         )
       );
       assert.equal(messages.map(text).join('\n').split('alpha is 7').length - 1, 1);

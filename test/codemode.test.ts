@@ -371,7 +371,7 @@ test('a fold keeps the notes it covers under its own as written, also through a 
         assert.match(
           note,
           new RegExp(
-            `Notes of the earlier folds covered here, oldest first, as they were written:\n\n\\[note of ep-[0-9a-f]{8}, t2\\]\n${literal(first)}\n\n\\[note of ep-[0-9a-f]{8}, t3-t4\\]\n${literal(second)}\n\\[t7\\]$`
+            `Notes of the earlier folds covered here, oldest first, as they were written:\n\n\\[note of ep-[0-9a-f]{8}, t2, ${first.length} characters\\]\n${literal(first)}\n\n\\[note of ep-[0-9a-f]{8}, t3-t4, ${second.length} characters\\]\n${literal(second)}\n\\[t7\\]$`
           ),
           mode
         );
@@ -544,7 +544,10 @@ test('a later fold covers a note a script left, and both spans stay recallable',
       // The script printed its own note; the note it covers is added once, as written.
       const note = text(view.at(-1)!);
       assert.match(note, /covers the note of an earlier fold, which follows this note as written/);
-      assert.equal(note.match(/\[note of ep-[0-9a-f]+, t1-t2\]\nfirst\n/g)?.length, 1);
+      assert.equal(
+        note.match(/\[note of ep-[0-9a-f]+, t1-t2, 5 characters\]\nfirst\n/g)?.length,
+        1
+      );
       assert.doesNotMatch(view.slice(0, -1).map(text).join('\n'), /\bfirst\b|echo two/);
       return script('text(await tools.recall({ query: "first-output" }));');
     },

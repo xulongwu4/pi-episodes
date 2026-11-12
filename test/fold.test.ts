@@ -795,26 +795,38 @@ test('a fold reaching behind an earlier fold note covers it', () => {
   assert.equal(after.anchorStamp, 3);
 });
 
-test('a fold keeps the notes it covers and the notes under them, each once and as it stands', () => {
+// A result as the fold tool writes it: the note between harness lines, then the notes kept.
+const noteBody = (handle: string, note: string) =>
+  `[fold ${handle}: archived]\n\n${note}\n\nTo go back: recall.`;
+
+/** A session in which each fold starts at the stamp of the note before it, and so covers it. */
+function foldChain() {
   const { manager } = session([
     user('go', 1),
     assistant(call('a', 'bash')),
     result('a', 'bash', 'alpha-out', 2)
   ]);
   let stamp = 2;
-  // Each fold starts at the stamp of the note before it.
   let from = 2;
-  // A result as the fold tool writes it: the note between harness lines, then the notes kept.
-  const body = (handle: string, note: string) =>
-    `[fold ${handle}: archived]\n\n${note}\n\nTo go back: recall.`;
-  const fold = (id: string, note: string, options: { shown?: string; recorded?: boolean } = {}) => {
+  return (
+    id: string,
+    note: string,
+    options: {
+      /** The note as a handler left it in the result. */
+      shown?: string;
+      recorded?: boolean;
+      /** What something did to all of the result afterwards. */
+      edit?: (text: string) => string;
+    } = {}
+  ) => {
     const since = from;
     manager.appendMessage(assistant(call(id, 'fold')));
     const plan = planFold(manager.buildSessionProjection().entries, id, since);
     const kept = renderCovered(plan.covers);
-    const text = body(plan.handle, options.shown ?? note);
+    const text = noteBody(plan.handle, options.shown ?? note);
+    const whole = kept ? `${text}\n\n${kept}` : text;
     manager.appendMessage({
-      ...result(id, 'fold', kept ? `${text}\n\n${kept}` : text, ++stamp),
+      ...result(id, 'fold', options.edit ? options.edit(whole) : whole, ++stamp),
       details: {
         kind: 'fold',
         handle: plan.handle,
@@ -832,7 +844,11 @@ test('a fold keeps the notes it covers and the notes under them, each once and a
     manager.appendMessage(result(`${id}-work`, 'bash', 'out', ++stamp));
     return plan;
   };
+}
 
+test('a fold keeps the notes it covers and the notes under them, each once and as it stands', () => {
+  const fold = foldChain();
+  const body = noteBody;
   const alpha = 'Learned: alpha is 7.\n\nOpen: none.';
   const first = fold('f1', alpha);
   const second = fold('f2', 'Learned: beta is 8.');
@@ -850,10 +866,10 @@ test('a fold keeps the notes it covers and the notes under them, each once and a
     [
       'Notes of the earlier folds covered here, oldest first, as they were written:',
       '',
-      `[note of ${first.handle}, t2]`,
+      `[note of ${first.handle}, t2, ${alpha.length} characters]`,
       alpha,
       '',
-      `[note of ${second.handle}, t3-t4]`,
+      `[note of ${second.handle}, t3-t4, 19 characters]`,
       'Learned: beta is 8.'
     ].join('\n')
   );
@@ -872,14 +888,85 @@ test('a fold keeps the notes it covers and the notes under them, each once and a
     { handle: fourth.handle, range: 't7-t8', text: body(fourth.handle, 'The key is [redacted].') },
     { handle: fifth.handle, range: 't9-t10', text: body(fifth.handle, 'An older note.') }
   ]);
+});
 
-  // A note that quotes the title of the kept notes, with its own words after it, is one note.
-  const quoting =
-    'Saw this in a note:\n\nNotes of the earlier folds covered here, oldest first, as they were written:\n\nand nothing under it.';
-  fold('f7', quoting, { recorded: false });
-  const eighth = fold('f8', 'eighth');
-  assert.equal(eighth.covers.length, 7);
-  assert.ok(eighth.covers.at(-1)!.text.includes(quoting));
+test('a note that reads like the notes kept under one stays one note, through later folds', () => {
+  const fold = foldChain();
+  const title = 'Notes of the earlier folds covered here, oldest first, as they were written:';
+  const first = fold('f1', 'Learned: alpha is 7.');
+  // A note that quotes the title, with its own words after it; one that quotes a kept note
+  // with the line over it, naming a fold that is kept too; and one that ends like kept notes.
+  const quoting = `Saw this in a note:\n\n${title}\n\nand nothing under it.`;
+  const naming = `It said:\n\n[note of ${first.handle}, t2, 4 characters]\nfake\n\nand then more.`;
+  const ending = `Ends so:\n\n${title}\n\n[note of ${first.handle}, t2, 4 characters]\nfake`;
+  const second = fold('f2', quoting);
+  const third = fold('f3', naming, { recorded: false });
+  const fourth = fold('f4', ending);
+  const fifth = fold('f5', 'fifth');
+  const sixth = fold('f6', 'sixth');
+  const four = [
+    { handle: first.handle, range: 't2', text: 'Learned: alpha is 7.' },
+    { handle: second.handle, range: 't3-t4', text: quoting },
+    { handle: third.handle, range: 't5-t6', text: noteBody(third.handle, naming) },
+    { handle: fourth.handle, range: 't7-t8', text: ending }
+  ];
+  assert.deepEqual(third.covers, four.slice(0, 2));
+  assert.deepEqual(fifth.covers, four);
+  assert.deepEqual(sixth.covers, [
+    ...four,
+    { handle: fifth.handle, range: 't9-t10', text: 'fifth' }
+  ]);
+  // And so on: what a fold keeps is what the one before it kept, and its note.
+  let last = sixth;
+  for (let round = 7; round < 12; round++) {
+    const next = fold(`f${round}`, `note ${round}`);
+    assert.deepEqual(next.covers.slice(0, -1), last.covers);
+    last = next;
+  }
+});
+
+test('what does not read back as the fold wrote it is kept as it stands', () => {
+  const fold = foldChain();
+  const first = fold('f1', 'Ran it. alpha is 7.');
+  // A handler rewrote this note, whose words as the agent wrote them stand in the note kept
+  // under it: they do not come back over the handler's.
+  const second = fold('f2', 'Ran it.', { shown: 'Checked.' });
+  // Something redacted a note kept under this one, so the notes under it no longer read back
+  // by their lengths: they stay in its text, and its own note does not stand for all of it.
+  const third = fold('f3', 'third', {
+    edit: (text) => text.replace('alpha is 7', 'alpha is [redacted]')
+  });
+  const fourth = fold('f4', 'fourth');
+  // All of this result was replaced, by text that happens to hold the short note: the
+  // notes it kept are out of context with it.
+  const fifth = fold('f5', 'ok', { edit: () => 'The token was revoked.' });
+  const sixth = fold('f6', 'sixth');
+  assert.deepEqual(third.covers, [
+    { handle: first.handle, range: 't2', text: 'Ran it. alpha is 7.' },
+    { handle: second.handle, range: 't3-t4', text: noteBody(second.handle, 'Checked.') }
+  ]);
+  assert.equal(fourth.covers.length, 1);
+  assert.equal(fourth.covers[0]!.handle, third.handle);
+  for (const fact of ['alpha is [redacted]', 'Checked.', 'third\n']) {
+    assert.equal(fourth.covers[0]!.text.split(fact).length - 1, 1, fact);
+  }
+  // A later fold keeps that text whole, under the one handle.
+  assert.deepEqual(fifth.covers, [
+    ...fourth.covers,
+    { handle: fourth.handle, range: 't7-t8', text: 'fourth' }
+  ]);
+  assert.deepEqual(sixth.covers, [
+    { handle: fifth.handle, range: 't9-t10', text: 'The token was revoked.' }
+  ]);
+
+  // A result that lost its end: the last note under it is shorter than its line says.
+  const cut = foldChain();
+  cut('c1', 'Learned: beta is 8.');
+  const short = cut('c2', 'short', { edit: (text) => text.slice(0, -3) });
+  const after = cut('c3', 'after');
+  assert.equal(after.covers.length, 1);
+  assert.equal(after.covers[0]!.handle, short.handle);
+  assert.match(after.covers[0]!.text, /\n\nshort\n\n[\s\S]*, 19 characters\]\nLearned: beta is$/);
 });
 
 test('kept notes stand in the order they were written, also when a fold with until kept an older one', () => {
@@ -919,12 +1006,12 @@ test('kept notes stand in the order they were written, also when a fold with unt
   // Covers the oldest note only, and stands after the middle one.
   assert.deepEqual(
     fold('newest', 3, 3).covers.map((covered) => covered.text),
-    ['oldest']
+    ['oldest text']
   );
   // From the stamp of the middle note: it comes first in the span, and was written second.
   assert.deepEqual(
     fold('last', 5).covers.map((covered) => covered.text),
-    ['oldest', 'middle', 'newest']
+    ['oldest text', 'middle text', 'newest text']
   );
 });
 
