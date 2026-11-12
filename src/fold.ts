@@ -567,17 +567,30 @@ function holdsNote(content: readonly (TextContent | ImageContent)[], note: strin
 
 type PendingDraft = { type: string; targetId?: string; replacement?: unknown };
 
-/** Whether the latest edit of an entry, on the branch or among queued drafts, removes it. */
-function removed(
+/**
+ * What the latest edit of an entry, on the branch or among queued drafts, leaves of it in
+ * context: null when it removes the entry, undefined when no edit touched it.
+ */
+function editedContent(
   id: string,
   branch: readonly SessionEntry[],
   pending: readonly PendingDraft[]
-): boolean {
-  let gone = false;
+): readonly (TextContent | ImageContent)[] | null | undefined {
+  let content: readonly (TextContent | ImageContent)[] | null | undefined;
   for (const entry of [...branch, ...pending]) {
-    if (entry.type === 'context_edit' && entry.targetId === id) gone = entry.replacement === null;
+    if (entry.type !== 'context_edit' || entry.targetId !== id) continue;
+    const replacement = entry.replacement as { content?: unknown } | null | undefined;
+    const shown = replacement?.content;
+    content =
+      replacement === null || replacement === undefined
+        ? null
+        : typeof shown === 'string'
+          ? [{ type: 'text', text: shown }]
+          : Array.isArray(shown)
+            ? (shown as (TextContent | ImageContent)[])
+            : [];
   }
-  return gone;
+  return content;
 }
 
 /**
@@ -1282,25 +1295,28 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       .filter((result) => !result.isError)
       .flatMap((result) => {
         const pending = state.pendingFolds.get(result.toolCallId);
-        // A later hook may have rewritten the result. Without the note in a script's result,
-        // the span would leave with nothing in its place; without the notes the fold covers,
-        // those would leave with it.
-        const stands =
-          (pending?.script
-            ? foldNoteDetails(result)?.handle === pending.handle &&
-              holdsNote(result.content, pending.script.note)
-            : result.toolName === FOLD_TOOL) &&
-          (pending?.carried === undefined || textOf(result.content).includes(pending.carried));
-        if (!pending || !stands) return [];
-        state.pendingFolds.delete(result.toolCallId);
-        // An earlier handler that removes the note leaves nothing to stand for the span.
         const note = branch.find(
           (entry) =>
             entry.type === 'message' &&
             entry.message.role === 'toolResult' &&
             entry.message.toolCallId === result.toolCallId
         );
-        if (note && removed(note.id, branch, event.entries)) return [];
+        // What will stand in context for the result: a later hook may have rewritten it, and
+        // an earlier handler of this boundary may have queued an edit of it. Without the note
+        // in a script's result, the span would leave with nothing in its place; without the
+        // notes the fold covers, those would leave with it; and a result that is removed
+        // leaves nothing to stand for the span.
+        const edited = note && editedContent(note.id, branch, event.entries);
+        const content = edited ?? result.content;
+        const stands =
+          edited !== null &&
+          (pending?.script
+            ? foldNoteDetails(result)?.handle === pending.handle &&
+              holdsNote(content, pending.script.note)
+            : result.toolName === FOLD_TOOL) &&
+          (pending?.carried === undefined || textOf(content).includes(pending.carried));
+        if (!pending || !stands) return [];
+        state.pendingFolds.delete(result.toolCallId);
         return [pending];
       });
     const repairs = completeCutShortFolds(branch, event.entries);
