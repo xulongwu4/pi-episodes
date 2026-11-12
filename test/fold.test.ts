@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -18,6 +19,7 @@ import {
   cutShortFold,
   foldableTurns,
   headline,
+  keptMark,
   mergeStart,
   openItems,
   planFold,
@@ -834,6 +836,7 @@ function foldChain() {
         since: `t${since}`,
         ...(stamp - 1 === since ? {} : { until: `t${stamp - 1}` }),
         covers: plan.covers.map((covered) => covered.handle),
+        ...(kept ? { kept: keptMark(kept) } : {}),
         ...(options.recorded === false ? {} : { note })
       }
     } as Message);
@@ -959,13 +962,16 @@ test('what does not read back as the fold wrote it is kept as it stands', () => 
     { handle: fifth.handle, range: 't9-t10', text: 'The token was revoked.' }
   ]);
 
-  // A note that ends in kept notes of its own making, right to the last character, under a
-  // fold whose real kept notes no longer read back: the made-up ones are not taken for them.
+  // A note that ends in kept notes of its own making, right to the last character and for
+  // the very folds kept, under a fold whose real kept notes no longer stand as written: the
+  // made-up ones are not taken for them.
   const made = foldChain();
   const one = made('m1', 'Learned: gamma is 9.');
   const title = 'Notes of the earlier folds covered here, oldest first, as they were written:';
-  const quoted = `Prose before.\n\n${title}\n\n[note of ep-00000000, t1, 4 characters]\nfake`;
+  const own = `ep-${createHash('sha256').update('m2').digest('hex').slice(0, 8)}`;
+  const quoted = `Prose before.\n\n${title}\n\n[note of ${one.handle}, t2, 4 characters]\nfake\n\n[note of ${own}, t3-t4, 4 characters]\nfake`;
   const two = made('m2', quoted);
+  assert.equal(two.handle, own);
   const holder = made('m3', 'holder', {
     edit: (text) => text.replace('gamma is 9', 'gamma is [redacted]')
   });
@@ -975,9 +981,21 @@ test('what does not read back as the fold wrote it is kept as it stands', () => 
     [one.handle, two.handle]
   );
   assert.equal(next.covers.length, 1);
-  for (const fact of ['gamma is [redacted]', 'Prose before.', 'fake', 'holder\n']) {
+  for (const fact of ['gamma is [redacted]', 'Prose before.', 'fake\n', 'holder\n']) {
     assert.equal(next.covers[0]!.text.split(fact).length - 1, 1, fact);
   }
+
+  // Changed by one character, at the same length, the kept notes stay whole as well.
+  const same = foldChain();
+  same('s1', 'Learned: delta is 1.');
+  same('s2', 'second');
+  const changed = same('s3', 'third', { edit: (text) => text.replace('delta is 1', 'delta is 2') });
+  const later = same('s4', 'later');
+  assert.deepEqual(
+    later.covers.map((note) => note.handle),
+    [changed.handle]
+  );
+  assert.match(later.covers[0]!.text, /, 20 characters\]\nLearned: delta is 2\.\n\n\[note of /);
 
   // A note that is empty reads back, also as the last one.
   const empty = foldChain();
@@ -1013,14 +1031,16 @@ test('kept notes stand in the order they were written, also when a fold with unt
       since,
       until === undefined ? {} : { until }
     );
+    const kept = renderCovered(plan.covers);
     manager.appendMessage({
-      ...result(id, 'fold', [`${id} text`, renderCovered(plan.covers) ?? ''].join('\n\n'), ++stamp),
+      ...result(id, 'fold', [`${id} text`, kept ?? ''].join('\n\n'), ++stamp),
       details: {
         kind: 'fold',
         handle: plan.handle,
         headline: id,
         since: `t${since}`,
         covers: plan.covers.map((covered) => covered.handle),
+        ...(kept ? { kept: keptMark(kept) } : {}),
         note: id
       }
     } as Message);

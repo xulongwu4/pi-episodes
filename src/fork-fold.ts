@@ -2,7 +2,15 @@ import type { AgentMessage, AgentTool, AgentToolResult } from '@earendil-works/p
 import type { Tool } from '@earendil-works/pi-ai';
 import type { ProjectedSessionEntry, SessionEntry } from '@earendil-works/pi-coding-agent';
 import type { FoldDetails, NestedFold } from './archive.js';
-import { coveredTokens, headline, openItems, planFold, renderCovered, renderNote } from './fold.js';
+import {
+  coveredTokens,
+  headline,
+  keptMark,
+  openItems,
+  planFold,
+  renderCovered,
+  renderNote
+} from './fold.js';
 import { estimateTokens, skillPaths, touchedPaths } from './messages.js';
 import { parseStamp, readStamp, stampLabel, withStamp } from './stamps.js';
 import type { EpisodeState } from './state.js';
@@ -142,6 +150,8 @@ export class ForkFolds {
     record.note = note;
     record.noteTokens = Math.ceil(note.length / 4);
     if (plan.covers.length > 0) record.keptTokens = coveredTokens(plan.covers);
+    const carried = renderCovered(plan.covers);
+    if (carried) record.kept = keptMark(carried);
     const keptFrom = plan.keptFrom === undefined ? undefined : stampLabel(plan.keptFrom);
     if (keptFrom) record.keptFrom = keptFrom;
     const open = openItems(note);
@@ -153,7 +163,6 @@ export class ForkFolds {
       omit
     });
 
-    const carried = renderCovered(plan.covers);
     return {
       content: [
         {

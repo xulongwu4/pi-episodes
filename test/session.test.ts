@@ -723,7 +723,7 @@ test('a fork folds with until and keeps its later work', async () => {
   }
 });
 
-test('a fold in a fork keeps the note it covers under its own', async () => {
+test('a fold in a fork keeps the note it covers under its own, and the next one keeps both', async () => {
   const last = (context: Parameters<typeof conversation>[0]) => text(conversation(context).at(-1)!);
   const stamp = (context: Parameters<typeof conversation>[0]) =>
     /\[(t\d+)\]$/.exec(last(context))![1]!;
@@ -752,6 +752,20 @@ test('a fold in a fork keeps the note it covers under its own', async () => {
         )
       );
       assert.equal(messages.map(text).join('\n').split('alpha is 7').length - 1, 1);
+      return fauxAssistantMessage(fauxToolCall('bash', { command: 'echo three' }));
+    },
+    (context) => {
+      const since = `t${Number(stamp(context).slice(1)) - 1}`;
+      return fauxAssistantMessage(fauxToolCall('fold', { since, note: 'third' }));
+    },
+    (context) => {
+      // The first note is read from under the second, as the fork's fold recorded it.
+      assert.match(
+        last(context),
+        new RegExp(
+          `third\n[\\s\\S]*\n\n\\[note of ep-[0-9a-f]{8}, ${first}, 29 characters\\]\nRan one\\.\nLearned: alpha is 7\\.\n\n\\[note of ep-[0-9a-f]{8}, t\\d+-t\\d+, 6 characters\\]\nsecond\n\\[t\\d+\\]$`
+        )
+      );
       return fauxAssistantMessage('Build passes.\n- Open: none.');
     },
     () => fauxAssistantMessage('done')

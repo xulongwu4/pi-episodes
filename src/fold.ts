@@ -97,13 +97,15 @@ function isFoldNote(entry: ProjectedSessionEntry, applied: ReadonlySet<string>):
   return details !== undefined && applied.has(details.handle);
 }
 
-/**
- * The notes under the title at `at`, when all of the text from there on is what `renderCovered`
- * writes: each note under its line, as long as that line says.
- */
-function keptUnder(text: string, at: number): CoveredNote[] | undefined {
+/** What a fold records of the kept notes it wrote, to know that text again. */
+export function keptMark(carried: string): { chars: number; sha256: string } {
+  return { chars: carried.length, sha256: createHash('sha256').update(carried).digest('hex') };
+}
+
+/** The notes in text that `renderCovered` wrote: each under its line, as long as the line says. */
+function keptUnder(text: string): CoveredNote[] | undefined {
   const notes: CoveredNote[] = [];
-  let index = at + KEPT_TITLE.length;
+  let index = KEPT_TITLE.length;
   while (index < text.length) {
     KEPT_HEAD.lastIndex = index;
     const head = KEPT_HEAD.exec(text);
@@ -118,15 +120,15 @@ function keptUnder(text: string, at: number): CoveredNote[] | undefined {
 
 /**
  * A note's result as it stands in context: its own text, and the notes kept under it, which
- * `renderCovered` wrote at the end of one of its text blocks. They are taken apart only where
- * the text reads back as written, from a title to the end of its block, as the notes of the
- * folds in `covers`, the ones the fold recorded that it kept. Anything else stays in the
- * note's own text, whole: a note that quotes the title, with kept notes of its own making
- * under it or not, and kept notes that something changed since.
+ * `renderCovered` wrote at the end of one of its text blocks. They are taken apart only if
+ * that text stands there as the fold wrote it, by the length and hash the fold recorded in
+ * `mark`. Anything else stays in the note's own text, whole: kept notes that something
+ * changed since, and whatever a note says that reads like kept notes, to any reader that
+ * looks for them by their form.
  */
 function standing(
   content: readonly (TextContent | ImageContent)[],
-  covers: readonly string[]
+  mark: { chars?: unknown; sha256?: unknown } | undefined
 ): {
   own: string;
   kept: CoveredNote[];
@@ -136,19 +138,20 @@ function standing(
   content.forEach((block, index) => {
     if (block.type !== 'text' || (index === content.length - 1 && isStampBlock(block))) return;
     const { text } = block;
-    const titles = text.startsWith(KEPT_TITLE) ? [0] : [];
-    const before = `\n\n${KEPT_TITLE}`;
-    for (let at = text.indexOf(before); at >= 0; at = text.indexOf(before, at + 1)) {
-      titles.push(at + 2);
-    }
-    for (const at of kept.length > 0 || covers.length === 0 ? [] : titles) {
-      const under = keptUnder(text, at);
-      if (under?.map((note) => note.handle).join() !== covers.join()) continue;
-      if (at > 0) own.push(text.slice(0, at));
-      kept = under;
+    const at = typeof mark?.chars === 'number' ? text.length - mark.chars : -1;
+    const tail = at >= 0 && kept.length === 0 ? text.slice(at) : undefined;
+    const under =
+      tail !== undefined &&
+      (at === 0 || text.slice(0, at).endsWith('\n\n')) &&
+      keptMark(tail).sha256 === mark?.sha256
+        ? keptUnder(tail)
+        : undefined;
+    if (!under?.length) {
+      own.push(text);
       return;
     }
-    own.push(text);
+    if (at > 0) own.push(text.slice(0, at));
+    kept = under;
   });
   return { own: own.join('\n').trim(), kept };
 }
@@ -202,7 +205,7 @@ export function coveredNotes(
     const fold = isFoldNote(entry, applied) ? foldNoteDetails(entryMessage(entry)) : undefined;
     if (!fold || shown?.role !== 'toolResult') continue;
     const covers = (fold.covers ?? []).filter((handle) => typeof handle === 'string');
-    const { own, kept } = standing(shown.content, covers);
+    const { own, kept } = standing(shown.content, fold.kept);
     const at = written.get(fold.handle) ?? 0;
     // A fold whose kept notes do not read back has them in its own text still.
     const recorded =
@@ -1220,6 +1223,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         cwd: state.cwd
       });
       const carried = renderCovered(plan.covers);
+      if (carried) details.kept = keptMark(carried);
       // Snapshots take time; a run aborted meanwhile, or already settled, must not get edits.
       if (signal?.aborted || run !== state.run) throw new Error('The fold was cancelled.');
       // A fold from a script takes effect with the script's result, which then stands as the
