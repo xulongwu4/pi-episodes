@@ -215,8 +215,17 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
       );
 
       if (threads.length === 0) {
+        // Read alone, "nothing is archived" was taken to mean that nothing can be known. It says where to
+        // look, and not why the archive is empty: a fork's own folds, another extension's edits and a lost
+        // archive file all leave it empty too. Nor does it promise a file for a cut result: only some cuts
+        // leave one.
         return {
-          content: [{ type: 'text', text: 'Nothing is archived on this branch yet.' }],
+          content: [
+            {
+              type: 'text',
+              text: 'No archived thread is on this branch, so recall has nothing to search. Look in your context instead; for a tool result that arrived cut, follow any pointer its preview gives to the rest.'
+            }
+          ],
           details: { query, threads: 0, shown: 0, total: 0 }
         };
       }

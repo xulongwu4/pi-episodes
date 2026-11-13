@@ -907,6 +907,27 @@ test('an output cap that is off leaves large results whole', async () => {
     await harness.cleanup();
   }
 });
+test('recall with nothing archived points to the context and makes no claim about it', async () => {
+  const harness = await createSession([
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo release-ea81b665' })),
+    () => fauxAssistantMessage(fauxToolCall('recall', { query: 'release' })),
+    (context) => {
+      assert.match(
+        text(conversation(context).at(-1)!),
+        /^No archived thread is on this branch, so recall has nothing to search\. Look in your context instead; for a tool result that arrived cut, follow any pointer its preview gives to the rest\./
+      );
+      return fauxAssistantMessage('done');
+    }
+  ]);
+
+  try {
+    await harness.session.prompt('go');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
 test('stats read the session: folds, rejections, cues followed, and the drop after a fold', async () => {
   let handle = '';
   const harness = await createSession(
