@@ -6,6 +6,15 @@ import type { RecallIndex } from './search.js';
 import { Snapshots } from './snapshots.js';
 import { readStamp } from './stamps.js';
 
+export interface PendingUnfold {
+  handle: string;
+  record: FoldDetails;
+  messages: number;
+  tokens: number;
+  edits: ContextEditEntryDraft[];
+  noteEntryId: string;
+}
+
 export interface PendingFold {
   handle: string;
   messages: number;
@@ -40,6 +49,8 @@ export class EpisodeState {
   snapshots: Snapshots | undefined;
   /** Context edits computed by a fold call, emitted at the end of its turn. */
   readonly pendingFolds = new Map<string, PendingFold>();
+  /** Context edits computed by an unfold call, emitted at the end of its turn. */
+  readonly pendingUnfolds = new Map<string, PendingUnfold>();
   /** Response entry ids that already made a fold call in the current run, with that call. */
   readonly foldResponses = new Map<string, string>();
   /** The calling tool of each nested call seen in the current run, from `tool_call` events. */
@@ -69,6 +80,7 @@ export class EpisodeState {
       ? new Snapshots(this.cwd, ctx.sessionManager.getSessionId())
       : undefined;
     this.pendingFolds.clear();
+    this.pendingUnfolds.clear();
     this.foldResponses.clear();
     this.parentCalls.clear();
     this.run++;

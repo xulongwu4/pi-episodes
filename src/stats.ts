@@ -1,9 +1,10 @@
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 import {
-  appliedFolds,
+  everAppliedFolds,
   FOLD_APPLIED_TYPE,
   FOLD_TOOL,
+  FOLD_UNFOLDED_TYPE,
   FORK_TOOL,
   foldNoteDetails,
   isForkDetails
@@ -424,7 +425,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
     overhead: { stamps: 0, cues: 0, notices: 0, prompt: tokensOf(EPISODES_SECTION.length) }
   };
 
-  const applied = appliedFolds(entries);
+  const applied = everAppliedFolds(entries);
   const foldNet = new Map<string, number>();
   const foldNote = new Map<string, number>();
   /** Net tokens of folds in effect, saved again on every request until a compaction. */
@@ -483,6 +484,16 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
         awaiting.push(fold);
         stats.folds.each.push(fold);
         inEffect.push(fold);
+      }
+      mark = 'fold';
+      return;
+    }
+    if (entry.type === 'custom' && entry.customType === FOLD_UNFOLDED_TYPE) {
+      const handle = (entry.data as { handle?: string } | undefined)?.handle;
+      if (handle) {
+        active = Math.max(0, active - (foldNet.get(handle) ?? 0));
+        inEffect = inEffect.filter((fold) => fold.handle !== handle);
+        awaiting = awaiting.filter((fold) => fold.handle !== handle);
       }
       mark = 'fold';
       return;

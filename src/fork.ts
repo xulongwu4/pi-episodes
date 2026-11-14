@@ -16,6 +16,7 @@ import {
   type ForkDetails,
   type ForkStatus,
   runningFork,
+  UNFOLD_TOOL,
   writeForkArchive
 } from './archive.js';
 import { changeLines, headline, openItems } from './fold.js';
@@ -193,7 +194,11 @@ export function registerFork(pi: ExtensionAPI, state: EpisodeState, registry: Fo
       const callable = new Set(ctx.tools.map((tool) => tool.name));
       const unavailable = declared
         .map((tool) => tool.name)
-        .filter((name) => name === FORK_TOOL || (name !== FOLD_TOOL && !callable.has(name)));
+        .filter(
+          (name) =>
+            name === FORK_TOOL ||
+            (name !== FOLD_TOOL && name !== UNFOLD_TOOL && !callable.has(name))
+        );
       const task: AgentMessage = {
         role: 'toolResult',
         toolCallId,
@@ -220,10 +225,14 @@ export function registerFork(pi: ExtensionAPI, state: EpisodeState, registry: Fo
         ...(leaf && leaf !== parent.sourceEntry.id ? { prefixEntryId: leaf } : {}),
         siblings,
         messages: agent.state.messages.slice(prefix.length),
-        folds: [...folds.folds]
+        folds: folds.folds.map((fold) => ({ ...fold }))
       });
       // The child's view changes as it folds; the cache anchor follows its latest note.
-      const options = requestOptions(pi, ctx, () => folds.view(agent.state.messages), undefined);
+      const options = requestOptions(pi, ctx, () => folds.view(agent.state.messages), undefined, {
+        retiredCallIds: () => folds.retiredCallIds(agent.state.messages),
+        extraApplied: () => folds.activeHandles(),
+        hasMutatedHistory: () => folds.hasMutated
+      });
       // The agent loop passes its own settings, but not these.
       const limits: Pick<typeof options, 'timeoutMs' | 'maxRetries'> = {};
       if (options.timeoutMs !== undefined) limits.timeoutMs = options.timeoutMs;
@@ -233,7 +242,7 @@ export function registerFork(pi: ExtensionAPI, state: EpisodeState, registry: Fo
           model,
           thinkingLevel: ctx.thinkingLevel ?? pi.getThinkingLevel(),
           tools: declared.map((declaration) =>
-            declaration.name === FOLD_TOOL
+            declaration.name === FOLD_TOOL || declaration.name === UNFOLD_TOOL
               ? folds.tool(declaration, () => agent.state.messages)
               : childTool(declaration, ctx, unavailable, transcript)
           ),
@@ -376,7 +385,7 @@ export function registerFork(pi: ExtensionAPI, state: EpisodeState, registry: Fo
         usage,
         status: forkStatus
       };
-      if (folds.folds.length > 0) details.folds = folds.folds.length;
+      if (folds.activeFolds.length > 0) details.folds = folds.activeFolds.length;
       const readOnly = readOnlyPaths(
         messages,
         state.cwd,
@@ -407,11 +416,13 @@ export function registerFork(pi: ExtensionAPI, state: EpisodeState, registry: Fo
               note || '(the fork ended without a final message)',
               '',
               ...changeLines(changes, touched, state.cwd),
-              ...(folds.folds.length > 0
+              ...(folds.activeFolds.length > 0
                 ? [
                     '',
                     'Folded inside the fork:',
-                    ...folds.folds.map((fold) => `${fold.record.handle}: ${fold.record.headline}`)
+                    ...folds.activeFolds.map(
+                      (fold) => `${fold.record.handle}: ${fold.record.headline}`
+                    )
                   ]
                 : []),
               '',

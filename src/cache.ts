@@ -1,6 +1,6 @@
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { FOLD_TOOL, foldNoteDetails } from './archive.js';
-import { estimateTokens } from './messages.js';
+import { estimateTokens, textOf } from './messages.js';
 import { readStamp, stampLabel } from './stamps.js';
 
 /**
@@ -42,9 +42,9 @@ export function cacheAnchor(
 }
 
 function isNote(message: AgentMessage & { role: 'toolResult' }, applied: ReadonlySet<string>) {
-  if (message.toolName === FOLD_TOOL) return true;
   const fold = foldNoteDetails(message);
-  return fold !== undefined && applied.has(fold.handle);
+  if (fold !== undefined) return applied.has(fold.handle);
+  return message.toolName === FOLD_TOOL && !textOf(message.content).startsWith('[unfolded ');
 }
 
 function isAnchor(message: AgentMessage, anchor: CacheAnchor): boolean {

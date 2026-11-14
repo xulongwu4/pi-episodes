@@ -126,6 +126,7 @@ async function createSession(
       'bash',
       'read',
       'fold',
+      'unfold',
       'recall',
       'ask',
       'fork',
@@ -167,9 +168,9 @@ async function createSession(
 
 test('fold and fork stay declared next to codemode; the other tools follow the mode', async () => {
   const expected: Record<Mode, string[]> = {
-    off: ['ask', 'bash', 'fold', 'fork', 'read', 'recall'],
-    on: ['ask', 'bash', 'codemode', 'fold', 'fork', 'read', 'recall'],
-    // fold is reached from scripts; fork cannot be, so it stays declared.
+    off: ['ask', 'bash', 'fold', 'fork', 'read', 'recall', 'unfold'],
+    on: ['ask', 'bash', 'codemode', 'fold', 'fork', 'read', 'recall', 'unfold'],
+    // fold and unfold are reached from scripts; fork cannot be, so it stays declared.
     only: ['codemode', 'fork']
   };
   for (const mode of ['off', 'on', 'only'] as const) {
@@ -2717,6 +2718,7 @@ test('under codemode "only" the prompt gives the calls of fold, recall and ask',
       await harness.run('go');
       assert.match(prompt, /<episodes>/);
       assert.equal(/tools\.recall\(\{ query, handle\?/.test(prompt), mode === 'only', mode);
+      assert.equal(/tools\.unfold\(\{ handle:/.test(prompt), mode === 'only', mode);
     } finally {
       await harness.cleanup();
     }

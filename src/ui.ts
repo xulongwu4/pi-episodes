@@ -45,6 +45,15 @@ export interface AskDetails {
   stale?: StaleThread[];
 }
 
+export interface UnfoldDetails {
+  kind: 'unfold';
+  handle: string;
+  since: string;
+  until?: string;
+  messages: number;
+  tokens: number;
+}
+
 /** Result text without the trailing turn stamp, which resumed sessions render with. */
 function resultText(content: readonly (TextContent | ImageContent)[]): string {
   const last = content.at(-1);
@@ -127,6 +136,32 @@ export const foldRenderers = {
     container.addChild(new Spacer(1));
     container.addChild(markdown(note, theme));
     return container;
+  }
+};
+
+export const unfoldRenderers = {
+  renderCall(args: { handle?: string }, theme: Theme): Text {
+    return title(theme, 'unfold', theme.fg('accent', args.handle ?? '...'));
+  },
+
+  renderResult(
+    result: AgentToolResult<UnfoldDetails | undefined>,
+    _options: { expanded: boolean },
+    theme: Theme
+  ): Text {
+    const details = result.details;
+    const text = resultText(result.content);
+    if (!details || result.isError) return new Text(theme.fg('error', text), 0, 0);
+    const range = details.until ? `${details.since}-${details.until}` : `${details.since} on`;
+    return new Text(
+      `${theme.fg('success', '◂')} ${theme.fg('accent', details.handle)} ${theme.fg('accent', range)} ` +
+        theme.fg(
+          'muted',
+          `${details.messages} messages, ~${formatTokens(details.tokens)} tokens restored`
+        ),
+      0,
+      0
+    );
   }
 };
 

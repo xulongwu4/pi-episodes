@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { type ExtensionAPI, type ExtensionContext, VERSION } from '@earendil-works/pi-coding-agent';
-import { FOLD_TOOL, FORK_TOOL } from './archive.js';
+import { FOLD_TOOL, FORK_TOOL, UNFOLD_TOOL } from './archive.js';
 import { EPISODES_SECTION } from './prompt.js';
 import { episodesSettings } from './settings.js';
 
@@ -68,7 +68,7 @@ function packageVersion(): string {
   }
 }
 
-const OWN_TOOLS = new Set([FOLD_TOOL, 'recall', 'ask', FORK_TOOL]);
+const OWN_TOOLS = new Set([FOLD_TOOL, UNFOLD_TOOL, 'recall', 'ask', FORK_TOOL]);
 
 /** Written at session start, only when it differs from the last one, so resuming adds nothing. */
 export function recordMeta(pi: ExtensionAPI, ctx: ExtensionContext): void {

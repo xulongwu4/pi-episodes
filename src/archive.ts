@@ -10,11 +10,18 @@ import {
   type SessionEntry,
   sessionEntryToContextMessages
 } from '@earendil-works/pi-coding-agent';
-import { readStamp, stampLabel } from './stamps.js';
+import {
+  branchHasMutatedHistory,
+  branchRetiredResponsesCallIds,
+  retireAssistantMessage,
+  retiredResponsesCallIds
+} from './retire.js';
+import { readStamp, stampLabel, withStamp } from './stamps.js';
 
 export type SessionView = ExtensionContext['sessionManager'];
 
 export const FOLD_TOOL = 'fold';
+export const UNFOLD_TOOL = 'unfold';
 export const FORK_TOOL = 'fork';
 /** The message /fold sends to ask for a fold. */
 export const FOLD_REQUEST_TYPE = 'episodes-fold-request';
@@ -30,6 +37,10 @@ export const FOLD_APPLIED_TYPE = 'episodes-fold-applied';
  * It tells a fold cut short from one that never took effect, and holds the edits still to write.
  */
 export const FOLD_STARTED_TYPE = 'episodes-fold-started';
+/** Appended after an unfold's context edits, taking the fold out of {@link appliedFolds}. */
+export const FOLD_UNFOLDED_TYPE = 'episodes-fold-unfolded';
+/** Written first in an unfold's batch, with the fold's handle and the edits that follow. */
+export const FOLD_UNFOLD_STARTED_TYPE = 'episodes-fold-unfold-started';
 /**
  * Key under which a fold called from a codemode script stores its FoldDetails on the script's
  * tool result. That result stays in context as the fold's note, as a fold result does for a
@@ -37,8 +48,21 @@ export const FOLD_STARTED_TYPE = 'episodes-fold-started';
  */
 export const FOLD_DETAILS_KEY = 'episodesFold';
 
-/** Handles of folds whose edits are among these entries. */
+/** Handles of folds currently in effect on these entries. */
 export function appliedFolds(entries: readonly SessionEntry[]): Set<string> {
+  const handles = new Set<string>();
+  for (const entry of entries) {
+    if (entry.type !== 'custom') continue;
+    const handle = (entry.data as { handle?: unknown } | undefined)?.handle;
+    if (typeof handle !== 'string') continue;
+    if (entry.customType === FOLD_APPLIED_TYPE) handles.add(handle);
+    else if (entry.customType === FOLD_UNFOLDED_TYPE) handles.delete(handle);
+  }
+  return handles;
+}
+
+/** Handles of folds that ever took effect anywhere in `entries`, even if later unfolded. */
+export function everAppliedFolds(entries: readonly SessionEntry[]): Set<string> {
   const handles = new Set<string>();
   for (const entry of entries) {
     if (entry.type !== 'custom' || entry.customType !== FOLD_APPLIED_TYPE) continue;
@@ -105,6 +129,10 @@ export interface FoldDetails {
    * next request writes to the cache again. No gap when the anchor was inside the span.
    */
   anchor?: { placed?: boolean; gapTokens?: number };
+  /** Full rendered `[fold ep-...]` text written for this fold, for codemode unfold matching. */
+  renderedNote?: string;
+  /** Count of covered-note image blocks appended to the fold's result, dropped on unfold. */
+  carriedImages?: number;
 }
 
 export type ForkStatus = 'done' | 'failed' | 'timeout' | 'aborted';
@@ -181,15 +209,78 @@ export interface NestedFold {
   last: number;
   /** Messages the fold hid from the child's view. */
   omit: number[];
+  unfolded?: boolean;
+  /** Child message count when this fold was created. */
+  createdAt?: number;
+  /** Child message count when this fold was unfolded. */
+  unfoldedAt?: number;
+  /** Child assistant message indices whose replay signatures were retired by this fold. */
+  retired?: number[];
+  /** Child assistant message indices whose replay signatures were retired when unfolded. */
+  unfoldRetired?: number[];
 }
 
-/** Messages left after hiding what the given nested folds omitted. */
-function withoutFolded(
+function isNestedFoldUnfoldedAt(fold: NestedFold, stateAt: number): boolean {
+  if (fold.unfoldedAt !== undefined) return fold.unfoldedAt <= stateAt;
+  return Boolean(fold.unfolded);
+}
+
+/** Replays child fork messages at `stateAt` (up to `messageLimit`), applying omits, unfold stubs, and bounded signature retirement. */
+export function replayForkMessages(
   messages: readonly AgentMessage[],
-  folds: readonly NestedFold[]
-): AgentMessage[] {
-  const omitted = new Set(folds.flatMap((fold) => fold.omit));
-  return messages.filter((_, index) => !omitted.has(index));
+  folds: readonly NestedFold[],
+  options: { messageLimit?: number; stateAt?: number } = {}
+): { messages: AgentMessage[]; retiredCallIds: Set<string>; mutated: boolean } {
+  const limit = Math.min(options.messageLimit ?? messages.length, messages.length);
+  const stateAt = options.stateAt ?? messages.length;
+  const relevant = folds.filter((fold) => (fold.createdAt ?? 0) <= stateAt);
+  const omitted = new Set<number>();
+  const unfoldedHandles = new Set<string>();
+  const retiredSet = new Set<number>();
+  for (const fold of relevant) {
+    const unfolded = isNestedFoldUnfoldedAt(fold, stateAt);
+    if (unfolded) {
+      unfoldedHandles.add(fold.record.handle);
+    } else {
+      for (const idx of fold.omit) omitted.add(idx);
+    }
+    if (fold.retired !== undefined) {
+      for (const idx of fold.retired) retiredSet.add(idx);
+    } else {
+      const end = fold.createdAt ?? messages.length;
+      for (let idx = fold.first; idx < end; idx++) retiredSet.add(idx);
+    }
+    if (unfolded) {
+      if (fold.unfoldRetired !== undefined) {
+        for (const idx of fold.unfoldRetired) retiredSet.add(idx);
+      } else {
+        const end = fold.unfoldedAt ?? stateAt;
+        for (let idx = fold.first; idx < end; idx++) retiredSet.add(idx);
+      }
+    }
+  }
+  const out: AgentMessage[] = [];
+  const retiredCallIds = new Set<string>();
+  for (let index = 0; index < limit; index++) {
+    if (omitted.has(index)) continue;
+    let current = messages[index]!;
+    if (current.role === 'toolResult') {
+      const details = foldNoteDetails(current);
+      if (details && unfoldedHandles.has(details.handle)) {
+        const stamp = readStamp(current);
+        const marker = `[unfolded ${details.handle}]`;
+        current = {
+          ...current,
+          content: stamp === undefined ? [{ type: 'text', text: marker }] : withStamp(marker, stamp)
+        };
+      }
+    } else if (current.role === 'assistant' && retiredSet.has(index)) {
+      current = retireAssistantMessage(current);
+      for (const id of retiredResponsesCallIds([current])) retiredCallIds.add(id);
+    }
+    out.push(current);
+  }
+  return { messages: out, retiredCallIds, mutated: relevant.length > 0 };
 }
 
 export interface ForkArchive {
@@ -222,6 +313,12 @@ export interface Thread {
    */
   context?: () => AgentMessage[];
   record: ThreadRecord;
+  /** Responses `call_id` values retired inside `context()`, for `ask` wire replay. */
+  retiredCallIds?: () => ReadonlySet<string>;
+  /** Whether `context()` replays a prefix mutated by a fold, unfold, or context edit. */
+  hasMutatedHistory?: () => boolean;
+  /** Applied fold handles visible inside `context()`, for cache breakpoint placement in `ask`. */
+  appliedFolds?: () => ReadonlySet<string>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -261,8 +358,10 @@ export function foldEntryDetails(entry: SessionEntry): FoldDetails | undefined {
   return entry.type === 'message' ? foldNoteDetails(entry.message) : undefined;
 }
 
-export function foldRecords(entries: readonly SessionEntry[]): FoldDetails[] {
-  const applied = appliedFolds(entries);
+export function foldRecords(
+  entries: readonly SessionEntry[],
+  applied: ReadonlySet<string> = appliedFolds(entries)
+): FoldDetails[] {
   return entries
     .map(foldEntryDetails)
     .filter((record): record is FoldDetails => record !== undefined && applied.has(record.handle));
@@ -364,8 +463,19 @@ export class ThreadIndex {
 
   /** Any archived thread in the session, on this branch or an abandoned one. */
   async find(handle: string): Promise<Thread | undefined> {
+    const currentBranch = this.sessions.getBranch();
+    const activeOnBranch = appliedFolds(currentBranch);
+    const unfoldedOnBranch = new Set<string>();
+    for (const entry of currentBranch) {
+      if (entry.type !== 'custom' || entry.customType !== FOLD_UNFOLDED_TYPE) continue;
+      const target = (entry.data as { handle?: unknown } | undefined)?.handle;
+      if (typeof target === 'string' && !activeOnBranch.has(target)) unfoldedOnBranch.add(target);
+    }
+    if (unfoldedOnBranch.has(handle)) return undefined;
     const entries = this.sessions.getEntries();
-    const fold = foldRecords(entries).find((record) => record.handle === handle);
+    const fold = foldRecords(entries, everAppliedFolds(entries)).find(
+      (record) => record.handle === handle
+    );
     if (fold) return this.foldThread(fold);
     const own =
       this.running && this.foldsInside(this.running).find((found) => found.handle === handle);
@@ -460,6 +570,21 @@ export class ThreadIndex {
         while (isFoldRequest(messages.at(-1))) messages.pop();
         return messages;
       },
+      retiredCallIds: () => {
+        const leafId = note?.id ?? fold.lastEntryId;
+        return branchRetiredResponsesCallIds(
+          this.sessions.getBranch(leafId),
+          buildSessionProjection(this.sessions.getEntries(), leafId).entries
+        );
+      },
+      hasMutatedHistory: () => {
+        const leafId = note?.id ?? fold.lastEntryId;
+        return branchHasMutatedHistory(
+          this.sessions.getBranch(leafId),
+          buildSessionProjection(this.sessions.getEntries(), leafId).entries
+        );
+      },
+      appliedFolds: () => appliedFolds(this.sessions.getBranch(note?.id ?? fold.lastEntryId)),
       record: fold
     };
   }
@@ -472,52 +597,102 @@ export class ThreadIndex {
     const archive = this.memory.get(fork.handle) ?? (await readArchive(fork.archive));
     if (!archive) return [];
 
-    const visible = withoutFolded(archive.messages, archive.folds ?? []);
+    const folds = archive.folds ?? [];
+    const finalReplay = replayForkMessages(archive.messages, folds);
     return [
       {
         handle: fork.handle,
         kind: 'fork',
         label: `fork: ${fork.task.slice(0, 80)}`,
-        messages: visible,
-        context: () => [...this.forkPrefix(archive), ...visible],
+        messages: finalReplay.messages,
+        context: () => [...this.forkPrefix(archive), ...finalReplay.messages],
+        retiredCallIds: () => {
+          const { branch, proj } = this.forkParentState(archive);
+          const ids = branchRetiredResponsesCallIds(branch, proj.entries);
+          for (const id of finalReplay.retiredCallIds) ids.add(id);
+          return ids;
+        },
+        hasMutatedHistory: () => {
+          const { branch, proj } = this.forkParentState(archive);
+          return finalReplay.mutated || branchHasMutatedHistory(branch, proj.entries);
+        },
+        appliedFolds: () => {
+          const active = appliedFolds(this.forkParentState(archive).branch);
+          for (const nested of folds) {
+            if (!isNestedFoldUnfoldedAt(nested, archive.messages.length)) {
+              active.add(nested.record.handle);
+            }
+          }
+          return active;
+        },
         record: fork
       },
       ...this.foldsInside(archive)
     ];
   }
 
+  private forkParentState(archive: ForkArchive) {
+    const entries = this.sessions.getEntries();
+    const targetId = archive.prefixEntryId ?? archive.parentEntryId;
+    const branch = this.sessions.getBranch(targetId);
+    const proj = buildSessionProjection(entries, targetId);
+    return { branch, proj };
+  }
+
   /** What the child started from: the parent's view and the results that closed sibling forks. */
   private forkPrefix(archive: ForkArchive): AgentMessage[] {
-    return [
-      ...buildSessionProjection(
-        this.sessions.getEntries(),
-        archive.prefixEntryId ?? archive.parentEntryId
-      ).messages,
-      ...(archive.siblings ?? [])
-    ];
+    return [...this.forkParentState(archive).proj.messages, ...(archive.siblings ?? [])];
   }
 
   /** The folds a fork made of its own work, finished or still running, each a thread. */
   private foldsInside(archive: ForkArchive): Thread[] {
     const folds = archive.folds ?? [];
-    return folds.map((fold, order) => {
-      // What earlier folds already removed is archived under their handles.
-      const earlier = new Set(folds.slice(0, order).flatMap((other) => other.omit));
-      return {
+    const threads: Thread[] = [];
+    folds.forEach((fold, order) => {
+      if (isNestedFoldUnfoldedAt(fold, archive.messages.length)) return;
+      const snapAt = fold.createdAt ?? fold.last + 1;
+      // What earlier folds still in effect at `snapAt` removed is archived under their handles.
+      const earlier = new Set(
+        folds
+          .slice(0, order)
+          .filter((other) => !isNestedFoldUnfoldedAt(other, snapAt))
+          .flatMap((other) => other.omit)
+      );
+      const snapReplay = () =>
+        replayForkMessages(archive.messages, folds.slice(0, order), {
+          messageLimit: fold.last + 1,
+          stateAt: snapAt
+        });
+      threads.push({
         handle: fold.record.handle,
         kind: 'fold',
         label: `${fold.record.until ? `turns ${fold.record.since}-${fold.record.until}` : `turns from ${fold.record.since} on`}, inside ${archive.handle}`,
         messages: archive.messages
           .slice(fold.first, fold.last + 1)
           .filter((_, index) => !earlier.has(fold.first + index)),
-        // What the child saw when it folded: its earlier folds applied, this one not yet.
-        context: () => [
-          ...this.forkPrefix(archive),
-          ...withoutFolded(archive.messages.slice(0, fold.last + 1), folds.slice(0, order))
-        ],
+        // What the child saw when it folded: its earlier folds at `snapAt`, this one not yet.
+        context: () => [...this.forkPrefix(archive), ...snapReplay().messages],
+        retiredCallIds: () => {
+          const { branch, proj } = this.forkParentState(archive);
+          const ids = branchRetiredResponsesCallIds(branch, proj.entries);
+          for (const id of snapReplay().retiredCallIds) ids.add(id);
+          return ids;
+        },
+        hasMutatedHistory: () => {
+          const { branch, proj } = this.forkParentState(archive);
+          return snapReplay().mutated || branchHasMutatedHistory(branch, proj.entries);
+        },
+        appliedFolds: () => {
+          const active = appliedFolds(this.forkParentState(archive).branch);
+          for (const other of folds.slice(0, order)) {
+            if (!isNestedFoldUnfoldedAt(other, snapAt)) active.add(other.record.handle);
+          }
+          return active;
+        },
         record: fold.record
-      };
+      });
     });
+    return threads;
   }
 }
 

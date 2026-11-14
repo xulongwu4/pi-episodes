@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { relative } from 'node:path';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
-import type { ImageContent, TextContent } from '@earendil-works/pi-ai';
+import type { AssistantMessage, ImageContent, TextContent } from '@earendil-works/pi-ai';
 import type {
   ContextEditEntryDraft,
   ExtensionAPI,
@@ -18,18 +18,38 @@ import {
   FOLD_REQUEST_TYPE,
   FOLD_STARTED_TYPE,
   FOLD_TOOL,
+  FOLD_UNFOLD_STARTED_TYPE,
+  FOLD_UNFOLDED_TYPE,
   type FoldDetails,
   foldNoteDetails,
-  ThreadIndex
+  ThreadIndex,
+  UNFOLD_TOOL
 } from './archive.js';
 import { anchorGapTokens } from './cache.js';
 import { type FoldRejection, recordEvent } from './events.js';
 import { estimateTokens, readOnlyPaths, skillPaths, textOf, touchedPaths } from './messages.js';
+import { retireAssistantContent } from './retire.js';
+
+export * from './retire.js';
+
 import type { DiskChange } from './snapshots.js';
-import { isStampBlock, parseStamp, readStamp, stampLabel, unstampedText } from './stamps.js';
+import {
+  isStampBlock,
+  parseStamp,
+  readStamp,
+  stampLabel,
+  unstampedText,
+  withStamp
+} from './stamps.js';
 import type { EpisodeState } from './state.js';
 import { episodeStats, statsLines } from './stats.js';
-import { foldRenderers, formatTokens, refreshStatus } from './ui.js';
+import {
+  foldRenderers,
+  formatTokens,
+  refreshStatus,
+  type UnfoldDetails,
+  unfoldRenderers
+} from './ui.js';
 
 /** User text above this size is kept as a head plus a pointer into the archive. */
 export const USER_TEXT_CAP = 4000;
@@ -542,14 +562,18 @@ export function workSince(
       }
     }
     const message = entryMessage(entry);
-    if (message?.role === 'toolResult' && foldNoteDetails(message)) calls.add(message.toolCallId);
+    if (message?.role === 'toolResult') {
+      const fold = foldNoteDetails(message);
+      if (fold && applied.has(fold.handle)) calls.add(message.toolCallId);
+    }
   }
   let folded = false;
   const left: ProjectedSessionEntry[] = [];
   for (let index = after + 1; index < entries.length; index++) {
     const entry = entries[index]!;
     const message = entryMessage(entry);
-    if (message?.role === 'toolResult' && foldNoteDetails(message)) continue;
+    const fold = message?.role === 'toolResult' ? foldNoteDetails(message) : undefined;
+    if (fold && applied.has(fold.handle)) continue;
     if (
       message?.role === 'assistant' &&
       message.content.some((block) => block.type === 'toolCall' && calls.has(block.id))
@@ -665,56 +689,118 @@ function editedContent(
   return content;
 }
 
+function unfinishedBatches(branch: readonly SessionEntry[]): {
+  index: number;
+  kind: 'fold' | 'unfold';
+  handle: string;
+  edits: ContextEditEntryDraft[];
+}[] {
+  const open = new Map<
+    string,
+    { index: number; kind: 'fold' | 'unfold'; handle: string; edits: ContextEditEntryDraft[] }
+  >();
+  branch.forEach((entry, index) => {
+    if (entry.type !== 'custom') return;
+    const data = (entry.data ?? {}) as { handle?: unknown; edits?: unknown };
+    if (typeof data.handle !== 'string') return;
+    if (entry.customType === FOLD_STARTED_TYPE && Array.isArray(data.edits)) {
+      open.set(`fold:${data.handle}`, {
+        index,
+        kind: 'fold',
+        handle: data.handle,
+        edits: data.edits as ContextEditEntryDraft[]
+      });
+    } else if (entry.customType === FOLD_APPLIED_TYPE) {
+      open.delete(`fold:${data.handle}`);
+    } else if (entry.customType === FOLD_UNFOLD_STARTED_TYPE && Array.isArray(data.edits)) {
+      open.set(`unfold:${data.handle}`, {
+        index,
+        kind: 'unfold',
+        handle: data.handle,
+        edits: data.edits as ContextEditEntryDraft[]
+      });
+    } else if (entry.customType === FOLD_UNFOLDED_TYPE) {
+      open.delete(`unfold:${data.handle}`);
+    }
+  });
+  return [...open.values()].sort((a, b) => a.index - b.index);
+}
+
 /**
- * The rest of the edits of folds cut short partway. An applied fold writes a start entry holding
- * its planned edits, then the edits in that order, then the applied marker; Pi writes them one
- * at a time, so a crash can stop the batch midway. For a start entry without a marker, each
- * planned edit whose target does not already carry that replacement, as its latest edit, is
- * written again, in the planned order, then the marker. That holds for a removal whatever was
- * done to its target since: a span removed in part must not keep a result whose call is gone.
- * The cut of a user message only saves tokens, so an edit made to that message after the fold
- * started, by anyone, stands and the cut is not written over it. A fold without a start entry
- * never took effect. One whose note another extension has removed since is completed like any
- * other: its record then says what a fold removed whole and lost its note afterwards says,
- * and no part of the span stays in context for a later fold to archive a second time. No fold
- * of this extension removes that note, because fold refuses to run while a start entry has
- * no marker.
- * `pending` holds the drafts earlier handlers of this boundary queued, which land first.
+ * The rest of the edits of folds or unfolds cut short partway. Each batch writes a start entry
+ * holding its planned edits, then the edits in that order, then the completion marker; Pi writes
+ * them one at a time, so a crash can stop the batch midway. `pending` holds the drafts earlier
+ * handlers of this boundary queued, which land first.
  */
 export function completeCutShortFolds(
   branch: readonly SessionEntry[],
   pending: readonly PendingDraft[] = []
 ): (ContextEditEntryDraft | { type: 'custom'; customType: string; data: { handle: string } })[] {
-  const applied = appliedFolds(branch);
-  return branch.flatMap((start, index) => {
-    if (start.type !== 'custom' || start.customType !== FOLD_STARTED_TYPE) return [];
-    const { handle, edits } = (start.data ?? {}) as { handle?: unknown; edits?: unknown };
-    if (typeof handle !== 'string' || applied.has(handle) || !Array.isArray(edits)) return [];
-    const latest = new Map<string, string>();
+  const branchById = new Map(branch.map((entry) => [entry.id, entry]));
+  const assistantBlocks = (replacement: unknown): AssistantMessage['content'] | undefined => {
+    if (!replacement || typeof replacement !== 'object') return undefined;
+    const raw = (replacement as { content?: unknown }).content;
+    if (typeof raw === 'string') return [{ type: 'text', text: raw }];
+    return Array.isArray(raw) ? (raw as AssistantMessage['content']) : [];
+  };
+  return unfinishedBatches(branch).flatMap(({ index, kind, handle, edits }) => {
+    const latestRaw = new Map<string, unknown>();
     for (const entry of [...branch.slice(index + 1), ...pending]) {
       if (entry.type === 'context_edit' && entry.targetId !== undefined) {
-        latest.set(entry.targetId, JSON.stringify(entry.replacement));
+        latestRaw.set(entry.targetId, entry.replacement);
       }
     }
-    const marker = { type: 'custom' as const, customType: FOLD_APPLIED_TYPE, data: { handle } };
-    const rest = (edits as ContextEditEntryDraft[]).filter((edit) => {
-      const now = latest.get(edit.targetId);
-      if (now === JSON.stringify(edit.replacement)) return false;
-      return edit.replacement === null || now === undefined;
+    const marker = {
+      type: 'custom' as const,
+      customType: kind === 'fold' ? FOLD_APPLIED_TYPE : FOLD_UNFOLDED_TYPE,
+      data: { handle }
+    };
+    const rest = edits.flatMap((edit): ContextEditEntryDraft[] => {
+      if (!latestRaw.has(edit.targetId)) return [edit];
+      const newer = latestRaw.get(edit.targetId);
+      if (JSON.stringify(newer) === JSON.stringify(edit.replacement)) return [];
+      const source = branchById.get(edit.targetId);
+      if (kind === 'fold') {
+        if (edit.replacement === null) return [edit];
+        if (source?.type === 'message' && source.message.role === 'assistant') {
+          const blocks = assistantBlocks(newer);
+          const retired = blocks ? retireAssistantContent(blocks) : undefined;
+          return retired
+            ? [{ type: 'context_edit', targetId: edit.targetId, replacement: { content: retired } }]
+            : [];
+        }
+        return [];
+      }
+      const noteRecord = source?.type === 'message' ? foldNoteDetails(source.message) : undefined;
+      if (noteRecord?.handle === handle) {
+        const pendingNote = editedContent(edit.targetId, branch, pending);
+        if (pendingNote !== null && pendingNote !== undefined && source?.type === 'message') {
+          return [
+            {
+              type: 'context_edit',
+              targetId: edit.targetId,
+              replacement: { content: unfoldedNoteContent(source, pendingNote, handle, noteRecord) }
+            }
+          ];
+        }
+        return [];
+      }
+      if (source?.type === 'message' && source.message.role === 'assistant') {
+        const blocks = assistantBlocks(newer);
+        const retired = blocks ? retireAssistantContent(blocks) : undefined;
+        return retired
+          ? [{ type: 'context_edit', targetId: edit.targetId, replacement: { content: retired } }]
+          : [];
+      }
+      return [];
     });
     return [...rest, marker];
   });
 }
 
-/** The handle of a fold that started and has no applied marker; the next turn end completes it. */
+/** The handle of a fold or unfold that started and has no completion marker; the next turn end completes it. */
 export function cutShortFold(branch: readonly SessionEntry[]): string | undefined {
-  const applied = appliedFolds(branch);
-  for (const entry of branch) {
-    if (entry.type !== 'custom' || entry.customType !== FOLD_STARTED_TYPE) continue;
-    const handle = (entry.data as { handle?: unknown } | undefined)?.handle;
-    if (typeof handle === 'string' && !applied.has(handle)) return handle;
-  }
-  return undefined;
+  return unfinishedBatches(branch)[0]?.handle;
 }
 
 export interface FoldOptions {
@@ -769,7 +855,10 @@ export function planFold(
   const foldResponse = entryMessage(entries[foldIndex]!);
   const firstFold =
     foldResponse?.role === 'assistant'
-      ? foldResponse.content.find((block) => block.type === 'toolCall' && block.name === FOLD_TOOL)
+      ? foldResponse.content.find(
+          (block) =>
+            block.type === 'toolCall' && (block.name === FOLD_TOOL || block.name === UNFOLD_TOOL)
+        )
       : undefined;
   if (firstFold?.type === 'toolCall' && firstFold.id !== foldCallId) {
     throw new FoldError('one-per-response', 'Only one fold per response; this one was ignored.');
@@ -924,10 +1013,26 @@ export function planFold(
     }
   }
 
-  // Pi writes these edits one entry at a time, so a crash can apply only some of them. Removing
-  // the span from its end keeps every applied prefix a valid context: a call that lost its
-  // result gets a placeholder from pi-ai, but a result whose call is gone reaches the provider.
+  // Pi writes these edits one entry at a time, so a crash can apply only some of them. Retiring
+  // surviving assistant signatures first ensures no mutated prefix ever coexists with unretired
+  // signatures, and removing the span from its end keeps every intermediate prefix valid.
   edits.reverse();
+  const retireEdits: ContextEditEntryDraft[] = [];
+  for (let index = endIndex; index < entries.length; index++) {
+    const entry = entries[index]!;
+    if (entry.messages.length === 0) continue;
+    const shown = entry.messages[0];
+    if (shown?.role !== 'assistant') continue;
+    const retired = retireAssistantContent(shown.content);
+    if (retired) {
+      retireEdits.push({
+        type: 'context_edit',
+        targetId: entry.sourceEntry.id,
+        replacement: { content: retired }
+      });
+    }
+  }
+  edits.unshift(...retireEdits);
 
   let anchorStamp: number | undefined;
   for (let index = startIndex - 1; index >= 0 && anchorStamp === undefined; index--) {
@@ -1075,6 +1180,390 @@ export function renderCovered(covers: readonly CoveredNote[]): string | undefine
     ])
   ].join('\n');
 }
+
+export interface UnfoldPlan {
+  handle: string;
+  record: FoldDetails;
+  noteEntryId: string;
+  edits: ContextEditEntryDraft[];
+}
+
+function defaultEntryContent(
+  entry: SessionEntry
+): (TextContent | ImageContent)[] | AssistantMessage['content'] | string | undefined {
+  if (entry.type === 'custom_message') return entry.content ?? [];
+  if (entry.type !== 'message') return undefined;
+  const msg = entry.message;
+  if (msg.role === 'user' || msg.role === 'assistant' || msg.role === 'toolResult') {
+    return msg.content ?? [];
+  }
+  return undefined;
+}
+
+function stripKeptSuffix(text: string, keptChars: number | undefined): string {
+  if (keptChars !== undefined && keptChars > 0 && text.length >= keptChars + 2) {
+    const start = text.length - keptChars;
+    if (text.slice(start - 2, start) === '\n\n' && text.slice(start).startsWith(KEPT_TITLE)) {
+      return text.slice(0, start - 2);
+    }
+  }
+  const idx = text.indexOf(`\n\n${KEPT_TITLE}`);
+  return idx >= 0 ? text.slice(0, idx) : text;
+}
+
+function unfoldedNoteContent(
+  noteEntry: SessionEntry & { type: 'message' },
+  current: readonly (TextContent | ImageContent)[],
+  handle: string,
+  details: FoldDetails
+): (TextContent | ImageContent)[] {
+  const stamp = readStamp(noteEntry.message);
+  const marker = `[unfolded ${handle}]`;
+  if (noteEntry.message.role === 'toolResult' && noteEntry.message.toolName === FOLD_TOOL) {
+    return stamp === undefined ? [{ type: 'text', text: marker }] : withStamp(marker, stamp);
+  }
+  // Script result: keep what the script emitted on its own (including script images), drop
+  // covered-note images appended by fold, and replace the rendered or JSON-escaped note.
+  const last = current.at(-1);
+  const rawBody = last && isStampBlock(last) ? current.slice(0, -1) : [...current];
+  const carriedCount = details.carriedImages ?? 0;
+  let body = rawBody;
+  if (carriedCount > 0) {
+    const dropIndices = new Set<number>();
+    if (details.written?.blocks !== undefined) {
+      for (
+        let i = details.written.blocks;
+        i < rawBody.length && dropIndices.size < carriedCount;
+        i++
+      ) {
+        if (rawBody[i]?.type === 'image') dropIndices.add(i);
+      }
+    } else {
+      for (let i = rawBody.length - 1; i >= 0 && dropIndices.size < carriedCount; i--) {
+        if (rawBody[i]?.type === 'image') dropIndices.add(i);
+      }
+    }
+    if (dropIndices.size > 0) {
+      body = rawBody.filter((_, idx) => !dropIndices.has(idx));
+    }
+  }
+
+  const candidates = [
+    details.renderedNote,
+    details.renderedNote ? JSON.stringify(details.renderedNote).slice(1, -1) : undefined,
+    details.note?.trim(),
+    details.note ? JSON.stringify(details.note.trim()).slice(1, -1) : undefined
+  ].filter((item): item is string => Boolean(item && item.length > 0));
+
+  const next: (TextContent | ImageContent)[] = [];
+  let marked = false;
+  for (const block of body) {
+    if (block.type !== 'text') {
+      next.push(block);
+      continue;
+    }
+    if (block.text.startsWith(KEPT_TITLE)) {
+      if (!marked) {
+        next.push({ type: 'text', text: marker });
+        marked = true;
+      }
+      continue;
+    }
+    const cleaned = stripKeptSuffix(block.text, details.written?.kept?.chars);
+    if (cleaned.startsWith(`[fold ${handle}:`)) {
+      if (!marked) {
+        next.push({ type: 'text', text: marker });
+        marked = true;
+      }
+      continue;
+    }
+    const hit = candidates.find((candidate) => cleaned.includes(candidate));
+    if (hit !== undefined) {
+      next.push({ type: 'text', text: cleaned.replace(hit, marker) });
+      marked = true;
+      continue;
+    }
+    if (cleaned !== block.text) {
+      if (cleaned.length > 0) next.push({ type: 'text', text: cleaned });
+      if (!marked) {
+        next.push({ type: 'text', text: marker });
+        marked = true;
+      }
+      continue;
+    }
+    next.push(block);
+  }
+  if (!marked) next.push({ type: 'text', text: marker });
+  return stamp === undefined ? next : withStamp(next, stamp);
+}
+
+function editSignature(targetId: string, replacement: unknown): string {
+  return `${targetId}\0${JSON.stringify(replacement)}`;
+}
+
+function attributeEpisodesEdits(
+  branch: readonly SessionEntry[]
+): Map<string, { kind: 'fold' | 'unfold'; handle: string }> {
+  const owners = new Map<string, { kind: 'fold' | 'unfold'; handle: string }>();
+  const latestStartedSigs = new Map<string, Set<string>>();
+  for (let i = 0; i < branch.length; i++) {
+    const entry = branch[i]!;
+    if (entry.type !== 'custom') continue;
+    const data = (entry.data ?? {}) as { handle?: unknown; edits?: unknown };
+    if (typeof data.handle !== 'string') continue;
+    if (
+      (entry.customType === FOLD_STARTED_TYPE || entry.customType === FOLD_UNFOLD_STARTED_TYPE) &&
+      Array.isArray(data.edits)
+    ) {
+      const kind: 'fold' | 'unfold' = entry.customType === FOLD_STARTED_TYPE ? 'fold' : 'unfold';
+      const sigs = new Set<string>(
+        (data.edits as ContextEditEntryDraft[]).map((edit) =>
+          editSignature(edit.targetId, edit.replacement)
+        )
+      );
+      latestStartedSigs.set(`${kind}:${data.handle}`, sigs);
+      for (let j = i + 1; j < branch.length; j++) {
+        const step = branch[j]!;
+        if (step.type !== 'context_edit') break;
+        if (!sigs.has(editSignature(step.targetId, step.replacement))) break;
+        owners.set(step.id, { kind, handle: data.handle });
+      }
+    } else if (entry.customType === FOLD_APPLIED_TYPE || entry.customType === FOLD_UNFOLDED_TYPE) {
+      const kind: 'fold' | 'unfold' = entry.customType === FOLD_APPLIED_TYPE ? 'fold' : 'unfold';
+      const sigs = latestStartedSigs.get(`${kind}:${data.handle}`);
+      if (!sigs) continue;
+      for (let j = i - 1; j >= 0; j--) {
+        const step = branch[j]!;
+        if (step.type !== 'context_edit') break;
+        if (!sigs.has(editSignature(step.targetId, step.replacement))) break;
+        if (!owners.has(step.id)) owners.set(step.id, { kind, handle: data.handle });
+      }
+    }
+  }
+  return owners;
+}
+
+/**
+ * Works out the edits that reverse an applied fold in place up to the latest compaction.
+ * Any fold still covering or overlapping `handle` must be unfolded first; any earlier fold
+ * that `handle` covered stays in effect, and newer external edits stand.
+ */
+export function planUnfold(
+  branch: readonly SessionEntry[],
+  projection: readonly ProjectedSessionEntry[],
+  handle: string,
+  options: { callerId?: string } = {}
+): UnfoldPlan {
+  const trimmed = handle.trim();
+  if (trimmed.startsWith('fk-')) {
+    throw new Error(
+      `${trimmed} is a fork, not an inline fold; fork transcripts stay archived and can be searched with recall or queried with ask.`
+    );
+  }
+  if (trimmed.startsWith('cp-')) {
+    throw new Error(
+      `${trimmed} is a compaction archive, not a fold; compacted turns remain accessible via recall.`
+    );
+  }
+
+  const branchIndexById = new Map<string, number>();
+  const noteEntryIdByHandle = new Map<string, string>();
+  branch.forEach((entry, idx) => {
+    branchIndexById.set(entry.id, idx);
+    const fold = entry.type === 'message' ? foldNoteDetails(entry.message) : undefined;
+    if (fold) noteEntryIdByHandle.set(fold.handle, entry.id);
+  });
+
+  const applied = appliedFolds(branch);
+  const noteEntryId = noteEntryIdByHandle.get(trimmed);
+  const noteIndex = noteEntryId === undefined ? -1 : (branchIndexById.get(noteEntryId) ?? -1);
+  if (noteIndex < 0 || !applied.has(trimmed)) {
+    throw new Error(`No active fold ${trimmed} on this branch.`);
+  }
+  const noteEntry = branch[noteIndex] as SessionEntry & { type: 'message' };
+  const record = foldNoteDetails(noteEntry.message)!;
+
+  const firstBranchIndex = branchIndexById.get(record.firstEntryId) ?? -1;
+  if (firstBranchIndex < 0) {
+    throw new Error(`Cannot find the start of ${trimmed} on this branch.`);
+  }
+  const rawLastBranchIndex = branchIndexById.get(record.lastEntryId) ?? -1;
+  const lastBranchIndex =
+    rawLastBranchIndex >= firstBranchIndex ? rawLastBranchIndex : firstBranchIndex;
+
+  for (let index = noteIndex + 1; index < branch.length; index++) {
+    const later = branch[index]!;
+    const laterFold = later.type === 'message' ? foldNoteDetails(later.message) : undefined;
+    if (!laterFold || !applied.has(laterFold.handle)) continue;
+    if (laterFold.covers?.includes(trimmed)) {
+      throw new Error(
+        `${trimmed} is covered by ${laterFold.handle}; unfold ${laterFold.handle} first.`
+      );
+    }
+    const laterFirst = branchIndexById.get(laterFold.firstEntryId) ?? -1;
+    const laterLast = Math.max(
+      laterFirst,
+      branchIndexById.get(laterFold.lastEntryId) ?? laterFirst
+    );
+    if (laterFirst >= 0 && laterFirst <= lastBranchIndex && laterLast >= firstBranchIndex) {
+      throw new Error(
+        `${trimmed} overlaps active fold ${laterFold.handle}; unfold ${laterFold.handle} first.`
+      );
+    }
+  }
+
+  const compactionIndex = branch.findLastIndex((entry) => entry.type === 'compaction');
+  if (compactionIndex >= 0) {
+    const compaction = branch[compactionIndex] as SessionEntry & {
+      type: 'compaction';
+      firstKeptEntryId: string;
+    };
+    const firstKeptIndex = branchIndexById.get(compaction.firstKeptEntryId) ?? -1;
+    if (
+      firstBranchIndex <= compactionIndex &&
+      (firstKeptIndex < 0 || firstBranchIndex < firstKeptIndex)
+    ) {
+      throw new Error(
+        `${trimmed} lies before the latest compaction: its turns were compacted by pi and remain accessible via recall and ask.`
+      );
+    }
+  }
+
+  if (
+    options.callerId !== undefined &&
+    !projection.some((entry) => callsTool(entry, options.callerId!))
+  ) {
+    throw new Error('The response that called unfold is not in the current context.');
+  }
+
+  const remaining = new Set(applied);
+  remaining.delete(trimmed);
+  const editOwners = attributeEpisodesEdits(branch);
+
+  // Chronological replay of what stands on `target` when folds no longer in `remaining` are
+  // removed, while active folds in `remaining`, unfolded note stubs, and external edits stand.
+  const desiredWithoutOwn = (
+    target: SessionEntry
+  ): ContextEditEntryDraft['replacement'] | undefined => {
+    const baseContent = defaultEntryContent(target);
+    let state: ContextEditEntryDraft['replacement'] | undefined =
+      baseContent === undefined ? undefined : { content: baseContent };
+    for (const entry of branch) {
+      if (entry.type !== 'context_edit' || entry.targetId !== target.id) continue;
+      const owner = editOwners.get(entry.id);
+      if (!owner) {
+        state = entry.replacement;
+        continue;
+      }
+      if (owner.kind === 'fold') {
+        if (remaining.has(owner.handle)) state = entry.replacement;
+        continue;
+      }
+      // Unfold batch: keep its `[unfolded ...]` stub on its own note (while still unfolded) and
+      // permanent assistant signature retirements; skip span restorations so active folds/externals win.
+      const isUnfoldedStub =
+        !remaining.has(owner.handle) && target.id === noteEntryIdByHandle.get(owner.handle);
+      const isAssistantRetire = target.type === 'message' && target.message.role === 'assistant';
+      if (isUnfoldedStub || isAssistantRetire) {
+        state = entry.replacement;
+      }
+    }
+    return state;
+  };
+
+  const spanSlice = branch.slice(firstBranchIndex, lastBranchIndex + 1);
+  const byId = new Map(projection.map((entry) => [entry.sourceEntry.id, entry]));
+  const restoreEdits: ContextEditEntryDraft[] = [];
+
+  // Restore span entries in forward order so each assistant turn returns before its toolResults.
+  for (const entry of spanSlice) {
+    const editable =
+      entry.type === 'custom_message' ||
+      (entry.type === 'message' &&
+        (entry.message.role === 'user' ||
+          entry.message.role === 'assistant' ||
+          entry.message.role === 'toolResult'));
+    if (!editable) continue;
+    const desired = desiredWithoutOwn(entry);
+    if (desired === undefined) continue;
+    let finalDesired = desired;
+    if (finalDesired !== null && entry.type === 'message' && entry.message.role === 'assistant') {
+      const blocks = Array.isArray(finalDesired.content)
+        ? (finalDesired.content as AssistantMessage['content'])
+        : ([{ type: 'text', text: String(finalDesired.content) }] as AssistantMessage['content']);
+      const retired = retireAssistantContent(blocks);
+      if (retired) finalDesired = { content: retired };
+    }
+    const projected = byId.get(entry.id);
+    const firstMsg = projected?.messages[0];
+    const current =
+      projected === undefined
+        ? undefined
+        : firstMsg === undefined
+          ? null
+          : 'content' in firstMsg
+            ? { content: firstMsg.content }
+            : undefined;
+    if (JSON.stringify(current) !== JSON.stringify(finalDesired)) {
+      restoreEdits.push({ type: 'context_edit', targetId: entry.id, replacement: finalDesired });
+    }
+  }
+
+  const noteProjectedEntry = byId.get(noteEntry.id);
+  const noteProjected = noteProjectedEntry?.messages[0];
+  const currentNoteBlocks =
+    noteProjected?.role === 'toolResult'
+      ? noteProjected.content
+      : (noteEntry.message as { content: (TextContent | ImageContent)[] }).content;
+  const noteReplacement =
+    noteProjectedEntry !== undefined && noteProjectedEntry.messages.length === 0
+      ? null
+      : { content: unfoldedNoteContent(noteEntry, currentNoteBlocks, trimmed, record) };
+  const noteEdits: ContextEditEntryDraft[] =
+    noteReplacement !== null
+      ? [
+          {
+            type: 'context_edit',
+            targetId: noteEntry.id,
+            replacement: noteReplacement
+          }
+        ]
+      : [];
+
+  // Retire stale thinking/replay signatures on every surviving assistant entry from the span start
+  // onward FIRST, so an interrupted batch never leaves restored messages before signed turns.
+  const retireEdits: ContextEditEntryDraft[] = [];
+  const spanIds = new Set(spanSlice.map((entry) => entry.id));
+  for (const entry of projection) {
+    if (entry.messages.length === 0 || spanIds.has(entry.sourceEntry.id)) continue;
+    const idx = branchIndexById.get(entry.sourceEntry.id) ?? -1;
+    if (idx < firstBranchIndex) continue;
+    const shown = entry.messages[0];
+    if (shown?.role !== 'assistant') continue;
+    const retired = retireAssistantContent(shown.content);
+    if (retired) {
+      retireEdits.push({
+        type: 'context_edit',
+        targetId: entry.sourceEntry.id,
+        replacement: { content: retired }
+      });
+    }
+  }
+
+  return {
+    handle: trimmed,
+    record,
+    noteEntryId: noteEntry.id,
+    edits: [...retireEdits, ...restoreEdits, ...noteEdits]
+  };
+}
+
+const UnfoldParams = Type.Object({
+  handle: Type.String({
+    description:
+      'Handle of the applied fold to restore in place, such as "ep-1a2b3c4d". Must lie after the latest compaction and not be covered by a later active fold.'
+  })
+});
 
 const FoldParams = Type.Object({
   since: Type.String({
@@ -1308,10 +1797,93 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       const shown = carried && !scriptCall ? `${text}\n\n${carried}` : text;
       const written = [{ type: 'text' as const, text: shown }];
       // A script's result is recorded when it is there, with what the script printed.
+      details.renderedNote = text;
+      if (plan.images.length > 0) details.carriedImages = plan.images.length;
       if (scriptCall) return { content: written, details, terminate };
       details.written = writtenMark(written, carried);
       // The images of the covered notes follow what the fold wrote, as blocks added to it.
       return { content: [...written, ...plan.images], details, terminate };
+    }
+  });
+
+  pi.registerTool({
+    name: UNFOLD_TOOL,
+    label: 'Unfold',
+    description:
+      'Restore a folded episode in place: bring back the turns `handle` removed after the latest compaction and retire its fold note. A fold covered by a later fold can be unfolded once the covering fold is unfolded first.',
+    promptSnippet: 'Restore a post-compaction folded episode in place',
+    parameters: UnfoldParams,
+    executionMode: 'sequential',
+    renderCall: unfoldRenderers.renderCall,
+    renderResult: unfoldRenderers.renderResult,
+
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      const root = state.rootCall(toolCallId);
+      const scriptCall = root === toolCallId ? undefined : root;
+      const run = state.run;
+      const projection = ctx.sessionManager.buildSessionProjection().entries;
+      const branch = ctx.sessionManager.getBranch();
+      const caller = projection.find((entry) => callsTool(entry, scriptCall ?? toolCallId));
+      if (caller) {
+        const reserved = state.foldResponses.get(caller.sourceEntry.id);
+        if (reserved !== undefined && reserved !== toolCallId) {
+          throw new Error('Only one fold or unfold per response; this one was ignored.');
+        }
+        state.foldResponses.set(caller.sourceEntry.id, toolCallId);
+      }
+      const unfinished = cutShortFold(branch);
+      if (unfinished !== undefined) {
+        throw new Error(
+          `${unfinished} was interrupted partway and is completed when this response ends. Unfold again in your next response.`
+        );
+      }
+      const response = caller ? entryMessage(caller) : undefined;
+      const firstAction =
+        response?.role === 'assistant'
+          ? response.content.find(
+              (block) =>
+                block.type === 'toolCall' &&
+                (block.name === FOLD_TOOL || block.name === UNFOLD_TOOL)
+            )
+          : undefined;
+      if (!scriptCall && firstAction?.type === 'toolCall' && firstAction.id !== toolCallId) {
+        throw new Error('Only one fold or unfold per response; this one was ignored.');
+      }
+
+      const plan = planUnfold(branch, projection, params.handle, {
+        callerId: scriptCall ?? toolCallId
+      });
+      if (signal?.aborted || run !== state.run) throw new Error('The unfold was cancelled.');
+
+      state.pendingUnfolds.set(scriptCall ?? toolCallId, {
+        handle: plan.handle,
+        record: plan.record,
+        messages: plan.record.messages,
+        tokens: plan.record.tokens,
+        edits: plan.edits,
+        noteEntryId: plan.noteEntryId
+      });
+
+      const range = plan.record.until
+        ? `${plan.record.since}-${plan.record.until}`
+        : `from ${plan.record.since} on`;
+      const details: UnfoldDetails = {
+        kind: 'unfold',
+        handle: plan.handle,
+        since: plan.record.since,
+        ...(plan.record.until ? { until: plan.record.until } : {}),
+        messages: plan.record.messages,
+        tokens: plan.record.tokens
+      };
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `[unfolded ${plan.handle}: restored ${plan.record.messages} messages, ${range}, ~${formatTokens(plan.record.tokens)} tokens]`
+          }
+        ],
+        details
+      };
     }
   });
 
@@ -1339,12 +1911,21 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     if (note !== pending.script.note.trim()) pending.script.changed = true;
     pending.script.note = note;
   });
+
+  // A result hook can fail a nested unfold call after it ran, and the script can catch that.
+  pi.on('tool_execution_end', (event) => {
+    if (!event.parentToolCallId || event.toolName !== UNFOLD_TOOL || !event.isError) return;
+    state.pendingUnfolds.delete(state.rootCall(event.toolCallId));
+  });
   // A fold from a script takes effect only if the script succeeds. Its result then carries the
   // fold's details, the note too when the script did not print it, and the notes the fold
   // covers, written once with the result rather than edited in later.
   pi.on('tool_result', (event) => {
     if (event.parentToolCallId) return undefined;
     const pending = state.pendingFolds.get(event.toolCallId);
+    if (event.isError) {
+      state.pendingUnfolds.delete(event.toolCallId);
+    }
     const script = pending?.script;
     if (!script) return undefined;
     if (event.isError) {
@@ -1364,8 +1945,10 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     // The result as the fold leaves it, for the fold that covers this note to know it by;
     // not when a hook changed the note on its way to the script, which that fold must keep
     // as the result has it.
+    script.details.renderedNote = script.note;
     script.details.written = writtenMark(written, pending.carried, script.changed);
     const images = pending.images ?? [];
+    if (images.length > 0) script.details.carriedImages = images.length;
     if (added.length === 0 && images.length === 0) return { details };
     // The images of the covered notes follow what the fold wrote, as blocks added to it.
     const content = [...written, ...images];
@@ -1408,8 +1991,54 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         state.pendingFolds.delete(result.toolCallId);
         return [pending];
       });
+    const unfolded = event.toolResults
+      .filter((result) => !result.isError)
+      .flatMap((result) => {
+        const pending = state.pendingUnfolds.get(result.toolCallId);
+        if (!pending) return [];
+        state.pendingUnfolds.delete(result.toolCallId);
+        return [pending];
+      });
     const repairs = completeCutShortFolds(branch, event.entries);
-    if (applied.length === 0 && repairs.length === 0) return undefined;
+    if (applied.length === 0 && unfolded.length === 0 && repairs.length === 0) return undefined;
+
+    const branchById = new Map(branch.map((entry) => [entry.id, entry]));
+    const latestPendingEdit = (targetId: string): PendingDraft | undefined =>
+      (event.entries as readonly PendingDraft[]).findLast(
+        (draft) => draft.type === 'context_edit' && draft.targetId === targetId
+      );
+    const assistantBlocksOf = (replacement: unknown): AssistantMessage['content'] | undefined => {
+      if (!replacement || typeof replacement !== 'object') return undefined;
+      const content = (replacement as { content?: unknown }).content;
+      if (typeof content === 'string') return [{ type: 'text', text: content }];
+      return Array.isArray(content) ? (content as AssistantMessage['content']) : [];
+    };
+    const reconcileAssistantPending = (
+      targetId: string
+    ): ContextEditEntryDraft | null | undefined => {
+      const pending = latestPendingEdit(targetId);
+      if (!pending) return undefined;
+      if (!pending.replacement) return null;
+      const blocks = assistantBlocksOf(pending.replacement);
+      const retired = blocks ? retireAssistantContent(blocks) : undefined;
+      return retired ? { type: 'context_edit', targetId, replacement: { content: retired } } : null;
+    };
+    const retireCurrent = (): ContextEditEntryDraft[] => {
+      if (event.message.role !== 'assistant' || !event.messageEntryId) return [];
+      const reconciled = reconcileAssistantPending(event.messageEntryId);
+      if (reconciled !== undefined) return reconciled ? [reconciled] : [];
+      const retired = retireAssistantContent(event.message.content);
+      return retired
+        ? [
+            {
+              type: 'context_edit',
+              targetId: event.messageEntryId,
+              replacement: { content: retired }
+            }
+          ]
+        : [];
+    };
+
     // The cut of a user message only saves tokens, so an edit an earlier handler queued for
     // that message stands, as it does when a cut-short fold is completed. The note was written
     // before this boundary: if that edit removes the message, the note still lists its turn
@@ -1419,8 +2048,80 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         draft.type === 'context_edit' && draft.targetId !== undefined ? [draft.targetId] : []
       )
     );
-    const editsOf = (fold: { edits: readonly ContextEditEntryDraft[] }) =>
-      fold.edits.filter((edit) => edit.replacement === null || !edited.has(edit.targetId));
+    const editsOf = (fold: { edits: readonly ContextEditEntryDraft[] }) => {
+      const current = retireCurrent();
+      const currentIds = new Set(current.map((edit) => edit.targetId));
+      const base: ContextEditEntryDraft[] = [];
+      for (const edit of fold.edits) {
+        if (currentIds.has(edit.targetId)) continue;
+        if (edit.replacement === null) {
+          base.push(edit);
+          continue;
+        }
+        const source = branchById.get(edit.targetId);
+        if (source?.type === 'message' && source.message.role === 'assistant') {
+          const reconciled = reconcileAssistantPending(edit.targetId);
+          if (reconciled !== undefined) {
+            if (reconciled) base.push(reconciled);
+            continue;
+          }
+          base.push(edit);
+          continue;
+        }
+        if (!edited.has(edit.targetId)) base.push(edit);
+      }
+      return [...current, ...base];
+    };
+    const unfoldEditsOf = (unfold: {
+      handle: string;
+      record: FoldDetails;
+      edits: readonly ContextEditEntryDraft[];
+      noteEntryId: string;
+    }) => {
+      const current = retireCurrent();
+      const currentIds = new Set(current.map((edit) => edit.targetId));
+      const base: ContextEditEntryDraft[] = [];
+      for (const edit of unfold.edits) {
+        if (currentIds.has(edit.targetId)) continue;
+        if (edit.targetId === unfold.noteEntryId) {
+          if (!edited.has(unfold.noteEntryId)) {
+            base.push(edit);
+            continue;
+          }
+          const pendingNote = editedContent(unfold.noteEntryId, branch, event.entries);
+          const noteEntry = branchById.get(unfold.noteEntryId);
+          if (pendingNote !== null && pendingNote !== undefined && noteEntry?.type === 'message') {
+            base.push({
+              type: 'context_edit',
+              targetId: unfold.noteEntryId,
+              replacement: {
+                content: unfoldedNoteContent(noteEntry, pendingNote, unfold.handle, unfold.record)
+              }
+            });
+          }
+          continue;
+        }
+        const source = branchById.get(edit.targetId);
+        if (source?.type === 'message' && source.message.role === 'assistant') {
+          const reconciled = reconcileAssistantPending(edit.targetId);
+          if (reconciled !== undefined) {
+            if (reconciled) base.push(reconciled);
+            continue;
+          }
+          base.push(edit);
+          continue;
+        }
+        if (!edited.has(edit.targetId)) base.push(edit);
+      }
+      return [...current, ...base];
+    };
+    const repairRetire =
+      applied.length === 0 && unfolded.length === 0 && repairs.length > 0
+        ? retireCurrent().filter(
+            (edit) =>
+              !repairs.some((r) => r.type === 'context_edit' && r.targetId === edit.targetId)
+          )
+        : [];
 
     for (const fold of applied) {
       ctx.ui.notify(
@@ -1428,22 +2129,52 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         'info'
       );
     }
+    for (const unfold of unfolded) {
+      ctx.ui.notify(
+        `Unfolded ${unfold.handle} (${unfold.messages} messages, ~${formatTokens(unfold.tokens)} tokens)`,
+        'info'
+      );
+    }
     return {
       entries: [
         ...event.entries,
+        ...repairRetire,
         ...repairs,
         // The marker goes last. A fold cut short leaves part of its span removed, a valid
         // context, and no applied note; a marker written first would leave the rest of the span
         // stuck behind a note no fold can reach past.
-        ...applied.flatMap((fold) => [
-          {
-            type: 'custom' as const,
-            customType: FOLD_STARTED_TYPE,
-            data: { handle: fold.handle, edits: editsOf(fold) }
-          },
-          ...editsOf(fold),
-          { type: 'custom' as const, customType: FOLD_APPLIED_TYPE, data: { handle: fold.handle } }
-        ])
+        ...applied.flatMap((fold) => {
+          const edits = editsOf(fold);
+          return [
+            {
+              type: 'custom' as const,
+              customType: FOLD_STARTED_TYPE,
+              data: { handle: fold.handle, edits }
+            },
+            ...edits,
+            {
+              type: 'custom' as const,
+              customType: FOLD_APPLIED_TYPE,
+              data: { handle: fold.handle }
+            }
+          ];
+        }),
+        ...unfolded.flatMap((unfold) => {
+          const edits = unfoldEditsOf(unfold);
+          return [
+            {
+              type: 'custom' as const,
+              customType: FOLD_UNFOLD_STARTED_TYPE,
+              data: { handle: unfold.handle, edits }
+            },
+            ...edits,
+            {
+              type: 'custom' as const,
+              customType: FOLD_UNFOLDED_TYPE,
+              data: { handle: unfold.handle }
+            }
+          ];
+        })
       ]
     };
   });
@@ -1457,6 +2188,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
   // the run would otherwise not show until the next response.
   pi.on('agent_settled', (_event, ctx) => {
     state.pendingFolds.clear();
+    state.pendingUnfolds.clear();
     state.foldResponses.clear();
     state.parentCalls.clear();
     state.run++;

@@ -5,7 +5,7 @@ import {
   estimateTokens as estimateMessageTokens,
   type ProjectedSessionEntry
 } from '@earendil-works/pi-coding-agent';
-import { foldNoteDetails } from './archive.js';
+import { appliedFolds, foldNoteDetails } from './archive.js';
 import {
   coveredNotes,
   coveredTokens,
@@ -100,11 +100,14 @@ function dueBehindNote(
  * and folded its last request instead; the note is something it can find in its context.
  */
 function noteAt(entries: readonly ProjectedSessionEntry[], stamp: number): string {
+  const applied = appliedFolds(entries.map((entry) => entry.sourceEntry));
   for (const entry of entries) {
     const message = entry.messages[0];
     if (!message || readStamp(message) !== stamp) continue;
     const fold = foldNoteDetails(message);
-    return fold ? `, the stamp at the end of your note ${fold.handle}` : '';
+    return fold && applied.has(fold.handle)
+      ? `, the stamp at the end of your note ${fold.handle}`
+      : '';
   }
   return '';
 }

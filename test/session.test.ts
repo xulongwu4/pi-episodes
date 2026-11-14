@@ -84,7 +84,7 @@ async function createSession(
     thinkingLevel: 'off',
     modelRuntime: await ModelRuntime.create({ modelsPath: null, authPath: join(dir, 'auth.json') }),
     resourceLoader,
-    tools: ['bash', 'read', 'fold', 'recall', 'ask', 'fork'],
+    tools: ['bash', 'read', 'fold', 'unfold', 'recall', 'ask', 'fork'],
     sessionManager: options.persist
       ? SessionManager.create(dir, join(dir, 'sessions'))
       : SessionManager.inMemory(dir),

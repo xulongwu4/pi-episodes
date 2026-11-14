@@ -81,7 +81,9 @@ fold removed. Run one recall before retrying something a note says was rejected,
 editing a file a note points at, before acting on an error string or symbol you have seen
 before, and before saying "we already checked that". ask resumes an archived thread to
 answer one judgment question, such as why something was done; it re-reads the whole thread,
-usually uncached, so prefer recall when a search will do.
+usually uncached, so prefer recall when a search will do. When you folded too early and
+still need the whole span verbatim in context, unfold("ep-...") restores a post-compaction
+fold in place.
 
 Prefer working inline and folding after. Use fork when you know up front that the work is
 long and self-contained, or for independent parts that do not edit the same files; forks
@@ -91,10 +93,11 @@ for another agent, give it the user's requests and the diff, not your reasoning.
 
 `.trim();
 
-/** Appended when fold, recall and ask are called from codemode scripts, out of the model's view. */
+/** Appended when fold, unfold, recall and ask are called from codemode scripts, out of the model's view. */
 export const CODEMODE_CALLS = /* md */ `
 From a codemode script: tools.fold({ since: "t13", until?, note }),
-tools.recall({ query, handle?, regex?, limit? }) (limit 30 by default, at most 200; the
-rest go to a file), tools.recall({ handle, turn }) for a turn or a range of turns
-verbatim, and tools.ask({ handle, question }). Print what they return.
+tools.unfold({ handle: "ep-..." }), tools.recall({ query, handle?, regex?, limit? })
+(limit 30 by default, at most 200; the rest go to a file),
+tools.recall({ handle, turn }) for a turn or a range of turns verbatim, and
+tools.ask({ handle, question }). Print what they return.
 `.trim();
