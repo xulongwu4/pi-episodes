@@ -2311,7 +2311,13 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
               (!hasRefs || persistedDetails?.handle === pending?.handle)) &&
           (pending?.carried === undefined || textOf(content).includes(pending.carried)) &&
           holdsArchivedManifest(persistedDetails?.archivedImages, mediaItems) &&
-          holdsCarriedMedia(content, mediaItems, protectedPrefix, archiveDir(ctx.sessionManager));
+          holdsCarriedMedia(
+            content,
+            mediaItems,
+            protectedPrefix,
+            archiveDir(ctx.sessionManager),
+            pending?.handle
+          );
         if (!pending || !stands) return [];
         state.pendingFolds.delete(result.toolCallId);
         return [pending];

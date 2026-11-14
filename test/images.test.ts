@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { test } from 'node:test';
 import { deflateSync } from 'node:zlib';
 import {
@@ -1847,12 +1847,33 @@ test('readArchivedImage and verifyArchivedImageSync confine paths to archiveDir,
       /outside the session archive directory/
     );
 
-    // 4) Symlink inside archiveSubdir pointing to outsideFile MUST be rejected.
-    const symlinkPath = join(archiveSubdir, 'image-fedcba9876543210.png');
-    await symlink(outsideFile, symlinkPath);
-    const symlinkRef = { ...validRef, path: symlinkPath };
-    assert.equal(verifyArchivedImageSync(symlinkRef, archiveSubdir), false);
-    await assert.rejects(() => readArchivedImage(symlinkRef, archiveSubdir), /not a regular file/);
+    // 4a) Regular file inside archiveSubdir with image-<16 hex>.png shape NOT matching sha256 MUST be rejected.
+    const wrongHashPath = join(archiveSubdir, 'image-fedcba9876543210.png');
+    await writeFile(wrongHashPath, png);
+    const wrongHashRef = { ...validRef, path: wrongHashPath };
+    assert.equal(verifyArchivedImageSync(wrongHashRef, archiveSubdir), false);
+    await assert.rejects(
+      () => readArchivedImage(wrongHashRef, archiveSubdir),
+      /outside the session archive directory/
+    );
+
+    // 4b) Symlink at the exact expected basename inside an archive directory MUST be rejected.
+    const symlinkArchiveDir = join(outerDir, 'symlink-session.episodes');
+    await mkdir(symlinkArchiveDir, { recursive: true });
+    const exactSymlinkPath = join(symlinkArchiveDir, basename(validRef.path));
+    await symlink(outsideFile, exactSymlinkPath);
+    const symlinkRef = { ...validRef, path: exactSymlinkPath };
+    assert.equal(verifyArchivedImageSync(symlinkRef, symlinkArchiveDir), false);
+    await assert.rejects(
+      () => readArchivedImage(symlinkRef, symlinkArchiveDir),
+      /not a regular file/
+    );
+
+    // 4c) Oversized replacement file fails pre-read st.size check before reading/hashing.
+    const sizeArchiveDir = join(outerDir, 'size-session.episodes');
+    const sizeRef = (await archiveImage(sizeArchiveDir, 'ep-size0001', 1, pngBlock))!;
+    await writeFile(sizeRef.path, Buffer.concat([png, Buffer.alloc(4096)]));
+    await assert.rejects(() => readArchivedImage(sizeRef, sizeArchiveDir), /size verification/);
 
     // 5) When written.sha256 WAS recorded on a codemode script result and a hook prepended a block
     // (breaking written.sha256), unfold drops carriedImg from the end rather than deleting scriptImg at stale written.blocks.
@@ -1987,5 +2008,149 @@ test('readArchivedImage and verifyArchivedImageSync confine paths to archiveDir,
     );
   } finally {
     await rm(outerDir, { recursive: true, force: true });
+  }
+});
+
+test('relocated session directories resolve archived images, recall rejects query+image, and missing inherited archive files do not wedge later covering folds', async () => {
+  const dirA = await mkdtemp(join(tmpdir(), 'pi-episodes-relocate-a-'));
+  const dirB = await mkdtemp(join(tmpdir(), 'pi-episodes-relocate-b-'));
+  const pngBlock: ImageContent = {
+    type: 'image',
+    data: makePng(5, 4, [15, 160, 95]).toString('base64'),
+    mimeType: 'image/png'
+  };
+  const attachFirst: ExtensionFactory = (pi) => {
+    pi.on('tool_result', (event) => {
+      const joined = event.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+      if (
+        !/Relocatable screenshot note/.test(joined) ||
+        /Notes of the earlier folds/.test(joined)
+      ) {
+        return undefined;
+      }
+      return { content: [...event.content, pngBlock] };
+    });
+  };
+
+  try {
+    let ep2 = '';
+    const first = await createPersistedSession(
+      'off',
+      [
+        () =>
+          fauxAssistantMessage(fauxToolCall('bash', { command: 'echo step1' }), {
+            stopReason: 'toolUse'
+          }),
+        () =>
+          fauxAssistantMessage(
+            fauxToolCall('fold', { since: 't2', note: 'Relocatable screenshot note.' }),
+            { stopReason: 'toolUse' }
+          ),
+        () =>
+          fauxAssistantMessage(fauxToolCall('bash', { command: 'echo step2' }), {
+            stopReason: 'toolUse'
+          }),
+        () =>
+          fauxAssistantMessage(
+            fauxToolCall('fold', { since: 't3', note: 'Covering note before move.' }),
+            { stopReason: 'toolUse' }
+          ),
+        (context) => {
+          const latest = text(conversation(context).at(-1)!);
+          ep2 = /\[fold (ep-[0-9a-f]{8}):/.exec(latest)![1]!;
+          return fauxAssistantMessage('ready to relocate');
+        }
+      ],
+      [attachFirst],
+      { dir: dirA, keepDir: true }
+    );
+    await first.run('start');
+    const oldSessionFile = first.session.sessionManager.getSessionFile()!;
+    await first.cleanup();
+
+    // Move the entire sessions directory from dirA to dirB so old paths no longer exist.
+    const relocatedSessionsDir = join(dirB, 'moved-sessions');
+    await rename(join(dirA, 'sessions'), relocatedSessionsDir);
+    const movedSessionFile = join(relocatedSessionsDir, basename(oldSessionFile));
+    const movedManager = SessionManager.open(movedSessionFile);
+    const movedArchiveDir = archiveDir(movedManager)!;
+
+    let liveImagePath = '';
+    const second = await createPersistedSession(
+      'off',
+      [
+        // 1) Passing both query and image is rejected.
+        () =>
+          fauxAssistantMessage(fauxToolCall('recall', { handle: ep2, image: 1, query: 'step1' }), {
+            stopReason: 'toolUse'
+          }),
+        (context) => {
+          const errResult = conversation(context).at(-1)!;
+          assert.equal(errResult.role, 'toolResult');
+          assert.equal(errResult.isError, true);
+          assert.match(text(errResult), /either query or image, not both/);
+          // 2) Reading back the archived image from the moved session directory succeeds.
+          return fauxAssistantMessage(fauxToolCall('recall', { handle: ep2, image: 1 }), {
+            stopReason: 'toolUse'
+          });
+        },
+        async (context) => {
+          const okResult = conversation(context).at(-1)!;
+          assert.equal(okResult.role, 'toolResult');
+          assert.equal(okResult.isError, false);
+          assert.ok(typeof okResult.content !== 'string');
+          assert.deepEqual(
+            okResult.content.filter((b) => b.type === 'image'),
+            [pngBlock],
+            'recall succeeds after session directory relocation'
+          );
+          const headerText = text(okResult);
+          assert.ok(
+            headerText.includes(movedArchiveDir),
+            `expected live relocated path in ${headerText}`
+          );
+          const matchPath = /— ([^\]]+)\]/.exec(headerText);
+          assert.ok(matchPath);
+          liveImagePath = matchPath[1]!;
+          // 3) Delete the inherited archive file on disk; a later covering fold must NOT wedge!
+          await rm(liveImagePath, { force: true });
+          return fauxAssistantMessage(
+            fauxToolCall('bash', { command: 'echo noisy_step_to_fold' }),
+            { stopReason: 'toolUse' }
+          );
+        },
+        (context) => {
+          const ep2Msg = conversation(context).find((m) => text(m).includes(ep2))!;
+          const ep2Stamp = /\[(t\d+)\]\s*$/.exec(text(ep2Msg))![1]!;
+          return fauxAssistantMessage(
+            fauxToolCall('fold', {
+              since: ep2Stamp,
+              note: 'Covering note after old archive file was cleaned.'
+            }),
+            { stopReason: 'toolUse' }
+          );
+        },
+        (context) => {
+          const msgs = conversation(context);
+          const joined = msgs.map(text).join('\n');
+          assert.ok(
+            !joined.includes('noisy_step_to_fold'),
+            'covering fold succeeded and omitted noisy_step_to_fold despite missing old archive file'
+          );
+          assert.ok(
+            joined.includes(`[${ep2} image #1:`),
+            'inherited reference marker still carried forward on new covering fold'
+          );
+          return fauxAssistantMessage('done after relocation + cleanup');
+        }
+      ],
+      [],
+      { dir: dirB, keepDir: true, sessionManager: movedManager }
+    );
+    await second.run('continue');
+    await second.cleanup();
+  } finally {
+    await rm(dirA, { recursive: true, force: true });
+    await rm(dirB, { recursive: true, force: true });
   }
 });

@@ -401,17 +401,46 @@ export async function archiveImage(
 
 const ARCHIVED_IMAGE_BASENAME = /^image-[0-9a-f]{16}\.(png|jpg|gif|webp)$/;
 
-function isConfinedPathStructure(filePath: string, allowedDir: string | undefined): boolean {
-  if (!ARCHIVED_IMAGE_BASENAME.test(basename(filePath))) return false;
-  if (allowedDir === undefined) return true;
-  return dirname(resolve(filePath)) === resolve(allowedDir);
+function expectedImageBasename(ref: ArchivedImage): string | undefined {
+  const ext = IMAGE_EXTENSIONS[ref.mimeType];
+  if (!ext || typeof ref.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(ref.sha256)) {
+    return undefined;
+  }
+  return `image-${ref.sha256.slice(0, 16)}${ext}`;
+}
+
+/**
+ * Resolves `ref` inside `allowedDir`, binding its filename to `ref.sha256` and `ref.mimeType` and
+ * allowing session directories relocated to a new parent path while rejecting traversal or outside
+ * directories.
+ */
+export function resolveArchivedImagePath(
+  ref: ArchivedImage,
+  allowedDir?: string
+): string | undefined {
+  if (!ref.path || ref.path.includes('\0')) return undefined;
+  const rawSegments = ref.path.split(/[\\/]/).filter(Boolean);
+  if (rawSegments.includes('.') || rawSegments.includes('..')) return undefined;
+  const expectedBase = expectedImageBasename(ref);
+  const actualBase = rawSegments.at(-1);
+  if (!expectedBase || actualBase !== expectedBase || !ARCHIVED_IMAGE_BASENAME.test(actualBase)) {
+    return undefined;
+  }
+  if (allowedDir === undefined) {
+    return resolve(ref.path);
+  }
+  const resolvedAllowed = resolve(allowedDir);
+  if (rawSegments.at(-2) !== basename(resolvedAllowed)) {
+    return undefined;
+  }
+  return join(resolvedAllowed, expectedBase);
 }
 
 /** Synchronous integrity and path-confinement check used at `turn_end` before committing fold edits. */
 export function verifyArchivedImageSync(ref: ArchivedImage, allowedDir?: string): boolean {
   try {
-    if (!isConfinedPathStructure(ref.path, allowedDir)) return false;
-    const resolvedPath = resolve(ref.path);
+    const resolvedPath = resolveArchivedImagePath(ref, allowedDir);
+    if (!resolvedPath) return false;
     const st = lstatSync(resolvedPath);
     if (!st.isFile() || st.size !== ref.bytes) return false;
     if (allowedDir !== undefined) {
@@ -431,27 +460,34 @@ export async function readArchivedImage(
   ref: ArchivedImage,
   allowedDir?: string
 ): Promise<ImageContent> {
-  if (!isConfinedPathStructure(ref.path, allowedDir)) {
+  const resolvedPath = resolveArchivedImagePath(ref, allowedDir);
+  if (!resolvedPath) {
     throw new Error(
       `Archived image #${ref.index} of ${ref.handle} has a path outside the session archive directory.`
     );
   }
-  const resolvedPath = resolve(ref.path);
   let st: Awaited<ReturnType<typeof lstat>>;
   try {
     st = await lstat(resolvedPath);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | undefined)?.code;
     if (code === 'ENOENT') {
-      throw new Error(`Archived image #${ref.index} of ${ref.handle} is missing at ${ref.path}.`);
+      throw new Error(
+        `Archived image #${ref.index} of ${ref.handle} is missing at ${resolvedPath}.`
+      );
     }
     throw new Error(
-      `Archived image #${ref.index} of ${ref.handle} could not be read at ${ref.path}: ${error instanceof Error ? error.message : String(error)}`
+      `Archived image #${ref.index} of ${ref.handle} could not be read at ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`
     );
   }
   if (!st.isFile()) {
     throw new Error(
-      `Archived image #${ref.index} of ${ref.handle} at ${ref.path} is not a regular file.`
+      `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} is not a regular file.`
+    );
+  }
+  if (st.size !== ref.bytes) {
+    throw new Error(
+      `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} failed size verification (expected ${ref.bytes} bytes, got ${st.size}).`
     );
   }
   if (allowedDir !== undefined) {
@@ -473,7 +509,7 @@ export async function readArchivedImage(
     sniffImageMimeType(bytes) !== ref.mimeType
   ) {
     throw new Error(
-      `Archived image #${ref.index} of ${ref.handle} at ${ref.path} failed SHA-256 verification (expected ${ref.sha256.slice(0, 16)}).`
+      `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} failed SHA-256 verification (expected ${ref.sha256.slice(0, 16)}).`
     );
   }
   return {
@@ -620,7 +656,8 @@ export function holdsCarriedMedia(
   content: readonly (TextContent | ImageContent)[],
   items: readonly CarriedMediaItem[],
   protectedPrefixLen?: number,
-  allowedDir?: string
+  allowedDir?: string,
+  archivingHandle?: string
 ): boolean {
   const blocks = withoutTrailingStamp(content);
   const fromIndex = protectedPrefixLen === undefined ? 0 : Math.max(0, protectedPrefixLen);
@@ -654,7 +691,8 @@ export function holdsCarriedMedia(
     return false;
   };
   const takeRef = (ref: ArchivedImage): boolean => {
-    if (!verifyArchivedImageSync(ref, allowedDir)) return false;
+    const mustVerifyOnDisk = archivingHandle === undefined || ref.handle === archivingHandle;
+    if (mustVerifyOnDisk && !verifyArchivedImageSync(ref, allowedDir)) return false;
     const expected = formatImageRef(ref);
     for (let i = fromIndex; i < blocks.length; i++) {
       if (used.has(i)) continue;

@@ -5,7 +5,7 @@ import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { archiveDir, callingFork, type Thread, ThreadIndex } from './archive.js';
-import { archivedImagesOf, readArchivedImage } from './images.js';
+import { archivedImagesOf, readArchivedImage, resolveArchivedImagePath } from './images.js';
 import { messageText } from './messages.js';
 import { withFullOutput } from './output.js';
 import { excerpt, RecallIndex, type RecallMatch, type SearchableThread } from './search.js';
@@ -214,6 +214,9 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
       if (asked && askedImage !== undefined) {
         throw new Error('recall takes either turn or image, not both.');
       }
+      if (askedImage !== undefined && query.trim()) {
+        throw new Error('recall takes either query or image, not both.');
+      }
       if (!asked && askedImage === undefined && !query.trim()) {
         throw new Error(
           'recall needs a query, or a handle with turn or image to read that item back.'
@@ -274,7 +277,8 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
           archived.width !== undefined && archived.height !== undefined
             ? `, ${archived.width}x${archived.height}`
             : '';
-        const header = `[${archived.handle} image #${archived.index}: ${archived.mimeType}${dims}, ${archived.bytes} bytes, sha256 ${archived.sha256} — ${archived.path}]`;
+        const livePath = resolveArchivedImagePath(archived, dir) ?? archived.path;
+        const header = `[${archived.handle} image #${archived.index}: ${archived.mimeType}${dims}, ${archived.bytes} bytes, sha256 ${archived.sha256} — ${livePath}]`;
         const note = [...stale.map((item) => item.line), header].join('\n');
         return {
           content: [{ type: 'text', text: note }, loaded],
