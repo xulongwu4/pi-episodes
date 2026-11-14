@@ -48,6 +48,7 @@ import {
   formatImageRef,
   holdsCarriedMedia,
   imageDimensions,
+  isArchivedImage,
   matchArchivedRefBlocks,
   prepareCarriedMedia,
   readArchivedImage,
@@ -322,25 +323,55 @@ test('sniffImageMimeType, imageDimensions, archiveImage and readArchivedImage ve
     assert.equal(first.path, second.path);
     assert.equal(first.width, 4);
     assert.equal(first.height, 7);
-    assert.equal(verifyArchivedImageSync(first), true);
+    assert.equal(verifyArchivedImageSync(first, dir), true);
+    assert.equal(verifyArchivedImageSync(first, undefined), false);
+    await assert.rejects(
+      () => readArchivedImage(first, undefined),
+      /outside the session archive directory/
+    );
+    assert.equal(isArchivedImage(first), true);
+    assert.equal(isArchivedImage({ ...first, width: 4.5 }), false);
+    assert.equal(isArchivedImage({ ...first, handle: 'bad handle!' }), false);
     assert.match(
       formatImageRef(first),
       /^\[ep-11111111 image #1: image\/png, 4x7, \d+ B, sha256 [0-9a-f]{16} — .*recall\(\{ handle: "ep-11111111", image: 1 \}\) or read path\]$/
     );
 
-    const roundTrip = await readArchivedImage(first);
+    const roundTrip = await readArchivedImage(first, dir);
     assert.deepEqual(roundTrip, block);
+
+    // Renamed session directory (.episodes mismatch) reports exact recorded archive directory.
+    const otherEpisodesDir = join(dir, 'renamed-session.episodes');
+    await assert.rejects(
+      () =>
+        readArchivedImage(
+          { ...first, path: join(dir, 'old-session.episodes', basename(first.path)) },
+          otherEpisodesDir
+        ),
+      /archived under "old-session\.episodes"/
+    );
+
+    // Simulated 64-bit filename-prefix collision: existing file with different bytes is NOT overwritten.
+    const otherFileBytes = makePng(2, 2);
+    await writeFile(first.path, otherFileBytes);
+    const collided = await archiveImage(dir, 'ep-33333333', 1, block);
+    assert.equal(
+      collided,
+      undefined,
+      'prefix collision falls back to undefined without clobbering'
+    );
+    assert.deepEqual(await readFile(first.path), otherFileBytes);
 
     const corrupted = Buffer.from(png);
     const lastIdx = corrupted.length - 5;
     corrupted[lastIdx] = (corrupted[lastIdx] ?? 0) ^ 0xff;
     await writeFile(first.path, corrupted);
-    assert.equal(verifyArchivedImageSync(first), false);
-    await assert.rejects(() => readArchivedImage(first), /failed SHA-256 verification/);
+    assert.equal(verifyArchivedImageSync(first, dir), false);
+    await assert.rejects(() => readArchivedImage(first, dir), /failed SHA-256 verification/);
 
     await rm(first.path);
-    assert.equal(verifyArchivedImageSync(first), false);
-    await assert.rejects(() => readArchivedImage(first), /is missing at/);
+    assert.equal(verifyArchivedImageSync(first, dir), false);
+    await assert.rejects(() => readArchivedImage(first, dir), /is missing at/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -689,7 +720,7 @@ test('ForkFolds offloads covered child-note images with running-fork isolation, 
       (item) => item.handle === cf2Handle && item.index === 1
     );
     assert.ok(runningHit);
-    assert.deepEqual(await readArchivedImage(runningHit), pngBlock);
+    assert.deepEqual(await readArchivedImage(runningHit, dir), pngBlock);
 
     // Unfolding cf2 inside the fork retires cf2 and its offloaded manifest.
     await unfoldTool.execute('cu1', { handle: cf2Handle });
@@ -738,7 +769,7 @@ test('ForkFolds offloads covered child-note images with running-fork isolation, 
       (item) => item.handle === cf3Handle && item.index === 1
     );
     assert.ok(parentHit);
-    assert.deepEqual(await readArchivedImage(parentHit), pngBlock);
+    assert.deepEqual(await readArchivedImage(parentHit, dir), pngBlock);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -796,11 +827,16 @@ test('reference matching is exact standalone 1-to-1 across verification, reorder
 
     // Substring embeds must NOT satisfy reference verification.
     assert.equal(
-      holdsCarriedMedia([{ type: 'text', text: `Wrapped: ${refText}` }], [{ kind: 'ref', ref }]),
+      holdsCarriedMedia(
+        [{ type: 'text', text: `Wrapped: ${refText}` }],
+        [{ kind: 'ref', ref }],
+        undefined,
+        dir
+      ),
       false
     );
     assert.equal(
-      holdsCarriedMedia([{ type: 'text', text: refText }], [{ kind: 'ref', ref }]),
+      holdsCarriedMedia([{ type: 'text', text: refText }], [{ kind: 'ref', ref }], undefined, dir),
       true
     );
 
@@ -1211,7 +1247,12 @@ test('multiple images, branch/unfold/refold immutable identities, interrupted re
     assert.equal(dupPrepared[0].ref.index, 1);
     assert.equal(dupPrepared[1].ref.index, 2);
     assert.equal(
-      holdsCarriedMedia([{ type: 'text', text: formatImageRef(dupPrepared[0].ref) }], dupPrepared),
+      holdsCarriedMedia(
+        [{ type: 'text', text: formatImageRef(dupPrepared[0].ref) }],
+        dupPrepared,
+        undefined,
+        dupDir
+      ),
       false
     );
     assert.equal(
@@ -1220,7 +1261,9 @@ test('multiple images, branch/unfold/refold immutable identities, interrupted re
           { type: 'text', text: formatImageRef(dupPrepared[0].ref) },
           { type: 'text', text: formatImageRef(dupPrepared[1].ref) }
         ],
-        dupPrepared
+        dupPrepared,
+        undefined,
+        dupDir
       ),
       true
     );
@@ -1675,8 +1718,11 @@ test('written prefix protects script-printed inherited image references on unfol
     // With intact protectedPrefixLen = 2, only index >= 2 is matched -> matches index 2 unambiguously.
     assert.deepEqual([...matchArchivedRefBlocks(ambBlocks, [ambRef], 2).keys()], [2]);
     // holdsCarriedMedia also declines ambiguous broken-prefix duplicates (undefined prefix, 2 copies vs 1 item).
-    assert.equal(holdsCarriedMedia(ambBlocks, [{ kind: 'ref', ref: ambRef }], undefined), false);
-    assert.equal(holdsCarriedMedia(ambBlocks, [{ kind: 'ref', ref: ambRef }], 2), true);
+    assert.equal(
+      holdsCarriedMedia(ambBlocks, [{ kind: 'ref', ref: ambRef }], undefined, ambDir),
+      false
+    );
+    assert.equal(holdsCarriedMedia(ambBlocks, [{ kind: 'ref', ref: ambRef }], 2, ambDir), true);
   } finally {
     await rm(ambDir, { recursive: true, force: true });
   }
@@ -2152,5 +2198,105 @@ test('relocated session directories resolve archived images, recall rejects quer
   } finally {
     await rm(dirA, { recursive: true, force: true });
     await rm(dirB, { recursive: true, force: true });
+  }
+});
+
+test('in-place mutation of FoldDetails.archivedImages entries by a tool_result hook declines both direct and codemode folds', async () => {
+  const png = makePng(3, 3);
+  const pngBlock: ImageContent = {
+    type: 'image',
+    data: png.toString('base64'),
+    mimeType: 'image/png'
+  };
+  for (const mode of ['off', 'only'] as const) {
+    let mutated = false;
+    const s = await createPersistedSession(
+      mode,
+      [
+        () =>
+          mode === 'off'
+            ? fauxAssistantMessage(fauxToolCall('bash', { command: 'echo inspect' }), {
+                stopReason: 'toolUse'
+              })
+            : script(`text(await tools.bash({ command: 'echo inspect' }));`),
+        () =>
+          mode === 'off'
+            ? fauxAssistantMessage(
+                fauxToolCall('fold', { since: 't1', note: 'First note with inline screenshot.' }),
+                { stopReason: 'toolUse' }
+              )
+            : script(
+                `await tools.fold({ since: 't1', note: 'First note with inline screenshot.' });`
+              ),
+        () =>
+          mode === 'off'
+            ? fauxAssistantMessage(
+                fauxToolCall('bash', { command: 'echo step_must_remain_visible' }),
+                { stopReason: 'toolUse' }
+              )
+            : script(`text(await tools.bash({ command: 'echo step_must_remain_visible' }));`),
+        (context) => {
+          const firstNote = conversation(context).find((m) =>
+            text(m).includes('First note with inline screenshot.')
+          )!;
+          const since = /\[(t\d+)\]\s*$/.exec(text(firstNote))![1]!;
+          return mode === 'off'
+            ? fauxAssistantMessage(
+                fauxToolCall('fold', {
+                  since,
+                  note: 'Covering note whose manifest gets mutated in place.'
+                }),
+                { stopReason: 'toolUse' }
+              )
+            : script(
+                `await tools.fold({ since: '${since}', note: 'Covering note whose manifest gets mutated in place.' });`
+              );
+        },
+        (context) => {
+          assert.equal(mutated, true, `hook mutated archivedImages in place (${mode})`);
+          const joined = conversation(context).map(text).join('\n');
+          assert.ok(
+            joined.includes('step_must_remain_visible'),
+            `covering fold MUST be declined when archivedImages[0] was mutated in place (${mode})`
+          );
+          return fauxAssistantMessage('done');
+        }
+      ],
+      [
+        (pi) => {
+          pi.on('tool_result', (event) => {
+            const joined = event.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+            if (
+              joined.includes('First note with inline screenshot.') &&
+              !joined.includes('Notes of the earlier folds')
+            ) {
+              return { content: [...event.content, pngBlock] };
+            }
+            const rawDetails = event.details as Record<string, unknown> | undefined;
+            const foldRecord = (
+              event.toolName === 'fold' ? rawDetails : rawDetails?.[FOLD_DETAILS_KEY]
+            ) as FoldDetails | undefined;
+            const first = foldRecord?.archivedImages?.[0];
+            if (!first) return undefined;
+            const oldText = formatImageRef(first);
+            first.handle = 'ep-00000000';
+            const newText = formatImageRef(first);
+            mutated = true;
+            return {
+              content: event.content.map((block) =>
+                block.type === 'text' && block.text === oldText
+                  ? { type: 'text' as const, text: newText }
+                  : block
+              )
+            };
+          });
+        }
+      ]
+    );
+    try {
+      await s.run('go');
+    } finally {
+      await s.cleanup();
+    }
   }
 });

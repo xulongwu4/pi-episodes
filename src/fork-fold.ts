@@ -273,11 +273,21 @@ export class ForkFolds {
     ];
     record.written = writtenMark(content, carried);
     const mediaBlocks = carriedMediaBlocks(prepared);
-    const archivedManifest = prepared.flatMap((item) => (item.kind === 'ref' ? [item.ref] : []));
+    const archivedManifest = prepared.flatMap((item) =>
+      item.kind === 'ref' ? [{ ...item.ref }] : []
+    );
     const carriedCount = prepared.filter((item) => item.kind === 'image').length;
     if (carriedCount > 0) record.carriedImages = carriedCount;
     if (archivedManifest.length > 0) record.archivedImages = archivedManifest;
-    return { content: [...content, ...mediaBlocks], details: record };
+    return {
+      content: [...content, ...mediaBlocks],
+      details: {
+        ...record,
+        ...(record.archivedImages
+          ? { archivedImages: record.archivedImages.map((ref) => ({ ...ref })) }
+          : {})
+      }
+    };
   }
 
   private async unfold(

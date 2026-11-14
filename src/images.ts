@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
-import { lstat, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from 'node:fs';
+import { mkdir, open, rename, rm, writeFile } from 'node:fs/promises';
+import { basename, join, resolve } from 'node:path';
 import type { ImageContent, TextContent } from '@earendil-works/pi-ai';
 import { isStampBlock } from './stamps.js';
 
@@ -338,7 +338,7 @@ export function isArchivedImage(value: unknown): value is ArchivedImage {
   return (
     isRecord(value) &&
     typeof value.handle === 'string' &&
-    value.handle.length > 0 &&
+    /^ep-[0-9a-z]+$/i.test(value.handle) &&
     typeof value.index === 'number' &&
     Number.isInteger(value.index) &&
     value.index >= 1 &&
@@ -350,8 +350,10 @@ export function isArchivedImage(value: unknown): value is ArchivedImage {
     typeof value.bytes === 'number' &&
     Number.isInteger(value.bytes) &&
     value.bytes > 0 &&
-    (value.width === undefined || (typeof value.width === 'number' && value.width > 0)) &&
-    (value.height === undefined || (typeof value.height === 'number' && value.height > 0))
+    (value.width === undefined ||
+      (typeof value.width === 'number' && Number.isInteger(value.width) && value.width > 0)) &&
+    (value.height === undefined ||
+      (typeof value.height === 'number' && Number.isInteger(value.height) && value.height > 0))
   );
 }
 
@@ -360,10 +362,37 @@ export function archivedImagesOf(value: unknown): ArchivedImage[] {
   return value.filter(isArchivedImage);
 }
 
+const NOFOLLOW_READ_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
+
+/** Returns `'same'` if `path` already holds `digest`, `'missing'` if absent, or `'conflict'` otherwise. */
+async function checkExistingArchiveFile(
+  path: string,
+  expectedBytes: number,
+  expectedSha256: string
+): Promise<'same' | 'missing' | 'conflict'> {
+  let fh: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    fh = await open(path, NOFOLLOW_READ_FLAGS);
+    const st = await fh.stat();
+    if (!st.isFile() || st.size !== expectedBytes) return 'conflict';
+    const existing = await fh.readFile();
+    if (existing.length !== expectedBytes) return 'conflict';
+    return createHash('sha256').update(existing).digest('hex') === expectedSha256
+      ? 'same'
+      : 'conflict';
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    return code === 'ENOENT' ? 'missing' : 'conflict';
+  } finally {
+    await fh?.close().catch(() => undefined);
+  }
+}
+
 /**
  * Atomically writes an image's original bytes under `dir` using a content-addressed filename
- * before returning its manifest entry. Returns `undefined` when `dir` is absent, the image has
- * unsupported or malformed bytes, or writing to disk fails.
+ * before returning its manifest entry. Reuses an existing file when its full SHA-256 matches, and
+ * returns `undefined` when `dir` is absent, a prefix collision or disk error occurs, or the image
+ * has unsupported or malformed bytes.
  */
 export async function archiveImage(
   dir: string | undefined,
@@ -378,14 +407,24 @@ export async function archiveImage(
   const digest = createHash('sha256').update(bytes).digest('hex');
   const ext = IMAGE_EXTENSIONS[mimeType];
   const path = join(dir, `image-${digest.slice(0, 16)}${ext}`);
-  const temporary = `${path}.${randomUUID()}.tmp`;
   try {
     await mkdir(dir, { recursive: true });
-    await writeFile(temporary, bytes);
-    await rename(temporary, path);
   } catch {
-    await rm(temporary, { force: true }).catch(() => undefined);
     return undefined;
+  }
+  const existing = await checkExistingArchiveFile(path, bytes.length, digest);
+  if (existing === 'conflict') return undefined;
+  if (existing === 'missing') {
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, bytes);
+      await rename(temporary, path);
+    } catch {
+      await rm(temporary, { force: true }).catch(() => undefined);
+      if ((await checkExistingArchiveFile(path, bytes.length, digest)) !== 'same') {
+        return undefined;
+      }
+    }
   }
   const dims = imageDimensions(bytes, mimeType);
   return {
@@ -409,66 +448,95 @@ function expectedImageBasename(ref: ArchivedImage): string | undefined {
   return `image-${ref.sha256.slice(0, 16)}${ext}`;
 }
 
+type PathResolution =
+  | { ok: true; path: string }
+  | { ok: false; reason: 'outside' }
+  | { ok: false; reason: 'session_mismatch'; recordedDir: string; expectedDir: string };
+
+function classifyArchivedImagePath(ref: ArchivedImage, allowedDir?: string): PathResolution {
+  if (!allowedDir || !ref.path || ref.path.includes('\0')) {
+    return { ok: false, reason: 'outside' };
+  }
+  const rawSegments = ref.path.split(/[\\/]/).filter(Boolean);
+  if (rawSegments.includes('.') || rawSegments.includes('..')) {
+    return { ok: false, reason: 'outside' };
+  }
+  const expectedBase = expectedImageBasename(ref);
+  const actualBase = rawSegments.at(-1);
+  if (!expectedBase || actualBase !== expectedBase || !ARCHIVED_IMAGE_BASENAME.test(actualBase)) {
+    return { ok: false, reason: 'outside' };
+  }
+  const resolvedAllowed = resolve(allowedDir);
+  const expectedDir = basename(resolvedAllowed);
+  const recordedDir = rawSegments.at(-2);
+  if (recordedDir !== expectedDir) {
+    if (recordedDir?.endsWith('.episodes')) {
+      return { ok: false, reason: 'session_mismatch', recordedDir, expectedDir };
+    }
+    return { ok: false, reason: 'outside' };
+  }
+  return { ok: true, path: join(resolvedAllowed, expectedBase) };
+}
+
 /**
  * Resolves `ref` inside `allowedDir`, binding its filename to `ref.sha256` and `ref.mimeType` and
- * allowing session directories relocated to a new parent path while rejecting traversal or outside
- * directories.
+ * allowing relocated `<session>.episodes` directories while rejecting missing `allowedDir`,
+ * traversal segments, or mismatched directories.
  */
 export function resolveArchivedImagePath(
   ref: ArchivedImage,
   allowedDir?: string
 ): string | undefined {
-  if (!ref.path || ref.path.includes('\0')) return undefined;
-  const rawSegments = ref.path.split(/[\\/]/).filter(Boolean);
-  if (rawSegments.includes('.') || rawSegments.includes('..')) return undefined;
-  const expectedBase = expectedImageBasename(ref);
-  const actualBase = rawSegments.at(-1);
-  if (!expectedBase || actualBase !== expectedBase || !ARCHIVED_IMAGE_BASENAME.test(actualBase)) {
-    return undefined;
-  }
-  if (allowedDir === undefined) {
-    return resolve(ref.path);
-  }
-  const resolvedAllowed = resolve(allowedDir);
-  if (rawSegments.at(-2) !== basename(resolvedAllowed)) {
-    return undefined;
-  }
-  return join(resolvedAllowed, expectedBase);
+  const result = classifyArchivedImagePath(ref, allowedDir);
+  return result.ok ? result.path : undefined;
 }
 
 /** Synchronous integrity and path-confinement check used at `turn_end` before committing fold edits. */
 export function verifyArchivedImageSync(ref: ArchivedImage, allowedDir?: string): boolean {
+  let fd: number | undefined;
   try {
     const resolvedPath = resolveArchivedImagePath(ref, allowedDir);
     if (!resolvedPath) return false;
-    const st = lstatSync(resolvedPath);
+    fd = openSync(resolvedPath, NOFOLLOW_READ_FLAGS);
+    const st = fstatSync(fd);
     if (!st.isFile() || st.size !== ref.bytes) return false;
-    if (allowedDir !== undefined) {
-      if (realpathSync(dirname(resolvedPath)) !== realpathSync(resolve(allowedDir))) return false;
-    }
-    const bytes = readFileSync(resolvedPath);
+    const bytes = readFileSync(fd);
     if (bytes.length !== ref.bytes) return false;
     if (sniffImageMimeType(bytes) !== ref.mimeType) return false;
     return createHash('sha256').update(bytes).digest('hex') === ref.sha256;
   } catch {
     return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Ignore close errors on verification cleanup.
+      }
+    }
   }
 }
 
-/** Reads and verifies a confined archived image from disk, rejecting symlinks and outside paths. */
+/** Reads and verifies a confined archived image from disk without following leaf symlinks. */
 export async function readArchivedImage(
   ref: ArchivedImage,
   allowedDir?: string
 ): Promise<ImageContent> {
-  const resolvedPath = resolveArchivedImagePath(ref, allowedDir);
-  if (!resolvedPath) {
+  const classified = classifyArchivedImagePath(ref, allowedDir);
+  if (!classified.ok) {
+    if (classified.reason === 'session_mismatch') {
+      throw new Error(
+        `Archived image #${ref.index} of ${ref.handle} was archived under "${classified.recordedDir}", outside the session archive directory "${classified.expectedDir}".`
+      );
+    }
     throw new Error(
       `Archived image #${ref.index} of ${ref.handle} has a path outside the session archive directory.`
     );
   }
-  let st: Awaited<ReturnType<typeof lstat>>;
+  const resolvedPath = classified.path;
+  let fh: Awaited<ReturnType<typeof open>>;
   try {
-    st = await lstat(resolvedPath);
+    fh = await open(resolvedPath, NOFOLLOW_READ_FLAGS);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | undefined)?.code;
     if (code === 'ENOENT') {
@@ -476,32 +544,32 @@ export async function readArchivedImage(
         `Archived image #${ref.index} of ${ref.handle} is missing at ${resolvedPath}.`
       );
     }
+    if (code === 'ELOOP' || code === 'EMLINK') {
+      throw new Error(
+        `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} is not a regular file.`
+      );
+    }
     throw new Error(
       `Archived image #${ref.index} of ${ref.handle} could not be read at ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`
     );
   }
-  if (!st.isFile()) {
-    throw new Error(
-      `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} is not a regular file.`
-    );
-  }
-  if (st.size !== ref.bytes) {
-    throw new Error(
-      `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} failed size verification (expected ${ref.bytes} bytes, got ${st.size}).`
-    );
-  }
-  if (allowedDir !== undefined) {
-    const [actualParent, expectedDir] = await Promise.all([
-      realpath(dirname(resolvedPath)),
-      realpath(resolve(allowedDir))
-    ]);
-    if (actualParent !== expectedDir) {
+  let bytes: Buffer;
+  try {
+    const st = await fh.stat();
+    if (!st.isFile()) {
       throw new Error(
-        `Archived image #${ref.index} of ${ref.handle} has a path outside the session archive directory.`
+        `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} is not a regular file.`
       );
     }
+    if (st.size !== ref.bytes) {
+      throw new Error(
+        `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} failed size verification (expected ${ref.bytes} bytes, got ${st.size}).`
+      );
+    }
+    bytes = await fh.readFile();
+  } finally {
+    await fh.close().catch(() => undefined);
   }
-  const bytes = await readFile(resolvedPath);
   const actualSha = createHash('sha256').update(bytes).digest('hex');
   if (
     bytes.length !== ref.bytes ||
@@ -613,7 +681,7 @@ export async function prepareCarriedMedia(
   }
   for (const item of items) {
     if (item.kind === 'ref') {
-      prepared.push({ kind: 'ref', ref: item.ref });
+      prepared.push({ kind: 'ref', ref: { ...item.ref } });
       continue;
     }
     const archived = await archiveImage(dir, archivingHandle, nextIndex, item.image);
@@ -621,7 +689,7 @@ export async function prepareCarriedMedia(
       nextIndex++;
       prepared.push({ kind: 'ref', ref: archived });
     } else {
-      prepared.push({ kind: 'image', image: item.image });
+      prepared.push({ kind: 'image', image: { ...item.image } });
     }
   }
   return prepared;
@@ -631,7 +699,7 @@ export function carriedMediaBlocks(
   items: readonly CarriedMediaItem[]
 ): (TextContent | ImageContent)[] {
   return items.map((item) =>
-    item.kind === 'image' ? item.image : { type: 'text', text: formatImageRef(item.ref) }
+    item.kind === 'image' ? { ...item.image } : { type: 'text', text: formatImageRef(item.ref) }
   );
 }
 

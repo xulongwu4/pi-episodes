@@ -2087,7 +2087,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       // Snapshots and image archiving take time; a run aborted meanwhile, or already settled, must not get edits.
       if (signal?.aborted || run !== state.run) throw new Error('The fold was cancelled.');
       const inlineImages = media.flatMap((item) => (item.kind === 'image' ? [item.image] : []));
-      const archivedRefs = media.flatMap((item) => (item.kind === 'ref' ? [item.ref] : []));
+      const archivedRefs = media.flatMap((item) => (item.kind === 'ref' ? [{ ...item.ref }] : []));
       // A fold from a script takes effect with the script's result, which then stands as the
       // note; the edits wait under the script's call, the one the turn reports.
       state.pendingFolds.set(scriptCall ?? toolCallId, {
@@ -2264,7 +2264,9 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     script.details.written = writtenMark(written, pending.carried, script.changed);
     const mediaItems = pending.media ?? [];
     const inlineCount = mediaItems.filter((item) => item.kind === 'image').length;
-    const archivedRefs = mediaItems.flatMap((item) => (item.kind === 'ref' ? [item.ref] : []));
+    const archivedRefs = mediaItems.flatMap((item) =>
+      item.kind === 'ref' ? [{ ...item.ref }] : []
+    );
     if (inlineCount > 0) script.details.carriedImages = inlineCount;
     if (archivedRefs.length > 0) script.details.archivedImages = archivedRefs;
     const mediaBlocks = carriedMediaBlocks(mediaItems);
