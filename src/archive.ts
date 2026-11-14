@@ -10,6 +10,7 @@ import {
   type SessionEntry,
   sessionEntryToContextMessages
 } from '@earendil-works/pi-coding-agent';
+import type { ArchivedImage } from './images.js';
 import {
   branchHasMutatedHistory,
   branchRetiredResponsesCallIds,
@@ -135,6 +136,8 @@ export interface FoldDetails {
   renderedNote?: string;
   /** Count of covered-note image blocks appended to the fold's result, dropped on unfold. */
   carriedImages?: number;
+  /** Offloaded covered-note image manifest standing on this fold's result, dropped on unfold. */
+  archivedImages?: ArchivedImage[];
 }
 
 export type ForkStatus = 'done' | 'failed' | 'timeout' | 'aborted';
@@ -467,13 +470,8 @@ export class ThreadIndex {
   async find(handle: string): Promise<Thread | undefined> {
     const currentBranch = this.sessions.getBranch();
     const activeOnBranch = appliedFolds(currentBranch);
-    const unfoldedOnBranch = new Set<string>();
-    for (const entry of currentBranch) {
-      if (entry.type !== 'custom' || entry.customType !== FOLD_UNFOLDED_TYPE) continue;
-      const target = (entry.data as { handle?: unknown } | undefined)?.handle;
-      if (typeof target === 'string' && !activeOnBranch.has(target)) unfoldedOnBranch.add(target);
-    }
-    if (unfoldedOnBranch.has(handle)) return undefined;
+    const unfolded = this.unfoldedHandles(currentBranch, activeOnBranch);
+    if (unfolded.has(handle)) return undefined;
     const entries = this.sessions.getEntries();
     const fold = foldRecords(entries, everAppliedFolds(entries)).find(
       (record) => record.handle === handle
@@ -492,6 +490,66 @@ export class ThreadIndex {
         entry.type === 'compaction' && compactionHandle(entry.id) === handle
     );
     return compaction ? this.compactionThread(compactionRecord(compaction)) : undefined;
+  }
+
+  /** Offloaded image `#index` of `handle` standing on any non-unfolded covering fold. */
+  async findImage(handle: string, index: number): Promise<ArchivedImage | undefined> {
+    const currentBranch = this.sessions.getBranch();
+    const activeOnBranch = appliedFolds(currentBranch);
+    const unfolded = this.unfoldedHandles(currentBranch, activeOnBranch);
+    if (unfolded.has(handle)) return undefined;
+
+    const matchIn = (records: readonly FoldDetails[]): ArchivedImage | undefined => {
+      for (const record of records) {
+        const hit = record.archivedImages?.find(
+          (item) => item.handle === handle && item.index === index
+        );
+        if (hit) return hit;
+      }
+      return undefined;
+    };
+
+    const branchHit = matchIn(foldRecords(currentBranch, activeOnBranch));
+    if (branchHit) return branchHit;
+
+    if (this.running) {
+      const ownRecords = (this.running.folds ?? [])
+        .filter((fold) => !isNestedFoldUnfoldedAt(fold, this.running!.messages.length))
+        .map((fold) => fold.record);
+      const ownHit = matchIn(ownRecords);
+      if (ownHit) return ownHit;
+    }
+
+    const entries = this.sessions.getEntries();
+    for (const fork of forkRecords(entries)) {
+      const archive = this.memory.get(fork.handle) ?? (await readArchive(fork.archive));
+      if (!archive) continue;
+      const forkHit = matchIn(
+        (archive.folds ?? [])
+          .filter((fold) => !isNestedFoldUnfoldedAt(fold, archive.messages.length))
+          .map((fold) => fold.record)
+      );
+      if (forkHit) return forkHit;
+    }
+
+    return matchIn(
+      foldRecords(entries, everAppliedFolds(entries)).filter(
+        (record) => !unfolded.has(record.handle)
+      )
+    );
+  }
+
+  private unfoldedHandles(
+    currentBranch: readonly SessionEntry[],
+    activeOnBranch: ReadonlySet<string>
+  ): Set<string> {
+    const unfolded = new Set<string>();
+    for (const entry of currentBranch) {
+      if (entry.type !== 'custom' || entry.customType !== FOLD_UNFOLDED_TYPE) continue;
+      const target = (entry.data as { handle?: unknown } | undefined)?.handle;
+      if (typeof target === 'string' && !activeOnBranch.has(target)) unfolded.add(target);
+    }
+    return unfolded;
   }
 
   /**

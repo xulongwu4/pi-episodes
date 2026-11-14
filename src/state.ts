@@ -2,6 +2,7 @@ import { realpathSync } from 'node:fs';
 import type { ImageContent } from '@earendil-works/pi-ai';
 import type { ContextEditEntryDraft, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { FoldDetails, ForkArchive } from './archive.js';
+import type { PreparedMediaItem } from './images.js';
 import type { RecallIndex } from './search.js';
 import { Snapshots } from './snapshots.js';
 import { readStamp } from './stamps.js';
@@ -28,6 +29,8 @@ export interface PendingFold {
   carried?: string;
   /** The images that stood in the results of those notes, which the result takes over. */
   images?: ImageContent[];
+  /** Covered-note media items (offloaded references and inline fallbacks) in block order. */
+  media?: PreparedMediaItem[];
   /**
    * Set when a codemode script made the fold call: the pending fold is keyed by the script's
    * call instead, and its result carries the details, the note if the script did not print it,

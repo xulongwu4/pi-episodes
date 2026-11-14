@@ -77,8 +77,9 @@ spans, forks and compacted turns on this branch by keyword, best match first, an
 cheap; quote the query to match exact text. Query for the specific thing you need. When a
 match's line is not enough, recall with its handle and turn and no query returns that turn
 verbatim, and a range such as "t14-t16" returns those turns; what is long is cut, with the
-rest in a file. Read back the turns you need, not a whole span: that brings back what the
-fold removed. Run one recall before retrying something a note says was rejected, before
+rest in a file. Images on covered notes are offloaded to [ep-... image #k] markers; recall
+with handle and image returns the original image. Read back the turns you need, not a whole
+span: that brings back what the fold removed. Run one recall before retrying something a note
 editing a file a note points at, before acting on an error string or symbol you have seen
 before, and before saying "we already checked that". ask resumes an archived thread to
 answer one judgment question, such as why something was done; it re-reads the whole thread,
@@ -99,6 +100,7 @@ export const CODEMODE_CALLS = /* md */ `
 From a codemode script: tools.fold({ since: "t13", until?, note }),
 tools.unfold({ handle: "ep-..." }), tools.recall({ query, handle?, regex?, limit? })
 (limit 30 by default, at most 200; the rest go to a file),
-tools.recall({ handle, turn }) for a turn or a range of turns verbatim, and
+tools.recall({ handle, turn }) for a turn or a range of turns verbatim,
+image(await tools.recall({ handle, image })) for an offloaded image, and
 tools.ask({ handle, question }). Print what they return.
 `.trim();

@@ -724,7 +724,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       const recall = details as RecallDetails | undefined;
       stats.recall.count++;
       if (recall?.total === 0) stats.recall.empty++;
-      if (recall?.turn) stats.recall.readBack++;
+      if (recall?.turn || recall?.image) stats.recall.readBack++;
       if (recall?.hits?.some((handle) => handle.startsWith('cp-'))) stats.recall.compacted++;
       countStale(recall?.stale, index);
     } else if (found.toolName === 'ask') {

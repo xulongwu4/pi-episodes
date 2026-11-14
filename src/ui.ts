@@ -31,6 +31,14 @@ export interface RecallDetails {
   /** Set when a turn was read back instead of searched for: its stamp and its length. */
   turn?: string;
   chars?: number;
+  /** Set when an offloaded image was read back instead of searched for. */
+  image?: {
+    index: number;
+    mimeType: string;
+    bytes: number;
+    width?: number;
+    height?: number;
+  };
 }
 
 export interface StaleThread {
@@ -166,11 +174,19 @@ export const unfoldRenderers = {
 };
 
 export const recallRenderers = {
-  renderCall(args: { query?: string; handle?: string; turn?: string }, theme: Theme): Text {
+  renderCall(
+    args: { query?: string; handle?: string; turn?: string; image?: number },
+    theme: Theme
+  ): Text {
     const where = args.handle
       ? ` ${theme.fg('muted', 'in')} ${theme.fg('accent', args.handle)}`
       : '';
-    const what = args.turn ? args.turn : `"${args.query ?? ''}"`;
+    const what =
+      args.image !== undefined
+        ? `image #${args.image}`
+        : args.turn
+          ? args.turn
+          : `"${args.query ?? ''}"`;
     return title(theme, 'recall', `${theme.fg('dim', what)}${where}`);
   },
 
@@ -190,14 +206,24 @@ export const recallRenderers = {
     if (details.total === 0) {
       return new Text(theme.fg('dim', `no match in ${details.threads} thread(s)`), 0, 0);
     }
-    const head = details.turn
-      ? theme.fg('success', `${details.turn} read back`) +
-        theme.fg('muted', `, ${details.chars ?? 0} characters`)
-      : theme.fg('success', `${details.total} match(es)`) +
+    const head = details.image
+      ? theme.fg('success', `image #${details.image.index} read back`) +
         theme.fg(
           'muted',
-          ` in ${details.threads} thread(s)${details.shown < details.total ? `, ${details.shown} shown` : ''}`
-        );
+          `, ${details.image.mimeType}${
+            details.image.width !== undefined && details.image.height !== undefined
+              ? `, ${details.image.width}x${details.image.height}`
+              : ''
+          }, ${details.image.bytes} bytes`
+        )
+      : details.turn
+        ? theme.fg('success', `${details.turn} read back`) +
+          theme.fg('muted', `, ${details.chars ?? 0} characters`)
+        : theme.fg('success', `${details.total} match(es)`) +
+          theme.fg(
+            'muted',
+            ` in ${details.threads} thread(s)${details.shown < details.total ? `, ${details.shown} shown` : ''}`
+          );
     const tail = details.file ? `\n${theme.fg('dim', `rest in ${details.file}`)}` : '';
     return new Text(
       `${head}\n${theme.fg('toolOutput', firstLines(text, expanded ? 200 : 4))}${tail}`,

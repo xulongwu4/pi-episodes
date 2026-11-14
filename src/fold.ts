@@ -13,6 +13,7 @@ import { Text } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 import {
   appliedFolds,
+  archiveDir,
   FOLD_APPLIED_TYPE,
   FOLD_DETAILS_KEY,
   FOLD_RECOVERY_STARTED_TYPE,
@@ -28,6 +29,15 @@ import {
 } from './archive.js';
 import { anchorGapTokens } from './cache.js';
 import { type FoldRejection, recordEvent } from './events.js';
+import {
+  type ArchivedImage,
+  archivedImagesOf,
+  type CarriedMediaInput,
+  carriedMediaBlocks,
+  formatImageRef,
+  holdsCarriedMedia,
+  prepareCarriedMedia
+} from './images.js';
 import { estimateTokens, readOnlyPaths, skillPaths, textOf, touchedPaths } from './messages.js';
 import { completeReadBlocks } from './output.js';
 import { retireAssistantContent } from './retire.js';
@@ -88,6 +98,8 @@ export interface FoldPlan {
   covers: CoveredNote[];
   /** The images in the results of the notes the fold covers, which its result takes over. */
   images: ImageContent[];
+  /** Covered-note media items (already-archived references and inline images) in block order. */
+  media: CarriedMediaInput[];
   edits: ContextEditEntryDraft[];
 }
 
@@ -188,15 +200,37 @@ function keptUnder(text: string): CoveredNote[] | undefined {
  * So nothing is taken for kept notes by its form, wherever it stands, and once anything was
  * changed, moved or cut, the changed text is in `own`, whole.
  */
+function matchedArchivedRefIndices(
+  blocks: readonly (TextContent | ImageContent)[],
+  fromIndex: number,
+  archived: readonly ArchivedImage[]
+): Set<number> {
+  const matched = new Set<number>();
+  if (archived.length === 0) return matched;
+  const remaining = [...archived];
+  for (let i = Math.max(0, fromIndex); i < blocks.length && remaining.length > 0; i++) {
+    const block = blocks[i];
+    if (block?.type !== 'text') continue;
+    const hit = remaining.findIndex((ref) => block.text === formatImageRef(ref));
+    if (hit >= 0) {
+      matched.add(i);
+      remaining.splice(hit, 1);
+    }
+  }
+  return matched;
+}
+
 function standing(
   content: readonly (TextContent | ImageContent)[],
-  written: FoldDetails['written']
+  written: FoldDetails['written'],
+  archived: readonly ArchivedImage[] = []
 ): { own: string; kept: CoveredNote[]; added?: string } {
   const blocks = content.filter(
     (block, index) =>
       !(index === content.length - 1 && block.type === 'text' && isStampBlock(block))
   );
   const count = typeof written?.blocks === 'number' ? written.blocks : 0;
+  const refIndices = matchedArchivedRefIndices(blocks, count, archived);
   const holder = blocks[count - 1];
   const at =
     holder?.type === 'text' && typeof written?.kept?.chars === 'number'
@@ -212,8 +246,8 @@ function standing(
   const texts = (from: number, to?: number) =>
     blocks
       .slice(from, to)
-      .flatMap((block) =>
-        block.type !== 'text'
+      .flatMap((block, offset) =>
+        block.type !== 'text' || refIndices.has(from + offset)
           ? []
           : [block === holder && kept.length > 0 ? block.text.slice(0, at) : block.text]
       )
@@ -263,10 +297,13 @@ export function coveredNotes(
     const shown = entry.messages[0];
     const fold = isFoldNote(entry, applied) ? foldNoteDetails(entryMessage(entry)) : undefined;
     if (!fold || shown?.role !== 'toolResult') continue;
-    const read = standing(shown.content, fold.written);
+    const archived = archivedImagesOf(fold.archivedImages);
+    const read = standing(shown.content, fold.written, archived);
     // A record that names more folds than its result has notes for is not to be trusted.
     const { own, kept, added } =
-      read.kept.length === (fold.covers?.length ?? 0) ? read : standing(shown.content, undefined);
+      read.kept.length === (fold.covers?.length ?? 0)
+        ? read
+        : standing(shown.content, undefined, archived);
     const at = written.get(fold.handle) ?? 0;
     const recorded =
       added === undefined || fold.note === undefined
@@ -301,6 +338,43 @@ export function coveredImages(
     const shown = entry.messages[0];
     if (shown?.role !== 'toolResult' || !isFoldNote(entry, applied)) return [];
     return shown.content.filter((block) => block.type === 'image');
+  });
+}
+
+/**
+ * Covered-note media items in block order: inline images and already-archived image references
+ * standing on the results of the notes in `span`.
+ */
+export function coveredMedia(
+  span: readonly ProjectedSessionEntry[],
+  applied: ReadonlySet<string>
+): CarriedMediaInput[] {
+  return span.flatMap((entry) => {
+    const shown = entry.messages[0];
+    if (shown?.role !== 'toolResult' || !isFoldNote(entry, applied)) return [];
+    const fold = foldNoteDetails(entryMessage(entry));
+    const blocks = shown.content.filter(
+      (block, index) =>
+        !(index === shown.content.length - 1 && block.type === 'text' && isStampBlock(block))
+    );
+    const count = typeof fold?.written?.blocks === 'number' ? fold.written.blocks : 0;
+    const remaining = [...archivedImagesOf(fold?.archivedImages)];
+    const items: CarriedMediaInput[] = [];
+    for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i]!;
+      if (block.type === 'image') {
+        items.push({ kind: 'image', handle: fold?.handle, image: block });
+        continue;
+      }
+      if (i >= count && remaining.length > 0) {
+        const hit = remaining.findIndex((ref) => block.text === formatImageRef(ref));
+        if (hit >= 0) {
+          items.push({ kind: 'ref', ref: remaining[hit]! });
+          remaining.splice(hit, 1);
+        }
+      }
+    }
+    return items;
   });
 }
 
@@ -1186,6 +1260,7 @@ export function planFold(
     archivedReadTurns,
     covers: coveredNotes(entries, span, applied),
     images: coveredImages(span, applied),
+    media: coveredMedia(span, applied),
     edits
   };
 }
@@ -1369,20 +1444,47 @@ function unfoldedNoteContent(
   const last = current.at(-1);
   const rawBody = last && isStampBlock(last) ? current.slice(0, -1) : [...current];
   const carriedCount = details.carriedImages ?? 0;
+  const archivedRefs = archivedImagesOf(details.archivedImages);
   let body = rawBody;
-  if (carriedCount > 0) {
+  if (carriedCount > 0 || archivedRefs.length > 0) {
     const dropIndices = new Set<number>();
+    let droppedImages = 0;
+    const remainingRefs = [...archivedRefs];
     if (details.written?.blocks !== undefined) {
       for (
         let i = details.written.blocks;
-        i < rawBody.length && dropIndices.size < carriedCount;
+        i < rawBody.length && (droppedImages < carriedCount || remainingRefs.length > 0);
         i++
       ) {
-        if (rawBody[i]?.type === 'image') dropIndices.add(i);
+        const block = rawBody[i];
+        if (block?.type === 'image' && droppedImages < carriedCount) {
+          dropIndices.add(i);
+          droppedImages++;
+        } else if (block?.type === 'text' && remainingRefs.length > 0) {
+          const hit = remainingRefs.findIndex((ref) => block.text === formatImageRef(ref));
+          if (hit >= 0) {
+            dropIndices.add(i);
+            remainingRefs.splice(hit, 1);
+          }
+        }
       }
     } else {
-      for (let i = rawBody.length - 1; i >= 0 && dropIndices.size < carriedCount; i--) {
-        if (rawBody[i]?.type === 'image') dropIndices.add(i);
+      for (
+        let i = rawBody.length - 1;
+        i >= 0 && (droppedImages < carriedCount || remainingRefs.length > 0);
+        i--
+      ) {
+        const block = rawBody[i];
+        if (block?.type === 'image' && droppedImages < carriedCount) {
+          dropIndices.add(i);
+          droppedImages++;
+        } else if (block?.type === 'text' && remainingRefs.length > 0) {
+          const hit = remainingRefs.findIndex((ref) => block.text === formatImageRef(ref));
+          if (hit >= 0) {
+            dropIndices.add(i);
+            remainingRefs.splice(hit, 1);
+          }
+        }
       }
     }
     if (dropIndices.size > 0) {
@@ -1980,8 +2082,15 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         cwd: state.cwd
       });
       const carried = renderCovered(plan.covers);
-      // Snapshots take time; a run aborted meanwhile, or already settled, must not get edits.
+      const media = await prepareCarriedMedia(
+        plan.handle,
+        plan.media,
+        archiveDir(ctx.sessionManager)
+      );
+      // Snapshots and image archiving take time; a run aborted meanwhile, or already settled, must not get edits.
       if (signal?.aborted || run !== state.run) throw new Error('The fold was cancelled.');
+      const inlineImages = media.flatMap((item) => (item.kind === 'image' ? [item.image] : []));
+      const archivedRefs = media.flatMap((item) => (item.kind === 'ref' ? [item.ref] : []));
       // A fold from a script takes effect with the script's result, which then stands as the
       // note; the edits wait under the script's call, the one the turn reports.
       state.pendingFolds.set(scriptCall ?? toolCallId, {
@@ -1992,7 +2101,8 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         lastEntryId: plan.lastEntryId,
         ...(caller ? { callerEntryId: caller.sourceEntry.id } : {}),
         ...(carried ? { carried } : {}),
-        ...(plan.images.length > 0 ? { images: plan.images } : {}),
+        ...(inlineImages.length > 0 ? { images: inlineImages } : {}),
+        ...(media.length > 0 ? { media } : {}),
         ...(scriptCall ? { script: { foldCallId: toolCallId, note: text, details } } : {})
       });
 
@@ -2006,11 +2116,12 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       const written = [{ type: 'text' as const, text: shown }];
       // A script's result is recorded when it is there, with what the script printed.
       details.renderedNote = text;
-      if (plan.images.length > 0) details.carriedImages = plan.images.length;
+      if (inlineImages.length > 0) details.carriedImages = inlineImages.length;
+      if (archivedRefs.length > 0) details.archivedImages = archivedRefs;
       if (scriptCall) return { content: written, details, terminate };
       details.written = writtenMark(written, carried);
-      // The images of the covered notes follow what the fold wrote, as blocks added to it.
-      return { content: [...written, ...plan.images], details, terminate };
+      // Covered-note media (archived references and inline fallbacks) follow what the fold wrote.
+      return { content: [...written, ...carriedMediaBlocks(media)], details, terminate };
     }
   });
 
@@ -2155,11 +2266,16 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     // as the result has it.
     script.details.renderedNote = script.note;
     script.details.written = writtenMark(written, pending.carried, script.changed);
-    const images = pending.images ?? [];
-    if (images.length > 0) script.details.carriedImages = images.length;
-    if (added.length === 0 && images.length === 0) return { details };
-    // The images of the covered notes follow what the fold wrote, as blocks added to it.
-    const content = [...written, ...images];
+    const mediaItems =
+      pending.media ?? (pending.images ?? []).map((image) => ({ kind: 'image' as const, image }));
+    const inlineCount = mediaItems.filter((item) => item.kind === 'image').length;
+    const archivedRefs = mediaItems.flatMap((item) => (item.kind === 'ref' ? [item.ref] : []));
+    if (inlineCount > 0) script.details.carriedImages = inlineCount;
+    if (archivedRefs.length > 0) script.details.archivedImages = archivedRefs;
+    const mediaBlocks = carriedMediaBlocks(mediaItems);
+    if (added.length === 0 && mediaBlocks.length === 0) return { details };
+    // Covered-note media (archived references and inline fallbacks) follow what the fold wrote.
+    const content = [...written, ...mediaBlocks];
     return event.structuredContent === undefined
       ? { content, details }
       : { content, details, structuredContent: event.structuredContent };
@@ -2194,7 +2310,11 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
               holdsNote(content, pending.script.note)
             : result.toolName === FOLD_TOOL) &&
           (pending?.carried === undefined || textOf(content).includes(pending.carried)) &&
-          holdsImages(content, pending?.images ?? []);
+          holdsCarriedMedia(
+            content,
+            pending?.media ??
+              (pending?.images ?? []).map((image) => ({ kind: 'image' as const, image }))
+          );
         if (!pending || !stands) return [];
         state.pendingFolds.delete(result.toolCallId);
         return [pending];

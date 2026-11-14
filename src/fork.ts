@@ -213,7 +213,8 @@ export function registerFork(pi: ExtensionAPI, state: EpisodeState, registry: Fo
         state,
         parentEntries: projection.entries,
         prefixLength: prefix.length,
-        siblings: siblings.length
+        siblings: siblings.length,
+        archiveDir: archiveDir(ctx.sessionManager)
       });
       const leaf = ctx.sessionManager.getLeafId();
       // The transcript as it stands: what is written after every turn, and what a call of the

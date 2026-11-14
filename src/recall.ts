@@ -5,6 +5,7 @@ import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { archiveDir, callingFork, type Thread, ThreadIndex } from './archive.js';
+import { readArchivedImage } from './images.js';
 import { messageText } from './messages.js';
 import { withFullOutput } from './output.js';
 import { excerpt, RecallIndex, type RecallMatch, type SearchableThread } from './search.js';
@@ -151,7 +152,7 @@ const RecallParams = Type.Object({
   query: Type.Optional(
     Type.String({
       description:
-        'Words to find, such as an error code, symbol, path or a few words of what happened. Wrap it in double quotes to match that exact text instead. Not needed with turn.'
+        'Words to find, such as an error code, symbol, path or a few words of what happened. Wrap it in double quotes to match that exact text instead. Not needed with turn or image.'
     })
   ),
   handle: Type.Optional(
@@ -161,6 +162,13 @@ const RecallParams = Type.Object({
     Type.String({
       description:
         'With handle, instead of searching: return what that turn held, verbatim. Use the turn a match named, such as "t14", or a range of turns such as "t14-t16".'
+    })
+  ),
+  image: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      description:
+        'With handle, instead of searching: return that offloaded image (#1, #2, ...) from a covered fold note.'
     })
   ),
   regex: Type.Optional(
@@ -177,31 +185,98 @@ const RecallParams = Type.Object({
   )
 });
 
+const RecallOutput = Type.Union([
+  Type.String(),
+  Type.Object({
+    type: Type.Literal('image'),
+    data: Type.String(),
+    mimeType: Type.String(),
+    note: Type.String()
+  })
+]);
+
 export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
   pi.registerTool<typeof RecallParams, RecallDetails>({
     name: 'recall',
     label: 'Recall',
     description:
-      'Search the archived threads (folded spans and finished forks): tool outputs, your own messages and reasoning, commands and their arguments. Ranked by relevance: messages holding every word come first, in any order, and rare words such as error codes weigh more than common ones. Returns the best line of each match with the thread handle and turn it came from; matches past the limit go to a file. A "quoted" query or regex matches exact text per line instead. Cheap, no model call. Query for the specific thing you need. When the line of a match is not enough, pass its handle and turn without a query to get that turn verbatim; it is not a way to read a whole span back.',
+      'Search the archived threads (folded spans and finished forks): tool outputs, your own messages and reasoning, commands and their arguments. Ranked by relevance: messages holding every word come first, in any order, and rare words such as error codes weigh more than common ones. Returns the best line of each match with the thread handle and turn it came from; matches past the limit go to a file. A "quoted" query or regex matches exact text per line instead. Cheap, no model call. Query for the specific thing you need. When the line of a match is not enough, pass its handle and turn without a query to get that turn verbatim; pass handle and image to read back an offloaded [ep-... image #k] from a covered note.',
     promptSnippet: 'Search archived threads (folded spans, forks) by keyword or exact text',
     parameters: RecallParams,
+    outputSchema: RecallOutput,
     renderCall: recallRenderers.renderCall,
     renderResult: recallRenderers.renderResult,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const query = params.query ?? '';
       const asked = params.turn?.trim();
-      if (!asked && !query.trim()) {
-        throw new Error('recall needs a query, or a handle and a turn to read that turn back.');
+      const askedImage = params.image;
+      if (asked && askedImage !== undefined) {
+        throw new Error('recall takes either turn or image, not both.');
+      }
+      if (!asked && askedImage === undefined && !query.trim()) {
+        throw new Error(
+          'recall needs a query, or a handle with turn or image to read that item back.'
+        );
       }
       if (asked && !params.handle) {
         throw new Error('turn needs the handle of the thread it is in.');
+      }
+      if (askedImage !== undefined && !params.handle) {
+        throw new Error('image needs the handle of the thread it is in.');
       }
       const index = new ThreadIndex(
         ctx.sessionManager,
         state.forkArchives,
         callingFork(ctx.sessionManager)
       );
+      if (askedImage !== undefined) {
+        const thread = await index.find(params.handle!);
+        if (!thread) throw new Error(`No archived thread ${params.handle}.`);
+        const archived = await index.findImage(thread.handle, askedImage);
+        if (!archived) {
+          throw new Error(
+            `No archived image #${askedImage} in ${thread.handle} (${thread.label}).`
+          );
+        }
+        const loaded = await readArchivedImage(archived);
+        const stale = await staleness(state, [thread]);
+        const details: RecallDetails = {
+          query,
+          threads: 1,
+          shown: 1,
+          total: 1,
+          hits: [thread.handle],
+          image: {
+            index: archived.index,
+            mimeType: archived.mimeType,
+            bytes: archived.bytes,
+            ...(archived.width !== undefined && archived.height !== undefined
+              ? { width: archived.width, height: archived.height }
+              : {})
+          }
+        };
+        if (stale.length > 0) {
+          details.stale = stale.map(({ handle, files }) => ({ handle, files }));
+        }
+        const dims =
+          archived.width !== undefined && archived.height !== undefined
+            ? `, ${archived.width}x${archived.height}`
+            : '';
+        const header = `[${archived.handle} image #${archived.index}: ${archived.mimeType}${dims}, ${archived.bytes} bytes, sha256 ${archived.sha256}]`;
+        const note = [...stale.map((item) => item.line), header].join('\n');
+        return {
+          content: [{ type: 'text', text: note }, loaded],
+          structuredContent: {
+            type: 'image',
+            data: loaded.data,
+            mimeType: loaded.mimeType,
+            note
+          },
+          details
+        };
+      }
+
       let threads: Thread[];
       if (params.handle) {
         const thread = await index.find(params.handle);
@@ -222,13 +297,11 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
         // Read alone, "nothing is archived" was taken to mean that nothing can be known. It says where to
         // look, and not why the archive is empty: another extension's edits and a lost archive file
         // leave it empty too. Nor does it promise a file for a cut result: only some cuts leave one.
+        const emptyText =
+          'No archived thread is on this branch, so recall has nothing to search. Look in your context instead; for a tool result that arrived cut, follow any pointer its preview gives to the rest.';
         return {
-          content: [
-            {
-              type: 'text',
-              text: 'No archived thread is on this branch, so recall has nothing to search. Look in your context instead; for a tool result that arrived cut, follow any pointer its preview gives to the rest.'
-            }
-          ],
+          content: [{ type: 'text', text: emptyText }],
+          structuredContent: emptyText,
           details: { query, threads: 0, shown: 0, total: 0 }
         };
       }
@@ -275,7 +348,8 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
         } else {
           lines.push(text);
         }
-        return { content: [{ type: 'text', text: lines.join('\n') }], details };
+        const out = lines.join('\n');
+        return { content: [{ type: 'text', text: out }], structuredContent: out, details };
       }
       const quoted = /^"(.+)"$/s.exec(query.trim())?.[1];
       let all: RecallMatch[];
@@ -308,13 +382,10 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
         total
       };
       if (total === 0) {
+        const none = `No match for "${query}" in ${threads.length} archived thread(s): ${threads.map((thread) => thread.handle).join(', ')}.`;
         return {
-          content: [
-            {
-              type: 'text',
-              text: `No match for "${query}" in ${threads.length} archived thread(s): ${threads.map((thread) => thread.handle).join(', ')}.`
-            }
-          ],
+          content: [{ type: 'text', text: none }],
+          structuredContent: none,
           details
         };
       }
@@ -345,7 +416,8 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
         details.file = file;
       }
 
-      return { content: [{ type: 'text', text: lines.join('\n') }], details };
+      const out = lines.join('\n');
+      return { content: [{ type: 'text', text: out }], structuredContent: out, details };
     }
   });
 }

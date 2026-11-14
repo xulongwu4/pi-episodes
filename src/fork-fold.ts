@@ -13,6 +13,7 @@ import {
   retiredResponsesCallIds,
   writtenMark
 } from './fold.js';
+import { carriedMediaBlocks, prepareCarriedMedia } from './images.js';
 import { estimateTokens, skillPaths, touchedPaths } from './messages.js';
 import { parseStamp, readStamp, stampLabel, withStamp } from './stamps.js';
 import type { EpisodeState } from './state.js';
@@ -32,6 +33,7 @@ export class ForkFolds {
   /** Messages before the child's own: the parent's view plus closed sibling fork calls. */
   private readonly prefixLength: number;
   private readonly siblings: number;
+  private readonly archiveDir: string | undefined;
   private readonly omitted = new Set<AgentMessage>();
   private readonly replaced = new Map<AgentMessage, (TextContent | ImageContent)[]>();
   private readonly applied = new Set<string>();
@@ -44,12 +46,14 @@ export class ForkFolds {
     parentEntries: readonly ProjectedSessionEntry[];
     prefixLength: number;
     siblings: number;
+    archiveDir?: string | undefined;
   }) {
     this.forkHandle = options.forkHandle;
     this.state = options.state;
     this.parentEntries = options.parentEntries;
     this.prefixLength = options.prefixLength;
     this.siblings = options.siblings;
+    this.archiveDir = options.archiveDir;
   }
 
   /** Active folds inside this fork: excludes any that the child unfolded. */
@@ -261,7 +265,13 @@ export class ForkFolds {
       }
     ];
     record.written = writtenMark(content, carried);
-    return { content, details: record };
+    const prepared = await prepareCarriedMedia(plan.handle, plan.media, this.archiveDir);
+    const mediaBlocks = carriedMediaBlocks(prepared);
+    const archivedManifest = prepared.flatMap((item) => (item.kind === 'ref' ? [item.ref] : []));
+    const carriedCount = prepared.filter((item) => item.kind === 'image').length;
+    if (carriedCount > 0) record.carriedImages = carriedCount;
+    if (archivedManifest.length > 0) record.archivedImages = archivedManifest;
+    return { content: [...content, ...mediaBlocks], details: record };
   }
 
   private async unfold(
