@@ -281,12 +281,7 @@ export class ForkFolds {
     if (archivedManifest.length > 0) record.archivedImages = archivedManifest;
     return {
       content: [...content, ...mediaBlocks],
-      details: {
-        ...record,
-        ...(record.archivedImages
-          ? { archivedImages: record.archivedImages.map((ref) => ({ ...ref })) }
-          : {})
-      }
+      details: structuredClone(record)
     };
   }
 

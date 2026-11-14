@@ -4,7 +4,7 @@ import { join, relative } from 'node:path';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
-import { archiveDir, callingFork, type Thread, ThreadIndex } from './archive.js';
+import { archiveDir, archiveDirs, callingFork, type Thread, ThreadIndex } from './archive.js';
 import { archivedImagesOf, readArchivedImage, resolveArchivedImagePath } from './images.js';
 import { messageText } from './messages.js';
 import { withFullOutput } from './output.js';
@@ -247,13 +247,13 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
             `No archived image #${askedImage} in ${thread.handle} (${thread.label}).`
           );
         }
-        const dir = archiveDir(ctx.sessionManager);
-        if (!dir) {
+        const dirs = await archiveDirs(ctx.sessionManager);
+        if (dirs.length === 0) {
           throw new Error(
             `No session archive directory available for ${thread.handle} image #${askedImage}.`
           );
         }
-        const loaded = await readArchivedImage(archived, dir);
+        const loaded = await readArchivedImage(archived, dirs);
         const stale = await staleness(state, [thread]);
         const details: RecallDetails = {
           query,
@@ -277,7 +277,7 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
           archived.width !== undefined && archived.height !== undefined
             ? `, ${archived.width}x${archived.height}`
             : '';
-        const livePath = resolveArchivedImagePath(archived, dir) ?? archived.path;
+        const livePath = resolveArchivedImagePath(archived, dirs) ?? archived.path;
         const header = `[${archived.handle} image #${archived.index}: ${archived.mimeType}${dims}, ${archived.bytes} bytes, sha256 ${archived.sha256} — ${livePath}]`;
         const note = [...stale.map((item) => item.line), header].join('\n');
         return {

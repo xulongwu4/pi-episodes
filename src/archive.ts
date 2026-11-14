@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { basename, dirname, extname, join } from 'node:path';
+import { constants as fsConstants } from 'node:fs';
+import { lstat, mkdir, open, readFile, rename, writeFile } from 'node:fs/promises';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { Usage } from '@earendil-works/pi-ai';
 import {
@@ -388,11 +389,93 @@ export function threadRecords(entries: readonly SessionEntry[]): ThreadRecord[] 
   });
 }
 
-/** Directory next to the session file where fork transcripts are kept. */
+function archiveDirForSessionFile(file: string): string {
+  return join(dirname(file), `${basename(file, extname(file))}.episodes`);
+}
+
+/** Directory next to the session file where fork transcripts and archived images are kept. */
 export function archiveDir(sessions: SessionView): string | undefined {
   const file = sessions.getSessionFile();
   if (!file) return undefined;
-  return join(dirname(file), `${basename(file, extname(file))}.episodes`);
+  return archiveDirForSessionFile(file);
+}
+
+async function pathExistsOnDisk(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readParentSessionFromHeader(sessionFile: string): Promise<string | undefined> {
+  let fh: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    const lst = await lstat(sessionFile);
+    if (!lst.isFile()) return undefined;
+    fh = await open(
+      sessionFile,
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0)
+    );
+    const st = await fh.stat();
+    if (!st.isFile()) return undefined;
+    const buf = Buffer.alloc(8192);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    if (bytesRead <= 0) return undefined;
+    const text = buf.subarray(0, bytesRead).toString('utf8');
+    const newline = text.indexOf('\n');
+    const firstLine = (newline >= 0 ? text.slice(0, newline) : text).trim();
+    if (!firstLine) return undefined;
+    const parsed = JSON.parse(firstLine) as { type?: unknown; parentSession?: unknown };
+    return parsed?.type === 'session' && typeof parsed.parentSession === 'string'
+      ? parsed.parentSession
+      : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    await fh?.close().catch(() => undefined);
+  }
+}
+
+/**
+ * The session's own `.episodes` directory followed by any ancestor `.episodes` directories
+ * reachable through Pi's `parentSession` header chain (`/fork` and `--fork`).
+ */
+export async function archiveDirs(sessions: SessionView): Promise<string[]> {
+  const liveFile = sessions.getSessionFile();
+  if (!liveFile) return [];
+  const resolvedLive = resolve(liveFile);
+  const liveSessionDir = dirname(resolvedLive);
+  const dirs: string[] = [archiveDirForSessionFile(resolvedLive)];
+  const seenDirs = new Set<string>(dirs);
+  const seenFiles = new Set<string>([resolvedLive]);
+  let nextParent =
+    typeof sessions.getHeader === 'function' ? sessions.getHeader()?.parentSession : undefined;
+  while (
+    typeof nextParent === 'string' &&
+    nextParent.length > 0 &&
+    !nextParent.includes('\0') &&
+    seenFiles.size < 64
+  ) {
+    const recordedParent = resolve(nextParent);
+    const siblingParent = join(liveSessionDir, basename(nextParent));
+    const siblingDir = archiveDirForSessionFile(siblingParent);
+    const recordedDir = archiveDirForSessionFile(recordedParent);
+    const useSibling =
+      siblingParent !== recordedParent &&
+      ((await pathExistsOnDisk(siblingParent)) || (await pathExistsOnDisk(siblingDir)));
+    const chosenSessionFile = useSibling ? siblingParent : recordedParent;
+    const chosenDir = useSibling ? siblingDir : recordedDir;
+    if (!seenDirs.has(chosenDir)) {
+      seenDirs.add(chosenDir);
+      dirs.push(chosenDir);
+    }
+    if (seenFiles.has(chosenSessionFile)) break;
+    seenFiles.add(chosenSessionFile);
+    nextParent = await readParentSessionFromHeader(chosenSessionFile);
+  }
+  return dirs;
 }
 
 export async function writeForkArchive(

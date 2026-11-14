@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -27,6 +28,7 @@ import {
 } from '@earendil-works/pi-coding-agent';
 import {
   archiveDir,
+  archiveDirs,
   callingFork,
   FOLD_APPLIED_TYPE,
   FOLD_DETAILS_KEY,
@@ -46,6 +48,7 @@ import {
   archiveImage,
   decodeImageBlock,
   formatImageRef,
+  holdsArchivedManifest,
   holdsCarriedMedia,
   imageDimensions,
   isArchivedImage,
@@ -2298,5 +2301,285 @@ test('in-place mutation of FoldDetails.archivedImages entries by a tool_result h
     } finally {
       await s.cleanup();
     }
+  }
+});
+
+test('FIFO nonblocking open, noFollowFlag=0 symlink fallback, atomic no-replace race, empty-manifest guard, and ForkFolds deep clone', async () => {
+  const tmpRoot = await mkdtemp(join(tmpdir(), 'episodes-os-safety-'));
+  try {
+    const dir = join(tmpRoot, 'sess.episodes');
+    await mkdir(dir, { recursive: true });
+    const pngA = makePng(3, 3, [20, 40, 60]);
+    const blockA: ImageContent = {
+      type: 'image',
+      data: pngA.toString('base64'),
+      mimeType: 'image/png'
+    };
+
+    // 1) Atomic no-replace publication: interleaved conflicting writer is NOT overwritten
+    const conflictBytes = Buffer.from('conflicting-concurrent-publication');
+    let racedTarget = '';
+    const racedConflict = await archiveImage(dir, 'ep-race0001', 1, blockA, {
+      beforePublish: async (targetPath) => {
+        racedTarget = targetPath;
+        await writeFile(targetPath, conflictBytes);
+      }
+    });
+    assert.equal(racedConflict, undefined, 'conflicting concurrent publish falls back to inline');
+    assert.deepEqual(
+      await readFile(racedTarget),
+      conflictBytes,
+      'existing file written concurrently must NEVER be overwritten'
+    );
+    await rm(racedTarget, { force: true });
+
+    // Interleaved identical writer reuses the concurrently published valid archive file
+    const racedSame = await archiveImage(dir, 'ep-race0002', 1, blockA, {
+      beforePublish: async (targetPath) => {
+        await writeFile(targetPath, pngA);
+      }
+    });
+    assert.ok(racedSame, 'identical concurrent publish reuses valid target');
+    assert.equal(verifyArchivedImageSync(racedSame, dir), true);
+
+    // 2) Simulated unavailable O_NOFOLLOW (noFollowFlag: 0): regular file passes, symlink fails
+    assert.equal(verifyArchivedImageSync(racedSame, dir, { noFollowFlag: 0 }), true);
+    const loadedNoFlag = await readArchivedImage(racedSame, dir, { noFollowFlag: 0 });
+    assert.equal(loadedNoFlag.data, blockA.data);
+
+    const outsideExact = join(tmpRoot, 'outside-exact.png');
+    await writeFile(outsideExact, pngA);
+    await rm(racedSame.path, { force: true });
+    await symlink(outsideExact, racedSame.path);
+    assert.equal(
+      verifyArchivedImageSync(racedSame, dir, { noFollowFlag: 0 }),
+      false,
+      'symlink rejected even when O_NOFOLLOW is unavailable'
+    );
+    await assert.rejects(
+      () => readArchivedImage(racedSame, dir, { noFollowFlag: 0 }),
+      /not a regular file/
+    );
+    await rm(racedSame.path, { force: true });
+
+    // 3) POSIX writerless FIFO at exact archive path does not block sync/async checks or archiveImage
+    if (process.platform !== 'win32') {
+      execFileSync('mkfifo', [racedSame.path]);
+      assert.equal(
+        verifyArchivedImageSync(racedSame, dir),
+        false,
+        'FIFO rejected without blocking'
+      );
+      await assert.rejects(() => readArchivedImage(racedSame, dir), /not a regular file/);
+      const fifoFallback = await archiveImage(dir, 'ep-fifo0001', 1, blockA);
+      assert.equal(
+        fifoFallback,
+        undefined,
+        'archiveImage falls back to inline without hanging on FIFO'
+      );
+      await rm(racedSame.path, { force: true });
+    }
+
+    // 4) holdsArchivedManifest rejects injected manifests when expected.length === 0
+    const validRef = await archiveImage(dir, 'ep-valid001', 1, blockA);
+    assert.ok(validRef);
+    assert.equal(holdsArchivedManifest(undefined, []), true);
+    assert.equal(holdsArchivedManifest([], []), true);
+    assert.equal(
+      holdsArchivedManifest([validRef], []),
+      false,
+      'injected archivedImages on inline-only fold must be rejected'
+    );
+    assert.equal(
+      holdsArchivedManifest([validRef, { malformed: true }], [{ kind: 'ref', ref: validRef }]),
+      false,
+      'extra malformed manifest entries must be rejected'
+    );
+
+    // 5) ForkFolds returns deep-cloned details (mutating written or covers does not corrupt stored record)
+    const { manager } = session([
+      user('parent', 1),
+      assistant(call('fk_clone', FORK_TOOL, { task: 'child' }))
+    ]);
+    const forkState = new EpisodeState();
+    forkState.cwd = tmpRoot;
+    forkState.nextStamp = 10;
+    const proj = manager.buildSessionProjection();
+    const childMsgs = [...proj.messages, result('fk_clone', FORK_TOOL, 'Task: child', 2)];
+    const forks = new ForkFolds({
+      forkHandle: 'fk-clone001',
+      state: forkState,
+      parentEntries: proj.entries,
+      prefixLength: proj.messages.length,
+      siblings: 0,
+      archiveDir: dir
+    });
+    const foldTool = forks.tool(
+      { name: 'fold', description: '', parameters: {} as never },
+      () => childMsgs
+    );
+    childMsgs.push(assistant(call('b1', 'bash', { command: 'echo hi' })));
+    const r1 = result('b1', 'bash', 'hi');
+    forks.stamp(r1);
+    childMsgs.push(r1);
+    childMsgs.push(assistant(call('f_child', 'fold', { since: 't10', note: 'Child note one.' })));
+    const f1 = (await foldTool.execute('f_child', {
+      since: 't10',
+      note: 'Child note one.'
+    })) as { details: FoldDetails };
+    f1.details.written!.blocks = 999;
+    f1.details.covers = ['ep-injected'];
+    assert.equal(forks.activeFolds[0]?.record.written?.blocks, 1);
+    assert.equal(forks.activeFolds[0]?.record.covers, undefined);
+  } finally {
+    await rm(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Pi /fork (createBranchedSession) and --fork (SessionManager.forkFrom) recall inherited ancestor images', async () => {
+  const png = makePng(6, 4, [15, 120, 220]);
+  const pngBlock: ImageContent = {
+    type: 'image',
+    data: png.toString('base64'),
+    mimeType: 'image/png'
+  };
+  let coveringHandle = '';
+
+  // Step 1: Create archived image in Session A
+  const sA = await createPersistedSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo sA_1' }), {
+          stopReason: 'toolUse'
+        }),
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', { since: 't1', note: 'Session A note 1 with screenshot.' }),
+          { stopReason: 'toolUse' }
+        ),
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo sA_2' }), {
+          stopReason: 'toolUse'
+        }),
+      (context) => {
+        const note1 = conversation(context).find((m) =>
+          text(m).includes('Session A note 1 with screenshot.')
+        )!;
+        const since = /\[(t\d+)\]\s*$/.exec(text(note1))![1]!;
+        return fauxAssistantMessage(
+          fauxToolCall('fold', { since, note: 'Session A covering note offloading screenshot.' }),
+          { stopReason: 'toolUse' }
+        );
+      },
+      (context) => {
+        const cov = conversation(context).find((m) =>
+          text(m).includes('Session A covering note offloading screenshot.')
+        )!;
+        coveringHandle = /\[fold (ep-[0-9a-f]+):/.exec(text(cov))![1]!;
+        return fauxAssistantMessage('done A');
+      }
+    ],
+    [
+      (pi) => {
+        pi.on('tool_result', (event) => {
+          const joined = event.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+          if (
+            joined.includes('Session A note 1 with screenshot.') &&
+            !joined.includes('Notes of the earlier folds')
+          ) {
+            return { content: [...event.content, pngBlock] };
+          }
+          return undefined;
+        });
+      }
+    ]
+  );
+
+  const crossForkDir = await mkdtemp(join(tmpdir(), 'episodes-cross-fork-'));
+  const relocatedDir = await mkdtemp(join(tmpdir(), 'episodes-relocated-fork-'));
+  try {
+    await sA.run('go');
+    assert.ok(coveringHandle, 'captured covering handle in Session A');
+    const smA = sA.session.sessionManager;
+    const fileA = smA.getSessionFile()!;
+    const leafA = smA.getLeafId()!;
+
+    // Step 2: Pi /fork via createBranchedSession -> Session B in same sessionDir
+    const fileB = smA.createBranchedSession(leafA)!;
+    assert.ok(fileB && fileB !== fileA, 'createBranchedSession produced a new session file');
+    const dirsB = await archiveDirs(smA);
+    assert.equal(dirsB.length, 2, 'Session B resolves both B.episodes and ancestor A.episodes');
+
+    // Step 3: Pi --fork via SessionManager.forkFrom(fileB, ...) -> Session C in a DIFFERENT directory (2 hops: C -> B -> A)
+    const smC = SessionManager.forkFrom(fileB, sA.dir, crossForkDir);
+    const dirsC = await archiveDirs(smC);
+    assert.equal(dirsC.length, 3, 'Session C resolves C.episodes, B.episodes, and A.episodes');
+
+    let recalledInC = '';
+    const sC = await createPersistedSession(
+      'off',
+      [
+        () =>
+          fauxAssistantMessage(fauxToolCall('recall', { handle: coveringHandle, image: 1 }), {
+            stopReason: 'toolUse'
+          }),
+        (context) => {
+          const recMsg = conversation(context).find(
+            (m) => m.role === 'toolResult' && m.toolName === 'recall'
+          )!;
+          assert.equal(recMsg.role, 'toolResult');
+          assert.equal(recMsg.isError, false, `recall in --fork child C failed: ${text(recMsg)}`);
+          const img = recMsg.content.find((b) => b.type === 'image');
+          assert.ok(img && img.type === 'image');
+          recalledInC = img.data;
+          return fauxAssistantMessage('done C');
+        }
+      ],
+      [],
+      { sessionManager: smC }
+    );
+    try {
+      await sC.run('recall from grandparent A');
+    } finally {
+      await sC.cleanup();
+    }
+    assert.equal(
+      recalledInC,
+      pngBlock.data,
+      '2-hop /fork + --fork session C recalled Session A image'
+    );
+
+    // Step 4: Relocate Session A (.jsonl + .episodes) and Session B (.jsonl) to relocatedDir and open B
+    const sessionDirA = join(sA.dir, 'sessions');
+    const dirA = join(sessionDirA, `${basename(fileA, '.jsonl')}.episodes`);
+    await rename(fileA, join(relocatedDir, basename(fileA)));
+    await rename(dirA, join(relocatedDir, basename(dirA)));
+    const movedFileB = join(relocatedDir, basename(fileB));
+    await rename(fileB, movedFileB);
+    const smMovedB = SessionManager.open(movedFileB, relocatedDir);
+    const movedDirsB = await archiveDirs(smMovedB);
+    assert.ok(
+      movedDirsB.includes(join(relocatedDir, basename(dirA))),
+      'relocated /fork child resolves relocated parent .episodes directory'
+    );
+
+    // Stranger .episodes directory not in parentSession chain is STILL rejected
+    const strangerRef = {
+      handle: coveringHandle,
+      index: 1,
+      path: `/tmp/unrelated-stranger.episodes/image-${'a'.repeat(16)}.png`,
+      sha256: 'a'.repeat(64),
+      mimeType: 'image/png' as const,
+      bytes: png.length
+    };
+    await assert.rejects(
+      () => readArchivedImage(strangerRef, movedDirsB),
+      /outside the session archive directory/
+    );
+  } finally {
+    await sA.cleanup();
+    await rm(crossForkDir, { recursive: true, force: true });
+    await rm(relocatedDir, { recursive: true, force: true });
   }
 });

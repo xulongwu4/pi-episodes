@@ -24,7 +24,6 @@ import {
   cutShortFold,
   foldableTurns,
   headline,
-  holdsImages,
   mergeStart,
   openItems,
   planFold,
@@ -35,6 +34,7 @@ import {
   workSince,
   writtenMark
 } from '../src/fold.js';
+import { carriedMediaBlocks, holdsCarriedMedia } from '../src/images.js';
 import { skillPaths, touchedPaths } from '../src/messages.js';
 import { nudgeGrowth, tokensBehindNote } from '../src/nudge.js';
 import { readStamp } from '../src/stamps.js';
@@ -860,7 +860,7 @@ function foldChain(shot?: string) {
       content: [
         ...copied,
         ...message.content.slice(0, -1),
-        ...plan.images,
+        ...carriedMediaBlocks(plan.media),
         ...(options.image ? [picture(options.image)] : []),
         ...(options.cue ? [{ type: 'text' as const, text: options.cue }] : []),
         ...message.content.slice(-1)
@@ -893,24 +893,53 @@ function foldChain(shot?: string) {
 test('a fold takes over the images that stand in the results of the notes it covers', () => {
   // Not the images in the work it folds, which leave with the work.
   const fold = foldChain('WORK');
-  assert.deepEqual(fold('f1', 'first', { image: 'AAAA' }).images, []);
-  assert.deepEqual(fold('f2', 'second', { image: 'BBBB' }).images, [picture('AAAA')]);
+  assert.deepEqual(fold('f1', 'first', { image: 'AAAA' }).media, []);
+  assert.deepEqual(fold('f2', 'second', { image: 'BBBB' }).media, [
+    { kind: 'image', image: picture('AAAA') }
+  ]);
   // The first image stands in the second note's result by now, before the one added there.
   const third = fold('f3', 'third');
-  assert.deepEqual(third.images, [picture('AAAA'), picture('BBBB')]);
+  assert.deepEqual(third.media, [
+    { kind: 'image', image: picture('AAAA') },
+    { kind: 'image', image: picture('BBBB') }
+  ]);
   // The images follow what the fold wrote, so the notes are still the ones the agent wrote.
   assert.deepEqual(
     third.covers.map((note) => note.text),
     ['first', 'second']
   );
-  assert.deepEqual(fold('f4', 'fourth').images, third.images);
+  assert.deepEqual(fold('f4', 'fourth').media, third.media);
 
-  assert.equal(holdsImages([picture('AAAA'), picture('BBBB')], [picture('BBBB')]), true);
-  assert.equal(holdsImages([{ type: 'text', text: 'AAAA' }], [picture('AAAA')]), false);
-  assert.equal(holdsImages([picture('AAAA')], [picture('AAAA'), picture('BBBB')]), false);
+  assert.equal(
+    holdsCarriedMedia(
+      [picture('AAAA'), picture('BBBB')],
+      [{ kind: 'image', image: picture('BBBB') }]
+    ),
+    true
+  );
+  assert.equal(
+    holdsCarriedMedia(
+      [{ type: 'text', text: 'AAAA' }],
+      [{ kind: 'image', image: picture('AAAA') }]
+    ),
+    false
+  );
+  assert.equal(
+    holdsCarriedMedia(
+      [picture('AAAA')],
+      [
+        { kind: 'image', image: picture('AAAA') },
+        { kind: 'image', image: picture('BBBB') }
+      ]
+    ),
+    false
+  );
   // The same data as another kind of image is not the image.
   assert.equal(
-    holdsImages([{ ...picture('AAAA'), mimeType: 'image/jpeg' }], [picture('AAAA')]),
+    holdsCarriedMedia(
+      [{ ...picture('AAAA'), mimeType: 'image/jpeg' }],
+      [{ kind: 'image', image: picture('AAAA') }]
+    ),
     false
   );
   // An image a script put in its result is part of what the fold left: another is not it.

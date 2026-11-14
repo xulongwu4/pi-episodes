@@ -98,8 +98,6 @@ export interface FoldPlan {
   archivedReadTurns: string[];
   /** The notes of earlier folds that the new note stands for from now on, oldest first. */
   covers: CoveredNote[];
-  /** The images in the results of the notes the fold covers, which its result takes over. */
-  images: ImageContent[];
   /** Covered-note media items (already-archived references and inline images) in block order. */
   media: CarriedMediaItem[];
   edits: ContextEditEntryDraft[];
@@ -188,20 +186,6 @@ function keptUnder(text: string): CoveredNote[] | undefined {
   return notes;
 }
 
-/**
- * A note's result as it stands in context, read by what the fold recorded of it in
- * `written`. The stamp is left out.
- *
- * `kept`: the notes kept under this one, taken from the end of the block the fold wrote them
- * in, only while the text there has the length and hash of what the fold wrote. `own`: all
- * the other text of the result. `added`: set while the blocks the fold left are, to the
- * character, what it left; it is then the text of the blocks added after them, a cue say, and
- * everything else in the result is known to be the fold's own writing, with the agent's note
- * in it as recorded.
- *
- * So nothing is taken for kept notes by its form, wherever it stands, and once anything was
- * changed, moved or cut, the changed text is in `own`, whole.
- */
 function intactWrittenPrefixLength(
   blocks: readonly (TextContent | ImageContent)[],
   written: FoldDetails['written']
@@ -218,6 +202,20 @@ function intactWrittenPrefixLength(
   return writtenMark(blocks.slice(0, count)).sha256 === written.sha256 ? count : undefined;
 }
 
+/**
+ * A note's result as it stands in context, read by what the fold recorded of it in
+ * `written`. The stamp is left out.
+ *
+ * `kept`: the notes kept under this one, taken from the end of the block the fold wrote them
+ * in, only while the text there has the length and hash of what the fold wrote. `own`: all
+ * the other text of the result. `added`: set while the blocks the fold left are, to the
+ * character, what it left; it is then the text of the blocks added after them, a cue say, and
+ * everything else in the result is known to be the fold's own writing, with the agent's note
+ * in it as recorded.
+ *
+ * So nothing is taken for kept notes by its form, wherever it stands, and once anything was
+ * changed, moved or cut, the changed text is in `own`, whole.
+ */
 function standing(
   content: readonly (TextContent | ImageContent)[],
   written: FoldDetails['written'],
@@ -326,22 +324,6 @@ export function coveredNotes(
 }
 
 /**
- * The images that stand in the results of the notes in `span`: another extension put them
- * there, and the images of notes covered before are among them. The fold that covers the notes
- * puts them after its own result, since the text it keeps cannot hold them.
- */
-export function coveredImages(
-  span: readonly ProjectedSessionEntry[],
-  applied: ReadonlySet<string>
-): ImageContent[] {
-  return span.flatMap((entry) => {
-    const shown = entry.messages[0];
-    if (shown?.role !== 'toolResult' || !isFoldNote(entry, applied)) return [];
-    return shown.content.filter((block) => block.type === 'image');
-  });
-}
-
-/**
  * Covered-note media items in block order: inline images and already-archived image references
  * standing on the results of the notes in `span`.
  */
@@ -371,19 +353,6 @@ export function coveredMedia(
     }
     return items;
   });
-}
-
-/** Whether every one of `images` is among the blocks of `content`. */
-export function holdsImages(
-  content: readonly (TextContent | ImageContent)[],
-  images: readonly ImageContent[]
-): boolean {
-  return images.every((image) =>
-    content.some(
-      (block) =>
-        block.type === 'image' && block.data === image.data && block.mimeType === image.mimeType
-    )
-  );
 }
 
 /** Estimated tokens of the notes a fold keeps as written: what covering them does not free. */
@@ -1255,7 +1224,6 @@ export function planFold(
     keptUserTurns,
     archivedReadTurns,
     covers: coveredNotes(entries, span, applied),
-    images: media.flatMap((item) => (item.kind === 'image' ? [item.image] : [])),
     media,
     edits
   };
