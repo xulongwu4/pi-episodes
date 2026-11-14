@@ -48,20 +48,22 @@ export function grepThreads(
 ): RecallMatch[] {
   const matches: RecallMatch[] = [];
   for (const thread of threads) {
-    let turn: string | undefined;
-    for (const message of thread.messages) {
-      const stamp = readStamp(message);
-      for (const line of messageText(message).split('\n')) {
-        const hit = match(line);
-        if (!hit) continue;
-        matches.push({
-          handle: thread.handle,
-          turn: stamp !== undefined ? stampLabel(stamp) : turn,
-          role: message.role,
-          line: excerpt(line, hit.index, hit.length)
-        });
+    for (const segment of thread.segments ?? [thread.messages]) {
+      let turn: string | undefined;
+      for (const message of segment) {
+        const stamp = readStamp(message);
+        for (const line of messageText(message).split('\n')) {
+          const hit = match(line);
+          if (!hit) continue;
+          matches.push({
+            handle: thread.handle,
+            turn: stamp !== undefined ? stampLabel(stamp) : turn,
+            role: message.role,
+            line: excerpt(line, hit.index, hit.length)
+          });
+        }
+        if (stamp !== undefined) turn = stampLabel(stamp);
       }
-      if (stamp !== undefined) turn = stampLabel(stamp);
     }
   }
   return matches;
@@ -81,22 +83,54 @@ export function turnMessages(
   stamp: number,
   last = stamp
 ): AgentMessage[] {
-  const start = thread.messages.findIndex((message) => readStamp(message) === stamp);
-  const final = thread.messages.findIndex((message) => readStamp(message) === last);
-  if (start < 0 || final < start) return [];
-  const end = thread.messages.findIndex(
-    (message, index) => index > final && readStamp(message) !== undefined
+  const segments = thread.segments ?? [thread.messages];
+  let startSeg = -1;
+  let startIdx = -1;
+  let endSeg = -1;
+  let endIdx = -1;
+  for (let s = 0; s < segments.length; s++) {
+    const seg = segments[s]!;
+    for (let i = 0; i < seg.length; i++) {
+      const found = readStamp(seg[i]!);
+      if (found === stamp && startSeg < 0) {
+        startSeg = s;
+        startIdx = i;
+      }
+      if (found === last && endSeg < 0) {
+        endSeg = s;
+        endIdx = i;
+      }
+    }
+  }
+  if (startSeg < 0 || endSeg < startSeg || (endSeg === startSeg && endIdx < startIdx)) {
+    return [];
+  }
+  const finalSeg = segments[endSeg]!;
+  const nextStamped = finalSeg.findIndex(
+    (message, index) => index > endIdx && readStamp(message) !== undefined
   );
-  return thread.messages.slice(start, end < 0 ? undefined : end);
+  const endCut = nextStamped < 0 ? finalSeg.length : nextStamped;
+  if (startSeg === endSeg) return [...finalSeg.slice(startIdx, endCut)];
+  return [
+    ...segments[startSeg]!.slice(startIdx),
+    ...segments.slice(startSeg + 1, endSeg).flatMap((seg) => [...seg]),
+    ...finalSeg.slice(0, endCut)
+  ];
 }
 
 /** Turns as they were, each message under a line saying whose it is, of which turn and how long. */
-export function formatTurn(handle: string, turn: string, messages: readonly AgentMessage[]) {
+export function formatTurn(
+  handle: string,
+  turn: string,
+  messages: readonly AgentMessage[],
+  segmentStarts?: ReadonlySet<AgentMessage>
+) {
   let label = turn;
   return messages
     .map((message) => {
       const stamp = readStamp(message);
       if (stamp !== undefined) label = stampLabel(stamp);
+      else if (segmentStarts?.has(message)) label = '-';
       const text = messageText(message);
       const tool = message.role === 'toolResult' ? ` (${message.toolName})` : '';
       return `${handle} ${label} ${message.role}${tool}, ${text.length} chars\n${text}`;
@@ -126,9 +160,13 @@ export async function staleness(
   threads: readonly Thread[]
 ): Promise<Staleness[]> {
   const snapshots = state.snapshots;
-  const records = threads.flatMap((thread) =>
-    thread.record.treeAfter && thread.record.files.length > 0 ? [thread.record] : []
-  );
+  const records = threads.flatMap((thread) => {
+    const rec = thread.record;
+    if (rec.files.length === 0) return [];
+    const hasSpanTree =
+      rec.kind === 'fold' && Boolean(rec.spans?.some((span) => Boolean(span.treeAfter)));
+    return rec.treeAfter || hasSpanTree ? [rec] : [];
+  });
   if (!snapshots || records.length === 0) return [];
 
   const now = await snapshots.snapshot();
@@ -136,12 +174,30 @@ export async function staleness(
 
   const notes: Staleness[] = [];
   for (const record of records) {
-    const changed = await snapshots.diff(record.treeAfter!, now, record.files);
-    if (changed && changed.length > 0) {
+    const filesByTree = new Map<string, string[]>();
+    if (record.kind === 'fold' && record.spans && record.spans.length > 1) {
+      for (const file of record.files) {
+        const latestSpan = record.spans.findLast((span) => span.files?.includes(file));
+        const tree = latestSpan?.treeAfter ?? record.treeAfter;
+        if (!tree) continue;
+        const group = filesByTree.get(tree) ?? [];
+        group.push(file);
+        filesByTree.set(tree, group);
+      }
+    } else if (record.treeAfter) {
+      filesByTree.set(record.treeAfter, [...record.files]);
+    }
+    const changedPaths = new Set<string>();
+    for (const [tree, groupFiles] of filesByTree) {
+      const changed = await snapshots.diff(tree, now, groupFiles);
+      for (const change of changed ?? []) changedPaths.add(change.path);
+    }
+    const ordered = record.files.filter((file) => changedPaths.has(file));
+    if (ordered.length > 0) {
       notes.push({
         handle: record.handle,
-        files: changed.map((change) => change.path),
-        line: `${record.handle} predates changes to: ${changed.map((change) => relative(state.cwd, change.path)).join(', ')}. Conclusions about those files may no longer hold.`
+        files: ordered,
+        line: `${record.handle} predates changes to: ${ordered.map((path) => relative(state.cwd, path)).join(', ')}. Conclusions about those files may no longer hold.`
       });
     }
   }
@@ -302,10 +358,18 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
       }
       // What a tool result was cut from when it arrived is part of the record.
       threads = await Promise.all(
-        threads.map(async (thread) => ({
-          ...thread,
-          messages: await Promise.all(thread.messages.map(withFullOutput))
-        }))
+        threads.map(async (thread) => {
+          if (thread.segments) {
+            const segments = await Promise.all(
+              thread.segments.map((seg) => Promise.all(seg.map(withFullOutput)))
+            );
+            return { ...thread, segments, messages: segments.flat() };
+          }
+          return {
+            ...thread,
+            messages: await Promise.all(thread.messages.map(withFullOutput))
+          };
+        })
       );
 
       if (threads.length === 0) {
@@ -333,7 +397,11 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
         }
         const from = stampLabel(first!);
         const turn = last === undefined || last === first ? from : `${from}-${stampLabel(last)}`;
-        const text = formatTurn(thread.handle, from, messages);
+        const segmentStarts =
+          thread.segments && thread.segments.length > 1
+            ? new Set(thread.segments.slice(1).flatMap((seg) => (seg[0] ? [seg[0]] : [])))
+            : undefined;
+        const text = formatTurn(thread.handle, from, messages, segmentStarts);
         const cap = turn === from ? READ_BACK_CHARS : READ_BACK_RANGE_CHARS;
         const details: RecallDetails = {
           query,

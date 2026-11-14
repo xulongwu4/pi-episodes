@@ -82,6 +82,8 @@ export interface FoldSpanDetails {
   firstEntryId: string;
   lastEntryId: string;
   note: string;
+  files?: string[];
+  treeAfter?: string;
 }
 
 /** Stored on the fold tool result, so the record follows the branch it belongs to. */
@@ -374,6 +376,8 @@ export interface Thread {
   label: string;
   /** What the thread itself held, unedited. */
   messages: AgentMessage[];
+  /** Disjoint span message segments when a batch fold archived non-contiguous ranges. */
+  segments?: AgentMessage[][];
   /**
    * The full context the thread ran with: everything before it plus the thread. Absent for
    * compacted turns, which filled the window when they were compacted; `ask` cannot resume them.
@@ -769,14 +773,18 @@ export class ThreadIndex {
       }
     }
 
+    const segments = intervals.map(([first, last]) =>
+      path
+        .slice(first, last + 1)
+        .filter((entry) => !covered.has(entry.id))
+        .flatMap(sessionEntryToContextMessages)
+    );
     return {
       handle: fold.handle,
       kind: 'fold',
       label: formatFoldRange(fold, { turnsPrefix: true }),
-      messages: intervals
-        .flatMap(([first, last]) => path.slice(first, last + 1))
-        .filter((entry) => !covered.has(entry.id))
-        .flatMap(sessionEntryToContextMessages),
+      messages: segments.flat(),
+      ...(segments.length > 1 ? { segments } : {}),
       context: () => {
         // As the agent saw the span when it folded: the edits of earlier folds are written
         // after their notes, which can be after this span.
@@ -885,15 +893,17 @@ export class ThreadIndex {
           messageLimit: fold.last + 1,
           stateAt: snapAt
         });
+      const segments = nestedFoldSpans(fold).map((span) =>
+        archive.messages
+          .slice(span.first, span.last + 1)
+          .filter((_, index) => !earlier.has(span.first + index))
+      );
       threads.push({
         handle: fold.record.handle,
         kind: 'fold',
         label: `${formatFoldRange(fold.record, { turnsPrefix: true })}, inside ${archive.handle}`,
-        messages: nestedFoldSpans(fold).flatMap((span) =>
-          archive.messages
-            .slice(span.first, span.last + 1)
-            .filter((_, index) => !earlier.has(span.first + index))
-        ),
+        messages: segments.flat(),
+        ...(segments.length > 1 ? { segments } : {}),
         // What the child saw when it folded: its earlier folds at `snapAt`, this one not yet.
         context: () => [...this.forkPrefix(archive), ...snapReplay().messages],
         retiredCallIds: () => {

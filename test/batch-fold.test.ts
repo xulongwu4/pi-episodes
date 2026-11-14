@@ -1019,3 +1019,186 @@ test('adjacent spans omit unfolded notice, ask queries batch thread, and TUI ren
     await harness.cleanup();
   }
 });
+
+test('staleness detects interior-gap edits to files touched only in an earlier batch span', async () => {
+  let batchHandle = '';
+  const harness = await createLiveSession(
+    [
+      // t2 (Span 0): read and write early.txt
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('bash', {
+            command: 'echo v1 > early.txt && cat early.txt && echo EARLY_MARK_77'
+          })
+        ),
+      // t3 (Interior retained gap): modify early.txt AFTER Span 0 ended!
+      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo v2 > early.txt' })),
+      // t4 (Span 1): touch only later.txt (early.txt already has v2 at t4!)
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('bash', { command: 'echo later > later.txt && echo LATER_MARK_88' })
+        ),
+      // Fold Span 0 (t2) and Span 1 (t4), keeping interior gap t3
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', {
+            spans: [
+              { since: 't2', until: 't2', note: 'Created early.txt v1.' },
+              { since: 't4', note: 'Created later.txt.' }
+            ]
+          }),
+          { stopReason: 'toolUse' }
+        ),
+      (context) => {
+        const joined = context.messages.map(text).join('\n');
+        batchHandle = /\[fold (ep-[0-9a-f]{8}):/.exec(joined)![1]!;
+        return fauxAssistantMessage(fauxToolCall('recall', { query: '"EARLY_MARK_77"' }), {
+          stopReason: 'toolUse'
+        });
+      },
+      (afterRecall) => {
+        const recallOut = text(afterRecall.messages.at(-1)!);
+        // early.txt was modified in t3 after Span 0 ended, so recall must warn it is stale!
+        assert.match(recallOut, /predates changes to: .*early\.txt/);
+        assert.doesNotMatch(recallOut, /later\.txt/);
+        return fauxAssistantMessage('Verified per-span staleness.');
+      }
+    ],
+    { git: true }
+  );
+
+  try {
+    execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: harness.dir });
+    await harness.session.prompt('check staleness');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.ok(batchHandle.startsWith('ep-'));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('disjoint span boundaries do not bleed Span 2 opening assistant turn into Span 1 turn readback or search attribution', async () => {
+  let batchHandle = '';
+  const harness = await createLiveSession([
+    // t2 (Span 0)
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo SPAN_ONE_OUT' })),
+    // t3 (Interior gap)
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo GAP_OUT' })),
+    // t4 (Span 1): unique token ONLY in Span 1 opening assistant toolCall command!
+    () =>
+      fauxAssistantMessage(
+        fauxToolCall('bash', {
+          command: 'echo SPAN_TWO_CMD_ONLY_TOKEN >/dev/null && echo SPAN_TWO_RES'
+        })
+      ),
+    // Batch fold t2 and t4, keeping t3
+    () =>
+      fauxAssistantMessage(
+        fauxToolCall('fold', {
+          spans: [
+            { since: 't2', until: 't2', note: 'Ran span one.' },
+            { since: 't4', note: 'Ran span two.' }
+          ]
+        }),
+        { stopReason: 'toolUse' }
+      ),
+    (context) => {
+      const joined = context.messages.map(text).join('\n');
+      batchHandle = /\[fold (ep-[0-9a-f]{8}):/.exec(joined)![1]!;
+      return fauxAssistantMessage(
+        [
+          fauxToolCall('recall', { handle: batchHandle, turn: 't2' }),
+          fauxToolCall('recall', { handle: batchHandle, turn: 't2-t4' }),
+          fauxToolCall('recall', { query: '"SPAN_TWO_CMD_ONLY_TOKEN"' }),
+          fauxToolCall('recall', { query: 'SPAN_TWO_CMD_ONLY_TOKEN' })
+        ],
+        { stopReason: 'toolUse' }
+      );
+    },
+    (afterRecall) => {
+      const recent = afterRecall.messages.slice(-4).map(text);
+      const turnT2Out = recent[0]!;
+      const rangeOut = recent[1]!;
+      const grepOut = recent[2]!;
+      const bm25Out = recent[3]!;
+      // 1. Reading back turn t2 must NOT include Span 2's opening assistant message:
+      assert.match(turnT2Out, /SPAN_ONE_OUT/);
+      assert.doesNotMatch(turnT2Out, /SPAN_TWO_CMD_ONLY_TOKEN/);
+      // 2. Cross-span range t2-t4 resets label at Span 2's unstamped assistant boundary:
+      assert.match(rangeOut, /SPAN_ONE_OUT/);
+      assert.match(rangeOut, /SPAN_TWO_RES/);
+      assert.doesNotMatch(rangeOut, /GAP_OUT/);
+      assert.match(rangeOut, new RegExp(`${batchHandle} - assistant`));
+      assert.doesNotMatch(rangeOut, new RegExp(`${batchHandle} t2 assistant`));
+      // 3. Both quoted grep and MiniSearch must NOT misattribute Span 2's opening assistant to t2:
+      assert.doesNotMatch(grepOut, new RegExp(`${batchHandle} t2 assistant:`));
+      assert.doesNotMatch(bm25Out, new RegExp(`${batchHandle} t2 assistant:`));
+      return fauxAssistantMessage('Verified disjoint span boundaries.');
+    }
+  ]);
+
+  try {
+    await harness.session.prompt('check boundaries');
+    if (harness.failures[0]) throw harness.failures[0];
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('planFoldBatch orders transitive covered notes oldest-first by written order across spans', async () => {
+  const harness = await createLiveSession([
+    // t2: work 1
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo w1' })),
+    // t3: ep-1 folds t2 (oldest note, written first!)
+    () =>
+      fauxAssistantMessage(fauxToolCall('fold', { since: 't2', note: 'OLDEST_NOTE_EP1' }), {
+        stopReason: 'toolUse'
+      }),
+    // t4: work 2
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo w2' })),
+    // t5: ep-2 folds t4 (second note, written second!)
+    () =>
+      fauxAssistantMessage(fauxToolCall('fold', { since: 't4', note: 'SECOND_NOTE_EP2' }), {
+        stopReason: 'toolUse'
+      }),
+    // t6: gap work to keep active
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo gap_keep' })),
+    // t7: ep-3 folds bounded t3..t3 (covers ep-1! Written third, stands at t7 AFTER ep-2 at t5!)
+    () =>
+      fauxAssistantMessage(
+        fauxToolCall('fold', { since: 't3', until: 't3', note: 'THIRD_NOTE_EP3' }),
+        { stopReason: 'toolUse' }
+      ),
+    // Batch fold covering Span 0 = t5 (ep-2) and Span 1 = t7 (ep-3, which carries ep-1), keeping gap t6!
+    () =>
+      fauxAssistantMessage(
+        fauxToolCall('fold', {
+          spans: [
+            { since: 't5', until: 't5', note: 'Batch span covering ep-2.' },
+            { since: 't7', until: 't7', note: 'Batch span covering ep-3.' }
+          ]
+        }),
+        { stopReason: 'toolUse' }
+      ),
+    (context) => {
+      const noteText = context.messages
+        .filter((m) => m.role === 'toolResult')
+        .map(text)
+        .at(-1)!;
+      const idx1 = noteText.indexOf('OLDEST_NOTE_EP1');
+      const idx2 = noteText.indexOf('SECOND_NOTE_EP2');
+      const idx3 = noteText.indexOf('THIRD_NOTE_EP3');
+      assert.ok(idx1 > 0 && idx2 > 0 && idx3 > 0);
+      assert.ok(idx1 < idx2, `Expected ep-1 (${idx1}) before ep-2 (${idx2})`);
+      assert.ok(idx2 < idx3, `Expected ep-2 (${idx2}) before ep-3 (${idx3})`);
+      return fauxAssistantMessage('Verified oldest-first covered notes order.');
+    }
+  ]);
+
+  try {
+    await harness.session.prompt('check covers order');
+    if (harness.failures[0]) throw harness.failures[0];
+  } finally {
+    await harness.cleanup();
+  }
+});

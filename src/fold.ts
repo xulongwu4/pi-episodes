@@ -1502,17 +1502,12 @@ export function planFoldBatch(
   const tokens = estimateTokens(omitted);
   const keptUserTurns = resolved.flatMap((entry) => entry.plan.keptUserTurns);
 
-  const seenCovers = new Set<string>();
-  const covers: CoveredNote[] = [];
-  for (const entry of resolved) {
-    for (const cover of entry.plan.covers) {
-      if (!seenCovers.has(cover.handle)) {
-        seenCovers.add(cover.handle);
-        covers.push(cover);
-      }
-    }
-  }
-  const media = resolved.flatMap((entry) => entry.plan.media);
+  const selectedEntries = resolved.flatMap((entry) =>
+    entries.slice(entry.startIndex, entry.endIndex)
+  );
+  const applied = options.applied ?? appliedFolds(entries.map((entry) => entry.sourceEntry));
+  const covers = coveredNotes(entries, selectedEntries, applied);
+  const media = coveredMedia(selectedEntries, applied);
 
   const omittedReadStamps = new Set<string>();
   for (const msg of omitted) {
@@ -2396,6 +2391,9 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       const keptFrom = batch.keptFrom;
       const touched = touchedPaths(batch.spanMessages, state.cwd);
       const files = new Set(touched);
+      const perSpanFiles = batch.spans.map(
+        (span) => new Set(touchedPaths(span.spanMessages, state.cwd))
+      );
 
       let changes: DiskChange[] | undefined;
       let treeAfter: string | undefined;
@@ -2408,13 +2406,17 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
           return currentTreePromise;
         };
         const perSpanChanges: (DiskChange[] | undefined)[] = [];
-        for (const span of batch.spans) {
+        for (let i = 0; i < batch.spans.length; i++) {
+          const span = batch.spans[i]!;
           const runsToCall = span.endIndex === foldIndex;
           const spanTreeAfter =
             runsToCall || span.lastStamp === undefined
               ? await currentTree()
               : await snapshots.treeAt(span.lastStamp);
-          treeAfter = spanTreeAfter;
+          if (spanTreeAfter) {
+            treeAfter = spanTreeAfter;
+            spanDetails[i]!.treeAfter = spanTreeAfter;
+          }
           let from: string | undefined;
           for (const stamp of [...span.laterStamps].reverse().concat(span.anchorStamp ?? [])) {
             from ??= await snapshots.treeAt(stamp);
@@ -2422,12 +2424,18 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
           if (from && spanTreeAfter) {
             const spanDiff = await snapshots.diff(from, spanTreeAfter);
             perSpanChanges.push(spanDiff);
-            for (const change of spanDiff ?? []) files.add(change.path);
+            for (const change of spanDiff ?? []) {
+              files.add(change.path);
+              perSpanFiles[i]!.add(change.path);
+            }
           } else {
             perSpanChanges.push(undefined);
           }
         }
         changes = mergeSpanDiskChanges(perSpanChanges);
+      }
+      for (let i = 0; i < spanDetails.length; i++) {
+        if (perSpanFiles[i]!.size > 0) spanDetails[i]!.files = [...perSpanFiles[i]!];
       }
 
       const tokens = batch.tokens;

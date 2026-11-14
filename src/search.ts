@@ -17,6 +17,7 @@ export interface RecallMatch {
 export interface SearchableThread {
   handle: string;
   messages: readonly AgentMessage[];
+  segments?: readonly (readonly AgentMessage[])[];
 }
 
 interface Chunk {
@@ -63,25 +64,31 @@ const lower = (term: string) => term.toLowerCase();
 const isWord = (term: string, min: number) => term.length >= min && /^\p{L}+$/u.test(term);
 
 /** Ids continue from `firstId`, so they stay positions in the index's chunk list. */
-function chunks(handle: string, messages: readonly AgentMessage[], firstId: number): Chunk[] {
+function chunks(
+  handle: string,
+  segments: readonly (readonly AgentMessage[])[],
+  firstId: number
+): Chunk[] {
   const out: Chunk[] = [];
-  let turn: string | undefined;
-  for (const message of messages) {
-    const stamp = readStamp(message);
-    const label = stamp !== undefined ? stampLabel(stamp) : turn;
-    let text = '';
-    const flush = () => {
-      if (text.trim()) {
-        out.push({ id: firstId + out.length, handle, turn: label, role: message.role, text });
+  for (const messages of segments) {
+    let turn: string | undefined;
+    for (const message of messages) {
+      const stamp = readStamp(message);
+      const label = stamp !== undefined ? stampLabel(stamp) : turn;
+      let text = '';
+      const flush = () => {
+        if (text.trim()) {
+          out.push({ id: firstId + out.length, handle, turn: label, role: message.role, text });
+        }
+        text = '';
+      };
+      for (const line of messageText(message).split('\n')) {
+        if (text && text.length + line.length > CHUNK_CHARS) flush();
+        text += `${line}\n`;
       }
-      text = '';
-    };
-    for (const line of messageText(message).split('\n')) {
-      if (text && text.length + line.length > CHUNK_CHARS) flush();
-      text += `${line}\n`;
+      flush();
+      if (stamp !== undefined) turn = stampLabel(stamp);
     }
-    flush();
-    if (stamp !== undefined) turn = stampLabel(stamp);
   }
   return out;
 }
@@ -126,7 +133,7 @@ export class RecallIndex {
     for (const thread of threads) {
       if (this.indexed.has(thread.handle)) continue;
       this.indexed.add(thread.handle);
-      const added = chunks(thread.handle, thread.messages, this.chunks.length);
+      const added = chunks(thread.handle, thread.segments ?? [thread.messages], this.chunks.length);
       this.chunks.push(...added);
       this.index.addAll(added);
     }

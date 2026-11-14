@@ -224,12 +224,14 @@ export class ForkFolds {
             ? stampLabel(span.lastStamp)
             : undefined
           : stampLabel(span.lastStamp ?? span.until ?? span.since);
+      const spanFiles = touchedPaths(span.spanMessages, this.state.cwd);
       return {
         since: sinceLabel,
         ...(untilLabel ? { until: untilLabel } : {}),
         firstEntryId: span.firstEntryId,
         lastEntryId: span.lastEntryId,
-        note: span.note
+        note: span.note,
+        ...(spanFiles.length > 0 ? { files: spanFiles } : {})
       };
     });
     const firstSpanDetail = spanDetails[0]!;
