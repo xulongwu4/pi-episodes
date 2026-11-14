@@ -1090,6 +1090,78 @@ test('a large tool result arrives cut, and recall searches and reads back all of
   }
 });
 
+test('a large read result arrives cut, leaves errors and images whole, and recall restores it', async () => {
+  let handle = '';
+  const png = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64'
+  );
+  const harness = await createSession(
+    [
+      () => fauxAssistantMessage(fauxToolCall('read', { path: 'table.txt' })),
+      (context) => {
+        const output = text(conversation(context).at(-1)!);
+        assert.match(output, /^row 1 of the file\n/);
+        assert.match(
+          output,
+          /\[episodes\] \d+ of \d+ characters left out here\. All of this output is in /
+        );
+        assert.match(output, /row 600 of the file\n+\[t2\]$/);
+        assert.doesNotMatch(output, /row 300 of/);
+        assert.ok(output.length < 1000);
+        return fauxAssistantMessage([
+          fauxToolCall('read', { path: 'missing.txt' }),
+          fauxToolCall('read', { path: 'tiny.png' })
+        ]);
+      },
+      (context) => {
+        const recent = conversation(context).slice(-2);
+        assert.equal(recent[0]?.role, 'toolResult');
+        assert.equal(recent[0]?.isError, true);
+        assert.doesNotMatch(text(recent[0]!), /left out here/);
+        assert.equal(recent[1]?.role, 'toolResult');
+        assert.ok(recent[1]!.content.some((block) => block.type === 'image'));
+        return fauxAssistantMessage(
+          fauxToolCall('fold', { since: 't2', note: 'Read table.txt and tiny.png.' })
+        );
+      },
+      async (context) => {
+        handle = /ep-[0-9a-f]{8}/.exec(text(conversation(context).at(-1)!))![0];
+        await writeFile(join(harness.dir, 'table.txt'), 'changed on disk\n');
+        return fauxAssistantMessage(fauxToolCall('recall', { query: '"row 300 of the file"' }));
+      },
+      (context) => {
+        assert.equal(
+          text(conversation(context).at(-1)!).split('\n')[0],
+          `${handle} t2 toolResult: row 300 of the file`
+        );
+        return fauxAssistantMessage(fauxToolCall('recall', { handle, turn: 't2' }));
+      },
+      (context) => {
+        const back = text(conversation(context).at(-1)!);
+        assert.match(back, /row 300 of the file\n/);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    { persist: true, episodes: { outputCapChars: 2000, outputCapKeepChars: 600 } }
+  );
+
+  try {
+    const rows = Array.from({ length: 600 }, (_, i) => `row ${i + 1} of the file`).join('\n');
+    await writeFile(join(harness.dir, 'table.txt'), `${rows}\n`);
+    await writeFile(join(harness.dir, 'tiny.png'), png);
+    await harness.session.prompt('read the files');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+
+    const stats = episodeStats(harness.session.sessionManager.getBranch(), harness.dir);
+    assert.equal(stats.outputs.capped, 1);
+    assert.ok(stats.outputs.tokens > 2000);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test('an output cap that is off leaves large results whole', async () => {
   const harness = await createSession(
     [

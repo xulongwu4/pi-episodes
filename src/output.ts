@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
@@ -305,4 +306,62 @@ export async function withFullOutput(message: AgentMessage): Promise<AgentMessag
     cuts = cuts.filter((cut) => cut !== next.cut);
   }
   return content === message.content ? message : { ...message, content };
+}
+
+const UNTRACKED_CUT_MARKER =
+  /\n\n\[(?:episodes\] \d+ of \d+ characters left out here|tool-result-offload: \d+ of \d+ chars omitted)\./;
+
+/**
+ * Verifies and returns the complete uncut text blocks of a `read` tool result after any trailing
+ * `[tN]` stamp block has been removed. Returns `undefined` when the result holds an image, was
+ * cut by an external offloader, carries an untracked cut marker, or had its archived
+ * `episodesOutput` file removed or altered on disk.
+ */
+export function completeReadBlocks(
+  content: readonly Block[],
+  details: unknown
+): TextContent[] | undefined {
+  if (content.some((block) => block.type !== 'text')) return undefined;
+  const textBlocks = content as readonly TextContent[];
+  if (offloadedOutput(details)) return undefined;
+  const capped = cappedOutput(details);
+  if (!capped) {
+    if (textBlocks.some((block) => UNTRACKED_CUT_MARKER.test(block.text))) return undefined;
+    return textBlocks.map((block) => ({ type: 'text', text: block.text }));
+  }
+  let full: string;
+  try {
+    full = readFileSync(capped.path, 'utf8');
+  } catch {
+    return undefined;
+  }
+  if (full.length !== capped.chars) return undefined;
+  const nameMatch = /(?:^|[/\\])output-([0-9a-f]{16})\.txt$/.exec(capped.path);
+  if (!nameMatch) return undefined;
+  const digest = createHash('sha256').update(full).digest('hex');
+  if (!digest.startsWith(nameMatch[1]!)) return undefined;
+  const marker = new RegExp(
+    '\\n\\n\\[episodes\\] (\\d+) of \\d+ characters left out here\\. ' +
+      literal(named(capped.path)) +
+      '[^\\n]*\\n\\n',
+    'g'
+  );
+  const marked = textBlocks.flatMap((block, index) =>
+    block.text.search(marker) >= 0 ? [{ index, text: block.text }] : []
+  );
+  if (marked.length === 0) return undefined;
+  const fits = marked.flatMap(({ index, text }) => {
+    const whole = putBack(text, marker, full, capped.head);
+    return whole === undefined ? [] : [{ index, text: whole }];
+  });
+  const fit =
+    fits.find(({ index }) => index === capped.block) ?? (fits.length === 1 ? fits[0] : undefined);
+  if (!fit || fit.text.length !== full.length) return undefined;
+  const rebuilt = textBlocks.flatMap((block, index): TextContent[] =>
+    index === fit.index
+      ? unjoined(full, capped.parts).map((text) => ({ type: 'text', text }))
+      : [{ type: 'text', text: block.text }]
+  );
+  if (rebuilt.some((block) => UNTRACKED_CUT_MARKER.test(block.text))) return undefined;
+  return rebuilt;
 }

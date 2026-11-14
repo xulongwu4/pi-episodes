@@ -20,6 +20,10 @@ export interface PendingFold {
   messages: number;
   tokens: number;
   edits: ContextEditEntryDraft[];
+  /** Last session entry inside the folded span, where any surviving `until` tail begins. */
+  lastEntryId?: string;
+  /** Assistant message entry that initiated the fold call (or calling script). */
+  callerEntryId?: string;
   /** The notes the fold covers, as its result holds them under its own note. */
   carried?: string;
   /** The images that stood in the results of those notes, which the result takes over. */

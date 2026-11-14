@@ -28,9 +28,14 @@ import {
 import { anchorGapTokens } from './cache.js';
 import { type FoldRejection, recordEvent } from './events.js';
 import { estimateTokens, readOnlyPaths, skillPaths, textOf, touchedPaths } from './messages.js';
+import { completeReadBlocks } from './output.js';
 import { retireAssistantContent } from './retire.js';
 
 export * from './retire.js';
+
+import { planFoldTailPruning, type ReadPruneDependency } from './prune.js';
+
+export * from './prune.js';
 
 import type { DiskChange } from './snapshots.js';
 import {
@@ -694,21 +699,29 @@ function unfinishedBatches(branch: readonly SessionEntry[]): {
   kind: 'fold' | 'unfold';
   handle: string;
   edits: ContextEditEntryDraft[];
+  readDeps: ReadPruneDependency[];
 }[] {
   const open = new Map<
     string,
-    { index: number; kind: 'fold' | 'unfold'; handle: string; edits: ContextEditEntryDraft[] }
+    {
+      index: number;
+      kind: 'fold' | 'unfold';
+      handle: string;
+      edits: ContextEditEntryDraft[];
+      readDeps: ReadPruneDependency[];
+    }
   >();
   branch.forEach((entry, index) => {
     if (entry.type !== 'custom') return;
-    const data = (entry.data ?? {}) as { handle?: unknown; edits?: unknown };
+    const data = (entry.data ?? {}) as { handle?: unknown; edits?: unknown; readDeps?: unknown };
     if (typeof data.handle !== 'string') return;
     if (entry.customType === FOLD_STARTED_TYPE && Array.isArray(data.edits)) {
       open.set(`fold:${data.handle}`, {
         index,
         kind: 'fold',
         handle: data.handle,
-        edits: data.edits as ContextEditEntryDraft[]
+        edits: data.edits as ContextEditEntryDraft[],
+        readDeps: Array.isArray(data.readDeps) ? (data.readDeps as ReadPruneDependency[]) : []
       });
     } else if (entry.customType === FOLD_APPLIED_TYPE) {
       open.delete(`fold:${data.handle}`);
@@ -717,7 +730,8 @@ function unfinishedBatches(branch: readonly SessionEntry[]): {
         index,
         kind: 'unfold',
         handle: data.handle,
-        edits: data.edits as ContextEditEntryDraft[]
+        edits: data.edits as ContextEditEntryDraft[],
+        readDeps: []
       });
     } else if (entry.customType === FOLD_UNFOLDED_TYPE) {
       open.delete(`unfold:${data.handle}`);
@@ -743,7 +757,19 @@ export function completeCutShortFolds(
     if (typeof raw === 'string') return [{ type: 'text', text: raw }];
     return Array.isArray(raw) ? (raw as AssistantMessage['content']) : [];
   };
-  return unfinishedBatches(branch).flatMap(({ index, kind, handle, edits }) => {
+  const effectiveReplacement = (targetId: string): unknown => {
+    const source = branchById.get(targetId);
+    const base = source ? defaultEntryContent(source) : undefined;
+    let state: unknown = base === undefined ? undefined : { content: base };
+    for (const entry of [...branch, ...pending]) {
+      if (entry.type === 'context_edit' && entry.targetId === targetId) {
+        state = entry.replacement;
+      }
+    }
+    return state;
+  };
+  return unfinishedBatches(branch).flatMap(({ index, kind, handle, edits, readDeps }) => {
+    const depByTarget = new Map(readDeps.map((dep) => [dep.targetId, dep]));
     const latestRaw = new Map<string, unknown>();
     for (const entry of [...branch.slice(index + 1), ...pending]) {
       if (entry.type === 'context_edit' && entry.targetId !== undefined) {
@@ -756,6 +782,43 @@ export function completeCutShortFolds(
       data: { handle }
     };
     const rest = edits.flatMap((edit): ContextEditEntryDraft[] => {
+      const dep = kind === 'fold' ? depByTarget.get(edit.targetId) : undefined;
+      if (dep) {
+        const currentNewer = effectiveReplacement(dep.newerEntryId);
+        const newerSource = branchById.get(dep.newerEntryId);
+        const newerBlocks =
+          currentNewer && typeof currentNewer === 'object'
+            ? (currentNewer as { content?: unknown }).content
+            : undefined;
+        const newerUnstamped = Array.isArray(newerBlocks)
+          ? newerBlocks.at(-1) && isStampBlock(newerBlocks.at(-1) as TextContent | ImageContent)
+            ? (newerBlocks.slice(0, -1) as (TextContent | ImageContent)[])
+            : (newerBlocks as (TextContent | ImageContent)[])
+          : undefined;
+        const newerIntact =
+          !latestRaw.has(dep.newerEntryId) &&
+          currentNewer !== null &&
+          currentNewer !== undefined &&
+          JSON.stringify(currentNewer) === JSON.stringify(dep.newerExpected) &&
+          newerSource?.type === 'message' &&
+          newerSource.message.role === 'toolResult' &&
+          newerUnstamped !== undefined &&
+          completeReadBlocks(newerUnstamped, newerSource.message.details) !== undefined;
+        if (!latestRaw.has(edit.targetId)) {
+          return newerIntact ? [edit] : [];
+        }
+        const written = latestRaw.get(edit.targetId);
+        if (!newerIntact && JSON.stringify(written) === JSON.stringify(edit.replacement)) {
+          return [
+            {
+              type: 'context_edit',
+              targetId: edit.targetId,
+              replacement: dep.restoreReplacement
+            }
+          ];
+        }
+        return [];
+      }
       if (!latestRaw.has(edit.targetId)) return [edit];
       const newer = latestRaw.get(edit.targetId);
       if (JSON.stringify(newer) === JSON.stringify(edit.replacement)) return [];
@@ -1301,7 +1364,7 @@ function editSignature(targetId: string, replacement: unknown): string {
   return `${targetId}\0${JSON.stringify(replacement)}`;
 }
 
-function attributeEpisodesEdits(
+export function attributeEpisodesEdits(
   branch: readonly SessionEntry[]
 ): Map<string, { kind: 'fold' | 'unfold'; handle: string }> {
   const owners = new Map<string, { kind: 'fold' | 'unfold'; handle: string }>();
@@ -1309,7 +1372,7 @@ function attributeEpisodesEdits(
   for (let i = 0; i < branch.length; i++) {
     const entry = branch[i]!;
     if (entry.type !== 'custom') continue;
-    const data = (entry.data ?? {}) as { handle?: unknown; edits?: unknown };
+    const data = (entry.data ?? {}) as { handle?: unknown; edits?: unknown; readDeps?: unknown };
     if (typeof data.handle !== 'string') continue;
     if (
       (entry.customType === FOLD_STARTED_TYPE || entry.customType === FOLD_UNFOLD_STARTED_TYPE) &&
@@ -1321,6 +1384,11 @@ function attributeEpisodesEdits(
           editSignature(edit.targetId, edit.replacement)
         )
       );
+      if (kind === 'fold' && Array.isArray(data.readDeps)) {
+        for (const dep of data.readDeps as ReadPruneDependency[]) {
+          sigs.add(editSignature(dep.targetId, dep.restoreReplacement));
+        }
+      }
       latestStartedSigs.set(`${kind}:${data.handle}`, sigs);
       for (let j = i + 1; j < branch.length; j++) {
         const step = branch[j]!;
@@ -1459,24 +1527,42 @@ export function planUnfold(
         if (remaining.has(owner.handle)) state = entry.replacement;
         continue;
       }
-      // Unfold batch: keep its `[unfolded ...]` stub on its own note (while still unfolded) and
-      // permanent assistant signature retirements; skip span restorations so active folds/externals win.
+      // Unfold batch: keep its `[unfolded ...]` stub on its own note (while still unfolded);
+      // skip span/tail restorations so active folds and external edits win, while assistant
+      // signature retirement is enforced on `finalDesired` below.
       const isUnfoldedStub =
         !remaining.has(owner.handle) && target.id === noteEntryIdByHandle.get(owner.handle);
-      const isAssistantRetire = target.type === 'message' && target.message.role === 'assistant';
-      if (isUnfoldedStub || isAssistantRetire) {
+      if (isUnfoldedStub) {
         state = entry.replacement;
       }
     }
     return state;
   };
 
+  const ownEditedTargetIds = new Set<string>();
+  for (const entry of branch) {
+    if (entry.type !== 'context_edit') continue;
+    const owner = editOwners.get(entry.id);
+    if (owner?.kind === 'fold' && owner.handle === trimmed) {
+      ownEditedTargetIds.add(entry.targetId);
+    }
+  }
   const spanSlice = branch.slice(firstBranchIndex, lastBranchIndex + 1);
+  const spanIds = new Set(spanSlice.map((entry) => entry.id));
+  const postSpanOwned = branch
+    .slice(lastBranchIndex + 1)
+    .filter((entry) => ownEditedTargetIds.has(entry.id) && entry.id !== noteEntry.id);
   const byId = new Map(projection.map((entry) => [entry.sourceEntry.id, entry]));
   const restoreEdits: ContextEditEntryDraft[] = [];
+  const tailRestoreEdits: ContextEditEntryDraft[] = [];
+  const postSpanAssistantRestores = new Map<
+    string,
+    NonNullable<ContextEditEntryDraft['replacement']>
+  >();
 
-  // Restore span entries in forward order so each assistant turn returns before its toolResults.
-  for (const entry of spanSlice) {
+  // Restore span entries in forward order so each assistant turn returns before its toolResults,
+  // plus any post-span entries that this fold pruned.
+  for (const entry of [...spanSlice, ...postSpanOwned]) {
     const editable =
       entry.type === 'custom_message' ||
       (entry.type === 'message' &&
@@ -1505,7 +1591,21 @@ export function planUnfold(
             ? { content: firstMsg.content }
             : undefined;
     if (JSON.stringify(current) !== JSON.stringify(finalDesired)) {
-      restoreEdits.push({ type: 'context_edit', targetId: entry.id, replacement: finalDesired });
+      if (spanIds.has(entry.id)) {
+        restoreEdits.push({ type: 'context_edit', targetId: entry.id, replacement: finalDesired });
+      } else if (
+        finalDesired !== null &&
+        entry.type === 'message' &&
+        entry.message.role === 'assistant'
+      ) {
+        postSpanAssistantRestores.set(entry.id, finalDesired);
+      } else {
+        tailRestoreEdits.push({
+          type: 'context_edit',
+          targetId: entry.id,
+          replacement: finalDesired
+        });
+      }
     }
   }
 
@@ -1530,14 +1630,24 @@ export function planUnfold(
         ]
       : [];
 
-  // Retire stale thinking/replay signatures on every surviving assistant entry from the span start
-  // onward FIRST, so an interrupted batch never leaves restored messages before signed turns.
+  // Retire stale thinking/replay signatures (and apply any post-span assistant argument
+  // restorations with signatures kept retired) from newest to oldest FIRST, so an interrupted
+  // batch never leaves restored messages before signed turns.
   const retireEdits: ContextEditEntryDraft[] = [];
-  const spanIds = new Set(spanSlice.map((entry) => entry.id));
-  for (const entry of projection) {
+  for (let i = projection.length - 1; i >= 0; i--) {
+    const entry = projection[i]!;
     if (entry.messages.length === 0 || spanIds.has(entry.sourceEntry.id)) continue;
     const idx = branchIndexById.get(entry.sourceEntry.id) ?? -1;
     if (idx < firstBranchIndex) continue;
+    const restoredAssistant = postSpanAssistantRestores.get(entry.sourceEntry.id);
+    if (restoredAssistant) {
+      retireEdits.push({
+        type: 'context_edit',
+        targetId: entry.sourceEntry.id,
+        replacement: restoredAssistant
+      });
+      continue;
+    }
     const shown = entry.messages[0];
     if (shown?.role !== 'assistant') continue;
     const retired = retireAssistantContent(shown.content);
@@ -1554,7 +1664,7 @@ export function planUnfold(
     handle: trimmed,
     record,
     noteEntryId: noteEntry.id,
-    edits: [...retireEdits, ...restoreEdits, ...noteEdits]
+    edits: [...retireEdits, ...restoreEdits, ...tailRestoreEdits, ...noteEdits]
   };
 }
 
@@ -1573,7 +1683,7 @@ const FoldParams = Type.Object({
   until: Type.Optional(
     Type.String({
       description:
-        'Stamp of the last turn inside the span, such as "t20", when the turns after it must stay verbatim. Leave it out to fold up to this call. What stays after the span is sent uncached once.'
+        'Stamp of the last turn inside the span, such as "t20", when the turns after it must stay in context. Leave it out to fold up to this call. What stays after the span is sent uncached once (with older identical reads and aged failed inputs trimmed).'
     })
   ),
   note: Type.String({
@@ -1628,11 +1738,11 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       const scriptCall = root === toolCallId ? undefined : root;
       const run = state.run;
       const entries = ctx.sessionManager.buildSessionProjection().entries;
+      const caller = entries.find((entry) => callsTool(entry, scriptCall ?? toolCallId));
       try {
         // The first fold of a response holds it, whether or not it succeeds, as for folds the
         // response calls itself. Reserved before anything is awaited, so a second fold from the
         // same response, in the same script or another one, sees it.
-        const caller = entries.find((entry) => callsTool(entry, scriptCall ?? toolCallId));
         if (caller) {
           const reserved = state.foldResponses.get(caller.sourceEntry.id);
           if (reserved !== undefined && reserved !== toolCallId) {
@@ -1783,6 +1893,8 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         messages: plan.omitted.length,
         tokens,
         edits: plan.edits,
+        lastEntryId: plan.lastEntryId,
+        ...(caller ? { callerEntryId: caller.sourceEntry.id } : {}),
         ...(carried ? { carried } : {}),
         ...(plan.images.length > 0 ? { images: plan.images } : {}),
         ...(scriptCall ? { script: { foldCallId: toolCallId, note: text, details } } : {})
@@ -2003,6 +2115,11 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     if (applied.length === 0 && unfolded.length === 0 && repairs.length === 0) return undefined;
 
     const branchById = new Map(branch.map((entry) => [entry.id, entry]));
+    const branchIndexById = new Map(branch.map((entry, index) => [entry.id, index]));
+    const editOwners =
+      applied.length > 0
+        ? attributeEpisodesEdits(branch)
+        : new Map<string, { kind: 'fold' | 'unfold'; handle: string }>();
     const latestPendingEdit = (targetId: string): PendingDraft | undefined =>
       (event.entries as readonly PendingDraft[]).findLast(
         (draft) => draft.type === 'context_edit' && draft.targetId === targetId
@@ -2048,29 +2165,81 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         draft.type === 'context_edit' && draft.targetId !== undefined ? [draft.targetId] : []
       )
     );
-    const editsOf = (fold: { edits: readonly ContextEditEntryDraft[] }) => {
+    const editsOf = (fold: {
+      edits: readonly ContextEditEntryDraft[];
+      lastEntryId?: string;
+      callerEntryId?: string;
+    }) => {
       const current = retireCurrent();
       const currentIds = new Set(current.map((edit) => edit.targetId));
-      const base: ContextEditEntryDraft[] = [];
+      const beforeEntryId = fold.callerEntryId ?? event.messageEntryId;
+      const tailPrune =
+        fold.lastEntryId !== undefined && beforeEntryId !== undefined
+          ? planFoldTailPruning({
+              branch,
+              pending: event.entries as readonly PendingDraft[],
+              editOwners,
+              afterEntryId: fold.lastEntryId,
+              beforeEntryId,
+              cwd: state.cwd
+            })
+          : {
+              assistantReplacements: new Map<string, AssistantMessage['content']>(),
+              readEdits: [] as ContextEditEntryDraft[],
+              readDeps: [] as ReadPruneDependency[]
+            };
+
+      const foldAssistantMap = new Map<string, ContextEditEntryDraft>();
+      const spanEdits: ContextEditEntryDraft[] = [];
       for (const edit of fold.edits) {
         if (currentIds.has(edit.targetId)) continue;
         if (edit.replacement === null) {
-          base.push(edit);
+          spanEdits.push(edit);
           continue;
         }
         const source = branchById.get(edit.targetId);
         if (source?.type === 'message' && source.message.role === 'assistant') {
-          const reconciled = reconcileAssistantPending(edit.targetId);
-          if (reconciled !== undefined) {
-            if (reconciled) base.push(reconciled);
-            continue;
-          }
-          base.push(edit);
+          foldAssistantMap.set(edit.targetId, edit);
           continue;
         }
-        if (!edited.has(edit.targetId)) base.push(edit);
+        if (!edited.has(edit.targetId)) spanEdits.push(edit);
       }
-      return [...current, ...base];
+
+      const sortedAssistantIds = [
+        ...new Set([...foldAssistantMap.keys(), ...tailPrune.assistantReplacements.keys()])
+      ]
+        .filter((id) => !currentIds.has(id))
+        .sort((a, b) => (branchIndexById.get(b) ?? -1) - (branchIndexById.get(a) ?? -1));
+
+      const assistantEdits: ContextEditEntryDraft[] = [];
+      for (const targetId of sortedAssistantIds) {
+        const reconciled = reconcileAssistantPending(targetId);
+        if (reconciled !== undefined) {
+          if (reconciled) assistantEdits.push(reconciled);
+          continue;
+        }
+        const composed = tailPrune.assistantReplacements.get(targetId);
+        if (composed) {
+          assistantEdits.push({
+            type: 'context_edit',
+            targetId,
+            replacement: { content: composed }
+          });
+          continue;
+        }
+        const existing = foldAssistantMap.get(targetId);
+        if (existing) assistantEdits.push(existing);
+      }
+
+      const readEdits = tailPrune.readEdits.filter(
+        (edit) => !currentIds.has(edit.targetId) && !edited.has(edit.targetId)
+      );
+      const keptReadIds = new Set(readEdits.map((edit) => edit.targetId));
+      const readDeps = tailPrune.readDeps.filter((dep) => keptReadIds.has(dep.targetId));
+      return {
+        edits: [...current, ...assistantEdits, ...spanEdits, ...readEdits],
+        readDeps
+      };
     };
     const unfoldEditsOf = (unfold: {
       handle: string;
@@ -2144,12 +2313,16 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         // context, and no applied note; a marker written first would leave the rest of the span
         // stuck behind a note no fold can reach past.
         ...applied.flatMap((fold) => {
-          const edits = editsOf(fold);
+          const { edits, readDeps } = editsOf(fold);
           return [
             {
               type: 'custom' as const,
               customType: FOLD_STARTED_TYPE,
-              data: { handle: fold.handle, edits }
+              data: {
+                handle: fold.handle,
+                edits,
+                ...(readDeps.length > 0 ? { readDeps } : {})
+              }
             },
             ...edits,
             {

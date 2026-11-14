@@ -35,10 +35,11 @@ the episode is still open or the note is missing something. When the question dr
 instead of ending, as in open-ended exploration, nothing marks a boundary; do not fold
 yet.
 
-When a finished episode lies behind work you still need verbatim, add until: fold with
+When a finished episode lies behind work you still need in context, add until: fold with
 since "t13" and until "t20" removes those turns only, with the other results of the
-response that [t20] answers, and the turns after them stay: the next step then has the
-note and those turns to go on. What stays after the span is sent uncached once, so do this
+response that [t20] answers, and the turns after them stay (older identical reads and
+aged failed tool inputs inside them are trimmed): the next step then has the note and
+those turns to go on. What stays after the span is sent uncached once, so do this
 when the span is larger than what stays after it; otherwise wait and fold the whole tail
 when that work is done too.
 

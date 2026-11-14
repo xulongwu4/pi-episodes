@@ -41,11 +41,8 @@ import { refreshStatus } from './ui.js';
 
 const STALE_STAMP = /\s*\[t\d+\]\s*$/;
 const MAX_SURFACED_THREADS = 2;
-/**
- * Results the output cap leaves whole: the extension's own, which are bounded or are the note,
- * and reads, whose text is already in a file the model can read a slice of.
- */
-const UNCAPPED_TOOLS = new Set([FOLD_TOOL, UNFOLD_TOOL, FORK_TOOL, 'recall', 'ask', 'read']);
+/** Results the output cap leaves whole: the extension's own, which are bounded or are the note. */
+const UNCAPPED_TOOLS = new Set([FOLD_TOOL, UNFOLD_TOOL, FORK_TOOL, 'recall', 'ask']);
 
 /** Threads to point at from a tool result that touched one of their files. */
 interface Cue {
