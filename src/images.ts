@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { lstat, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
 import type { ImageContent, TextContent } from '@earendil-works/pi-ai';
 import { isStampBlock } from './stamps.js';
 
@@ -399,10 +399,25 @@ export async function archiveImage(
   };
 }
 
-/** Synchronous integrity check used at `turn_end` before committing fold edits. */
-export function verifyArchivedImageSync(ref: ArchivedImage): boolean {
+const ARCHIVED_IMAGE_BASENAME = /^image-[0-9a-f]{16}\.(png|jpg|gif|webp)$/;
+
+function isConfinedPathStructure(filePath: string, allowedDir: string | undefined): boolean {
+  if (!ARCHIVED_IMAGE_BASENAME.test(basename(filePath))) return false;
+  if (allowedDir === undefined) return true;
+  return dirname(resolve(filePath)) === resolve(allowedDir);
+}
+
+/** Synchronous integrity and path-confinement check used at `turn_end` before committing fold edits. */
+export function verifyArchivedImageSync(ref: ArchivedImage, allowedDir?: string): boolean {
   try {
-    const bytes = readFileSync(ref.path);
+    if (!isConfinedPathStructure(ref.path, allowedDir)) return false;
+    const resolvedPath = resolve(ref.path);
+    const st = lstatSync(resolvedPath);
+    if (!st.isFile() || st.size !== ref.bytes) return false;
+    if (allowedDir !== undefined) {
+      if (realpathSync(dirname(resolvedPath)) !== realpathSync(resolve(allowedDir))) return false;
+    }
+    const bytes = readFileSync(resolvedPath);
     if (bytes.length !== ref.bytes) return false;
     if (sniffImageMimeType(bytes) !== ref.mimeType) return false;
     return createHash('sha256').update(bytes).digest('hex') === ref.sha256;
@@ -411,11 +426,20 @@ export function verifyArchivedImageSync(ref: ArchivedImage): boolean {
   }
 }
 
-/** Reads and verifies an archived image from disk, throwing an explicit error if missing or corrupt. */
-export async function readArchivedImage(ref: ArchivedImage): Promise<ImageContent> {
-  let bytes: Buffer;
+/** Reads and verifies a confined archived image from disk, rejecting symlinks and outside paths. */
+export async function readArchivedImage(
+  ref: ArchivedImage,
+  allowedDir?: string
+): Promise<ImageContent> {
+  if (!isConfinedPathStructure(ref.path, allowedDir)) {
+    throw new Error(
+      `Archived image #${ref.index} of ${ref.handle} has a path outside the session archive directory.`
+    );
+  }
+  const resolvedPath = resolve(ref.path);
+  let st: Awaited<ReturnType<typeof lstat>>;
   try {
-    bytes = await readFile(ref.path);
+    st = await lstat(resolvedPath);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | undefined)?.code;
     if (code === 'ENOENT') {
@@ -425,6 +449,23 @@ export async function readArchivedImage(ref: ArchivedImage): Promise<ImageConten
       `Archived image #${ref.index} of ${ref.handle} could not be read at ${ref.path}: ${error instanceof Error ? error.message : String(error)}`
     );
   }
+  if (!st.isFile()) {
+    throw new Error(
+      `Archived image #${ref.index} of ${ref.handle} at ${ref.path} is not a regular file.`
+    );
+  }
+  if (allowedDir !== undefined) {
+    const [actualParent, expectedDir] = await Promise.all([
+      realpath(dirname(resolvedPath)),
+      realpath(resolve(allowedDir))
+    ]);
+    if (actualParent !== expectedDir) {
+      throw new Error(
+        `Archived image #${ref.index} of ${ref.handle} has a path outside the session archive directory.`
+      );
+    }
+  }
+  const bytes = await readFile(resolvedPath);
   const actualSha = createHash('sha256').update(bytes).digest('hex');
   if (
     bytes.length !== ref.bytes ||
@@ -441,56 +482,81 @@ export async function readArchivedImage(ref: ArchivedImage): Promise<ImageConten
     mimeType: ref.mimeType
   };
 }
-
-function withoutTrailingStamp(
+export function withoutTrailingStamp(
   content: readonly (TextContent | ImageContent)[]
 ): readonly (TextContent | ImageContent)[] {
   const last = content.at(-1);
   return last && isStampBlock(last) ? content.slice(0, -1) : content;
 }
 
+export function sameArchivedImage(a: ArchivedImage, b: ArchivedImage): boolean {
+  return (
+    a.handle === b.handle &&
+    a.index === b.index &&
+    a.path === b.path &&
+    a.mimeType === b.mimeType &&
+    a.bytes === b.bytes &&
+    a.sha256 === b.sha256 &&
+    a.width === b.width &&
+    a.height === b.height
+  );
+}
+
 /**
  * Matches standalone text blocks in `blocks` (1-to-1, in block order) whose `text` equals
- * `formatImageRef(ref)` for an entry in `archived`. Modified blocks, substring embeds, and blocks
- * without a manifest entry are left unmatched so callers preserve them as ordinary text.
+ * `formatImageRef(ref)` for an entry in `archived`.
+ *
+ * When `protectedPrefixLen` is defined (the recorded `written` prefix is byte-for-byte intact),
+ * blocks inside `0 .. protectedPrefixLen - 1` belong to the note/script and are never matched.
+ * When `protectedPrefixLen` is undefined (prefix absent or altered), a reference string needed `K`
+ * times is matched only when `blocks` holds `C === K` standalone copies; when `C !== K`, ownership
+ * is ambiguous and none of those copies are matched so callers preserve text conservatively.
  */
 export function matchArchivedRefBlocks(
   blocks: readonly (TextContent | ImageContent)[],
-  archived: readonly ArchivedImage[]
+  archived: readonly ArchivedImage[],
+  protectedPrefixLen?: number
 ): Map<number, ArchivedImage> {
   const matched = new Map<number, ArchivedImage>();
   if (archived.length === 0) return matched;
-  const remaining = [...archived];
-  for (let i = 0; i < blocks.length && remaining.length > 0; i++) {
-    const block = blocks[i];
-    if (block?.type !== 'text') continue;
-    const hit = remaining.findIndex((ref) => block.text === formatImageRef(ref));
-    if (hit >= 0) {
-      matched.set(i, remaining[hit]!);
-      remaining.splice(hit, 1);
+  if (protectedPrefixLen !== undefined) {
+    const remaining = [...archived];
+    for (let i = Math.max(0, protectedPrefixLen); i < blocks.length && remaining.length > 0; i++) {
+      const block = blocks[i];
+      if (block?.type !== 'text') continue;
+      const hit = remaining.findIndex((ref) => block.text === formatImageRef(ref));
+      if (hit >= 0) {
+        matched.set(i, remaining[hit]!);
+        remaining.splice(hit, 1);
+      }
+    }
+    return matched;
+  }
+  const neededByText = new Map<string, ArchivedImage[]>();
+  for (const ref of archived) {
+    const key = formatImageRef(ref);
+    const list = neededByText.get(key);
+    if (list) list.push(ref);
+    else neededByText.set(key, [ref]);
+  }
+  for (const [expected, needed] of neededByText) {
+    const candidates: number[] = [];
+    for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i];
+      if (block?.type === 'text' && block.text === expected) candidates.push(i);
+    }
+    if (candidates.length === needed.length) {
+      for (let j = 0; j < candidates.length; j++) {
+        matched.set(candidates[j]!, needed[j]!);
+      }
     }
   }
   return matched;
 }
 
-/** Whether `content` holds `ref` as an exact standalone text block. */
-export function holdsImageReference(
-  content: readonly (TextContent | ImageContent)[],
-  ref: ArchivedImage
-): boolean {
-  const expected = formatImageRef(ref);
-  return withoutTrailingStamp(content).some(
-    (block) => block.type === 'text' && block.text === expected
-  );
-}
-
-export type CarriedMediaInput =
+export type CarriedMediaItem =
   | { kind: 'image'; image: ImageContent }
   | { kind: 'ref'; ref: ArchivedImage };
-
-export type PreparedMediaItem =
-  | { kind: 'image'; image: ImageContent }
-  | { kind: 'ref'; ref: ArchivedImage; original?: ImageContent };
 
 /**
  * Prepares covered-note media items for `archivingHandle`: existing archive references retain
@@ -499,10 +565,10 @@ export type PreparedMediaItem =
  */
 export async function prepareCarriedMedia(
   archivingHandle: string,
-  items: readonly CarriedMediaInput[],
+  items: readonly CarriedMediaItem[],
   dir: string | undefined
-): Promise<PreparedMediaItem[]> {
-  const prepared: PreparedMediaItem[] = [];
+): Promise<CarriedMediaItem[]> {
+  const prepared: CarriedMediaItem[] = [];
   let nextIndex = 1;
   for (const item of items) {
     if (item.kind === 'ref' && item.ref.handle === archivingHandle && item.ref.index >= nextIndex) {
@@ -517,7 +583,7 @@ export async function prepareCarriedMedia(
     const archived = await archiveImage(dir, archivingHandle, nextIndex, item.image);
     if (archived) {
       nextIndex++;
-      prepared.push({ kind: 'ref', ref: archived, original: item.image });
+      prepared.push({ kind: 'ref', ref: archived });
     } else {
       prepared.push({ kind: 'image', image: item.image });
     }
@@ -526,26 +592,54 @@ export async function prepareCarriedMedia(
 }
 
 export function carriedMediaBlocks(
-  items: readonly PreparedMediaItem[]
+  items: readonly CarriedMediaItem[]
 ): (TextContent | ImageContent)[] {
   return items.map((item) =>
     item.kind === 'image' ? item.image : { type: 'text', text: formatImageRef(item.ref) }
   );
 }
 
+/** Verifies that persisted `FoldDetails.archivedImages` matches every expected `ref` item 1-to-1. */
+export function holdsArchivedManifest(
+  rawManifest: unknown,
+  items: readonly CarriedMediaItem[]
+): boolean {
+  const expected = items.flatMap((item) => (item.kind === 'ref' ? [item.ref] : []));
+  if (expected.length === 0) return true;
+  const actual = archivedImagesOf(rawManifest);
+  if (actual.length !== expected.length) return false;
+  return expected.every((ref, idx) => sameArchivedImage(actual[idx]!, ref));
+}
+
 /**
  * Verifies at `turn_end` (1-to-1 across standalone blocks) that every carried media item survived
- * on the fold result either as its verified standalone archive reference block or as its original
- * inline image block.
+ * on the fold result in its exact prepared representation (standalone verified reference block for
+ * `ref`, inline image block for `image`), outside any intact `protectedPrefixLen`.
  */
 export function holdsCarriedMedia(
   content: readonly (TextContent | ImageContent)[],
-  items: readonly PreparedMediaItem[]
+  items: readonly CarriedMediaItem[],
+  protectedPrefixLen?: number,
+  allowedDir?: string
 ): boolean {
   const blocks = withoutTrailingStamp(content);
+  const fromIndex = protectedPrefixLen === undefined ? 0 : Math.max(0, protectedPrefixLen);
+  if (protectedPrefixLen === undefined) {
+    const neededByText = new Map<string, number>();
+    for (const item of items) {
+      if (item.kind === 'ref') {
+        const key = formatImageRef(item.ref);
+        neededByText.set(key, (neededByText.get(key) ?? 0) + 1);
+      }
+    }
+    for (const [expected, count] of neededByText) {
+      const found = blocks.filter((b) => b.type === 'text' && b.text === expected).length;
+      if (found !== count) return false;
+    }
+  }
   const used = new Set<number>();
   const takeImage = (target: ImageContent): boolean => {
-    for (let i = 0; i < blocks.length; i++) {
+    for (let i = fromIndex; i < blocks.length; i++) {
       if (used.has(i)) continue;
       const block = blocks[i];
       if (
@@ -560,8 +654,9 @@ export function holdsCarriedMedia(
     return false;
   };
   const takeRef = (ref: ArchivedImage): boolean => {
+    if (!verifyArchivedImageSync(ref, allowedDir)) return false;
     const expected = formatImageRef(ref);
-    for (let i = 0; i < blocks.length; i++) {
+    for (let i = fromIndex; i < blocks.length; i++) {
       if (used.has(i)) continue;
       const block = blocks[i];
       if (block?.type === 'text' && block.text === expected) {
@@ -571,12 +666,5 @@ export function holdsCarriedMedia(
     }
     return false;
   };
-  return items.every((item) => {
-    if (item.kind === 'image') return takeImage(item.image);
-    if (item.original !== undefined) {
-      if (verifyArchivedImageSync(item.ref) && takeRef(item.ref)) return true;
-      return takeImage(item.original);
-    }
-    return takeRef(item.ref);
-  });
+  return items.every((item) => (item.kind === 'image' ? takeImage(item.image) : takeRef(item.ref)));
 }

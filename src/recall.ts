@@ -244,7 +244,13 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
             `No archived image #${askedImage} in ${thread.handle} (${thread.label}).`
           );
         }
-        const loaded = await readArchivedImage(archived);
+        const dir = archiveDir(ctx.sessionManager);
+        if (!dir) {
+          throw new Error(
+            `No session archive directory available for ${thread.handle} image #${askedImage}.`
+          );
+        }
+        const loaded = await readArchivedImage(archived, dir);
         const stale = await staleness(state, [thread]);
         const details: RecallDetails = {
           query,
@@ -268,7 +274,7 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
           archived.width !== undefined && archived.height !== undefined
             ? `, ${archived.width}x${archived.height}`
             : '';
-        const header = `[${archived.handle} image #${archived.index}: ${archived.mimeType}${dims}, ${archived.bytes} bytes, sha256 ${archived.sha256}]`;
+        const header = `[${archived.handle} image #${archived.index}: ${archived.mimeType}${dims}, ${archived.bytes} bytes, sha256 ${archived.sha256} — ${archived.path}]`;
         const note = [...stale.map((item) => item.line), header].join('\n');
         return {
           content: [{ type: 'text', text: note }, loaded],
