@@ -1,7 +1,7 @@
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { convertToLlm, type ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
-import { ThreadIndex } from './archive.js';
+import { callingFork, ThreadIndex } from './archive.js';
 import { textOf } from './messages.js';
 import { staleness } from './recall.js';
 import { requestOptions } from './requests.js';
@@ -45,9 +45,11 @@ export function registerAsk(pi: ExtensionAPI, state: EpisodeState): void {
       const model = ctx.model;
       if (!model) throw new Error('No model selected.');
 
-      const thread = await new ThreadIndex(ctx.sessionManager, state.forkArchives).find(
-        params.handle
-      );
+      const thread = await new ThreadIndex(
+        ctx.sessionManager,
+        state.forkArchives,
+        callingFork(ctx.sessionManager)
+      ).find(params.handle);
       if (!thread) throw new Error(`No archived thread ${params.handle}.`);
       if (!thread.context) {
         throw new Error(

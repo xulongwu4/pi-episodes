@@ -58,10 +58,10 @@ async function createSession(
   // Assertions inside a step surface as provider errors; keep them to rethrow.
   const failures: unknown[] = [];
   faux.setResponses(
-    steps.map((step) => (context) => {
+    steps.map((step) => async (context) => {
       requests.push(context);
       try {
-        return step(context);
+        return await step(context);
       } catch (error) {
         failures.push(error);
         throw error;
@@ -686,6 +686,150 @@ test('a fork folds its own work, and recall and ask reach the fold inside it', a
     await harness.session.prompt('make it build in a fork');
     if (harness.failures[0]) throw harness.failures[0];
     assert.equal(harness.pending(), 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a running fork reaches the folds it made with recall and ask', async () => {
+  let stamp = '';
+  let nested = '';
+  const harness = await createSession([
+    () => fauxAssistantMessage(fauxToolCall('fork', { task: 'Make the build pass.' })),
+    () =>
+      fauxAssistantMessage(
+        fauxToolCall('bash', { command: 'echo "error TS9999 deep in the loop"' })
+      ),
+    (context) => {
+      stamp = /\[(t\d+)\]$/.exec(text(conversation(context).at(-1)!))![1]!;
+      return fauxAssistantMessage(
+        fauxToolCall('fold', { since: stamp, note: 'Build loop: fixed the type error.' })
+      );
+    },
+    (context) => {
+      const messages = conversation(context);
+      assert.ok(!messages.some((message) => /TS9999/.test(text(message))));
+      nested = /ep-[0-9a-f]{8}/.exec(text(messages.at(-1)!))![0];
+      return fauxAssistantMessage(fauxToolCall('recall', { query: 'TS9999' }));
+    },
+    (context) => {
+      const found = text(conversation(context).at(-1)!);
+      assert.match(found, new RegExp(`${nested} ${stamp} toolResult: error TS9999`));
+      // The fork's own thread is what the child still sees; it is not searched.
+      assert.doesNotMatch(found, /fk-[0-9a-f]{8} t\d+/);
+      return fauxAssistantMessage(fauxToolCall('recall', { handle: nested, turn: stamp }));
+    },
+    (context) => {
+      assert.match(
+        text(conversation(context).at(-1)!),
+        new RegExp(`^${nested} ${stamp} toolResult \\(bash\\), \\d+ chars\\nerror TS9999`)
+      );
+      return fauxAssistantMessage(
+        fauxToolCall('ask', { handle: nested, question: 'What failed?' })
+      );
+    },
+    // The folded thread answers from what the child saw when it folded.
+    (context) => {
+      const messages = conversation(context);
+      assert.match(text(messages.at(-1)!), /What failed\?/);
+      assert.ok(messages.some((message) => /error TS9999/.test(text(message))));
+      assert.ok(messages.some((message) => /Task: Make the build pass\./.test(text(message))));
+      return fauxAssistantMessage('A type error, TS9999.');
+    },
+    (context) => {
+      assert.match(
+        text(conversation(context).at(-1)!),
+        new RegExp(`^\\[${nested} answers\\]\\nA type error, TS9999\\.`)
+      );
+      return fauxAssistantMessage('Build passes.\n- Open: none.');
+    },
+    () => fauxAssistantMessage('done')
+  ]);
+
+  try {
+    await harness.session.prompt('make it build in a fork');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a fork running next to another does not reach the folds the other made', async () => {
+  let folded = () => {};
+  const alphaFolded = new Promise<void>((resolve) => {
+    folded = resolve;
+  });
+  let searched = () => {};
+  const betaSearched = new Promise<void>((resolve) => {
+    searched = resolve;
+  });
+  const done = { alpha: 0, beta: 0 };
+  // The children take their replies in whatever order they ask; each reply is picked by the
+  // task of the child that asks and by how far that child is.
+  const child = async (context: TranscriptContext) => {
+    const messages = conversation(context);
+    const last = text(messages.at(-1)!);
+    if (messages.some((message) => /Task: alpha\./.test(text(message)))) {
+      switch (done.alpha++) {
+        case 0:
+          return fauxAssistantMessage(
+            fauxToolCall('bash', { command: 'echo "error TS9999 deep in the loop"' })
+          );
+        case 1:
+          return fauxAssistantMessage(
+            fauxToolCall('fold', {
+              since: /\[(t\d+)\]$/.exec(last)![1]!,
+              note: 'Build loop: fixed the type error.'
+            })
+          );
+        case 2:
+          // Stays running until beta has searched.
+          folded();
+          await betaSearched;
+          return fauxAssistantMessage(fauxToolCall('recall', { query: 'TS9999' }));
+        default:
+          assert.match(last, /^ep-[0-9a-f]{8} t\d+ toolResult: error TS9999/);
+          return fauxAssistantMessage('Alpha done.');
+      }
+    }
+    switch (done.beta++) {
+      case 0:
+        await alphaFolded;
+        return fauxAssistantMessage(fauxToolCall('recall', { query: 'TS9999' }));
+      default:
+        // Alpha goes on whatever beta found, so that a failure here ends the test.
+        searched();
+        assert.match(last, /^No archived thread is on this branch/);
+        return fauxAssistantMessage('Beta done.');
+    }
+  };
+  const harness = await createSession([
+    () =>
+      fauxAssistantMessage([
+        fauxToolCall('fork', { task: 'alpha.' }, { id: 'fork-a' }),
+        fauxToolCall('fork', { task: 'beta.' }, { id: 'fork-b' })
+      ]),
+    child,
+    child,
+    child,
+    child,
+    child,
+    child,
+    () => fauxAssistantMessage(fauxToolCall('recall', { query: 'TS9999' })),
+    (context) => {
+      // Once both have ended, the main agent finds the span, once.
+      const found = text(conversation(context).at(-1)!);
+      assert.equal(found.match(/^ep-[0-9a-f]{8} t\d+ toolResult: error TS9999/gm)?.length, 1);
+      return fauxAssistantMessage('done');
+    }
+  ]);
+
+  try {
+    await harness.session.prompt('two forks');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+    assert.deepEqual(done, { alpha: 4, beta: 2 });
   } finally {
     await harness.cleanup();
   }

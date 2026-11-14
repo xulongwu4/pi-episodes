@@ -15,6 +15,7 @@ import {
   type ForkArchive,
   type ForkDetails,
   type ForkStatus,
+  runningFork,
   writeForkArchive
 } from './archive.js';
 import { changeLines, headline, openItems } from './fold.js';
@@ -89,12 +90,14 @@ function brief(handle: string, task: string, unavailable: readonly string[]): st
 /**
  * Declares exactly what the parent's transcript declares, so the child's requests carry the
  * same tools block, and runs every call through the parent's tools with their validation,
- * hooks and permission checks.
+ * hooks and permission checks. The call is made as this fork, so that `recall` and `ask` reach
+ * the folds the child made so far.
  */
 function childTool(
   declaration: Tool,
   ctx: ExtensionToolContext,
-  unavailable: readonly string[]
+  unavailable: readonly string[],
+  running: () => ForkArchive
 ): AgentTool {
   const tool: AgentTool = {
     ...declaration,
@@ -112,8 +115,19 @@ function childTool(
           isError: true
         };
       }
-      const outcome = await ctx.executeTool(declaration.name, args, signal ? { signal } : {});
-      return outcome.isError ? { ...outcome.result, isError: true } : outcome.result;
+      const call = {
+        sessionId: ctx.sessionManager.getSessionId(),
+        transcript: running as (() => ForkArchive) | undefined
+      };
+      try {
+        const outcome = await runningFork.run(call, () =>
+          ctx.executeTool(declaration.name, args, signal ? { signal } : {})
+        );
+        return outcome.isError ? { ...outcome.result, isError: true } : outcome.result;
+      } finally {
+        // Work that the call left running must not keep the transcript.
+        call.transcript = undefined;
+      }
     }
   };
   const mode = ctx.tools.find((callable) => callable.name === declaration.name)?.executionMode;
@@ -196,6 +210,16 @@ export function registerFork(pi: ExtensionAPI, state: EpisodeState, registry: Fo
         prefixLength: prefix.length,
         siblings: siblings.length
       });
+      // The transcript as it stands: what is written after every turn, and what a call of the
+      // child is made with, since no session entry or file holds it mid-turn.
+      const transcript = (): ForkArchive => ({
+        handle,
+        task: params.task,
+        parentEntryId: parent.sourceEntry.id,
+        siblings,
+        messages: agent.state.messages.slice(prefix.length),
+        folds: [...folds.folds]
+      });
       // The child's view changes as it folds; the cache anchor follows its latest note.
       const options = requestOptions(pi, ctx, () => folds.view(agent.state.messages), undefined);
       // The agent loop passes its own settings, but not these.
@@ -209,7 +233,7 @@ export function registerFork(pi: ExtensionAPI, state: EpisodeState, registry: Fo
           tools: declared.map((declaration) =>
             declaration.name === FOLD_TOOL
               ? folds.tool(declaration, () => agent.state.messages)
-              : childTool(declaration, ctx, unavailable)
+              : childTool(declaration, ctx, unavailable, transcript)
           ),
           messages: [...prefix, task]
         },
@@ -275,18 +299,10 @@ export function registerFork(pi: ExtensionAPI, state: EpisodeState, registry: Fo
 
       // The transcript is written after every turn, so a crash mid-fork keeps what the
       // child did so far.
-      const archive: ForkArchive = {
-        handle,
-        task: params.task,
-        parentEntryId: parent.sourceEntry.id,
-        siblings,
-        messages: []
-      };
       const dir = archiveDir(ctx.sessionManager);
       let writing: Promise<unknown> = Promise.resolve();
       const persist = () => {
-        archive.messages = agent.state.messages.slice(prefix.length);
-        archive.folds = [...folds.folds];
+        const archive = transcript();
         if (!dir) {
           state.forkArchives.set(handle, archive);
           return;

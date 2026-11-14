@@ -4,7 +4,7 @@ import { join, relative } from 'node:path';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
-import { archiveDir, type Thread, ThreadIndex } from './archive.js';
+import { archiveDir, callingFork, type Thread, ThreadIndex } from './archive.js';
 import { messageText } from './messages.js';
 import { withFullOutput } from './output.js';
 import { excerpt, RecallIndex, type RecallMatch, type SearchableThread } from './search.js';
@@ -197,7 +197,11 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
       if (asked && !params.handle) {
         throw new Error('turn needs the handle of the thread it is in.');
       }
-      const index = new ThreadIndex(ctx.sessionManager, state.forkArchives);
+      const index = new ThreadIndex(
+        ctx.sessionManager,
+        state.forkArchives,
+        callingFork(ctx.sessionManager)
+      );
       let threads: Thread[];
       if (params.handle) {
         const thread = await index.find(params.handle);
@@ -216,9 +220,8 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
 
       if (threads.length === 0) {
         // Read alone, "nothing is archived" was taken to mean that nothing can be known. It says where to
-        // look, and not why the archive is empty: a fork's own folds, another extension's edits and a lost
-        // archive file all leave it empty too. Nor does it promise a file for a cut result: only some cuts
-        // leave one.
+        // look, and not why the archive is empty: another extension's edits and a lost archive file
+        // leave it empty too. Nor does it promise a file for a cut result: only some cuts leave one.
         return {
           content: [
             {

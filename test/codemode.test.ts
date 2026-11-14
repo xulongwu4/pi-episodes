@@ -26,6 +26,7 @@ import {
 import { Type } from 'typebox';
 import {
   appliedFolds,
+  callingFork,
   FOLD_APPLIED_TYPE,
   FOLD_DETAILS_KEY,
   FOLD_STARTED_TYPE,
@@ -89,10 +90,10 @@ async function createSession(
   const requests: TranscriptContext[] = [];
   const failures: unknown[] = [];
   faux.setResponses(
-    steps.map((step) => (context) => {
+    steps.map((step) => async (context) => {
       requests.push(context);
       try {
-        return step(context);
+        return await step(context);
       } catch (error) {
         failures.push(error);
         throw error;
@@ -1123,6 +1124,59 @@ test('an edit by line anchors in a fork is among the files of the fork', async (
     // The files of the child are its own, not the fork call's.
     const details = toolResults(harness, 'fork')[0]?.details as Record<string, unknown>;
     assert.equal(details[FILES_KEY], undefined);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('what a call from a fork left running finds no running fork once the call has returned', async () => {
+  const seen: { during?: string | undefined; after?: Promise<string | undefined> } = {};
+  const observer: ExtensionFactory = (pi) => {
+    pi.on('tool_call', (event, ctx) => {
+      if (event.toolName !== 'recall') return;
+      seen.during = callingFork(ctx.sessionManager)?.handle;
+      seen.after = new Promise((resolve) => {
+        setTimeout(() => resolve(callingFork(ctx.sessionManager)?.handle), 50);
+      });
+    });
+  };
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('fork', { task: 'Build.' }), { stopReason: 'toolUse' }),
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo TS9999' }), {
+          stopReason: 'toolUse'
+        }),
+      (context) =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', {
+            since: /\[(t\d+)\]$/.exec(text(conversation(context).at(-1)!))![1]!,
+            note: 'Built.'
+          }),
+          { stopReason: 'toolUse' }
+        ),
+      () =>
+        fauxAssistantMessage(fauxToolCall('recall', { query: 'TS9999' }), {
+          stopReason: 'toolUse'
+        }),
+      async (context) => {
+        assert.match(
+          text(conversation(context).at(-1)!),
+          /^ep-[0-9a-f]{8} t\d+ toolResult: TS9999/
+        );
+        // The fork is still running, and the recall call has returned.
+        assert.match(String(seen.during), /^fk-[0-9a-f]{8}$/);
+        assert.equal(await seen.after, undefined);
+        return fauxAssistantMessage('Built.\n- Open: none.');
+      },
+      () => fauxAssistantMessage('ok')
+    ],
+    [observer]
+  );
+  try {
+    await harness.run('go');
   } finally {
     await harness.cleanup();
   }

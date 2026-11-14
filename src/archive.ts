@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, join } from 'node:path';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
@@ -298,13 +299,45 @@ export async function writeForkArchive(
   return file;
 }
 
+/** One tool call that the child of a running fork makes through the parent's tools. */
+export interface ForkCall {
+  sessionId: string;
+  /** The child's transcript as it stands; taken away when the call returns. */
+  transcript: (() => ForkArchive) | undefined;
+}
+
+/**
+ * Set around each such call. A fork's record reaches the session only when the fork ends, so
+ * until then `recall` and `ask` find the folds the child made of its own work through this.
+ */
+export const runningFork = new AsyncLocalStorage<ForkCall>();
+
+/**
+ * The running fork that is making the current call in this session, if one is. Work that the
+ * call left running gets nothing once the call has returned, and neither does another session.
+ */
+export function callingFork(sessions: SessionView): ForkArchive | undefined {
+  const call = runningFork.getStore();
+  return call?.sessionId === sessions.getSessionId() ? call.transcript?.() : undefined;
+}
+
 export class ThreadIndex {
   private readonly sessions: SessionView;
   private readonly memory: ReadonlyMap<string, ForkArchive>;
+  private readonly running: ForkArchive | undefined;
 
-  constructor(sessions: SessionView, memory: ReadonlyMap<string, ForkArchive>) {
+  /**
+   * `running` is the fork whose child asks, from `callingFork`: the folds inside it are threads too.
+   * Its own thread is not, as the child still sees those messages.
+   */
+  constructor(
+    sessions: SessionView,
+    memory: ReadonlyMap<string, ForkArchive>,
+    running?: ForkArchive
+  ) {
     this.sessions = sessions;
     this.memory = memory;
+    this.running = running;
   }
 
   /** Threads archived on the current branch, oldest first. */
@@ -319,6 +352,7 @@ export class ThreadIndex {
         record.kind === 'fold' ? this.foldThread(record) : this.compactionThread(record);
       if (thread) threads.push(thread);
     }
+    if (this.running) threads.push(...this.foldsInside(this.running));
     return threads;
   }
 
@@ -327,6 +361,9 @@ export class ThreadIndex {
     const entries = this.sessions.getEntries();
     const fold = foldRecords(entries).find((record) => record.handle === handle);
     if (fold) return this.foldThread(fold);
+    const own =
+      this.running && this.foldsInside(this.running).find((found) => found.handle === handle);
+    if (own) return own;
     // A fork's handle, or a fold made inside one: the fork's archive holds both.
     for (const fork of forkRecords(entries)) {
       const thread = (await this.forkThreads(fork)).find((found) => found.handle === handle);
@@ -429,41 +466,49 @@ export class ThreadIndex {
     const archive = this.memory.get(fork.handle) ?? (await readArchive(fork.archive));
     if (!archive) return [];
 
-    const folds = archive.folds ?? [];
-    const prefix = () => [
-      ...buildSessionProjection(this.sessions.getEntries(), fork.parentEntryId).messages,
-      ...(archive.siblings ?? [])
-    ];
-    const visible = withoutFolded(archive.messages, folds);
-    const threads: Thread[] = [
+    const visible = withoutFolded(archive.messages, archive.folds ?? []);
+    return [
       {
         handle: fork.handle,
         kind: 'fork',
         label: `fork: ${fork.task.slice(0, 80)}`,
         messages: visible,
-        context: () => [...prefix(), ...visible],
+        context: () => [...this.forkPrefix(archive), ...visible],
         record: fork
-      }
+      },
+      ...this.foldsInside(archive)
     ];
-    folds.forEach((fold, order) => {
+  }
+
+  /** What the child started from: the parent's view and the results that closed sibling forks. */
+  private forkPrefix(archive: ForkArchive): AgentMessage[] {
+    return [
+      ...buildSessionProjection(this.sessions.getEntries(), archive.parentEntryId).messages,
+      ...(archive.siblings ?? [])
+    ];
+  }
+
+  /** The folds a fork made of its own work, finished or still running, each a thread. */
+  private foldsInside(archive: ForkArchive): Thread[] {
+    const folds = archive.folds ?? [];
+    return folds.map((fold, order) => {
       // What earlier folds already removed is archived under their handles.
       const earlier = new Set(folds.slice(0, order).flatMap((other) => other.omit));
-      threads.push({
+      return {
         handle: fold.record.handle,
         kind: 'fold',
-        label: `${fold.record.until ? `turns ${fold.record.since}-${fold.record.until}` : `turns from ${fold.record.since} on`}, inside ${fork.handle}`,
+        label: `${fold.record.until ? `turns ${fold.record.since}-${fold.record.until}` : `turns from ${fold.record.since} on`}, inside ${archive.handle}`,
         messages: archive.messages
           .slice(fold.first, fold.last + 1)
           .filter((_, index) => !earlier.has(fold.first + index)),
         // What the child saw when it folded: its earlier folds applied, this one not yet.
         context: () => [
-          ...prefix(),
+          ...this.forkPrefix(archive),
           ...withoutFolded(archive.messages.slice(0, fold.last + 1), folds.slice(0, order))
         ],
         record: fold.record
-      });
+      };
     });
-    return threads;
   }
 }
 

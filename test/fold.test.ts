@@ -7,10 +7,14 @@ import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { Message } from '@earendil-works/pi-ai';
 import { convertToLlm, type SessionManager } from '@earendil-works/pi-coding-agent';
 import {
+  callingFork,
   FOLD_APPLIED_TYPE,
   FOLD_STARTED_TYPE,
+  type FoldDetails,
   type ForkArchive,
+  type ForkCall,
   foldRecords,
+  runningFork,
   ThreadIndex
 } from '../src/archive.js';
 import {
@@ -1461,6 +1465,71 @@ test('after a compaction, stamps the summary mentions are gone and the kept ones
   const plan = planFold(entries, 'f', 3, { latestStamp: 5 });
   assert.equal(plan.anchorStamp, undefined);
   assert.equal(plan.keptUserTurns.join(), 't3');
+});
+
+test('the folds of a running fork are threads for the call its child makes, and for no other', async () => {
+  const fold = (handle: string): FoldDetails => ({
+    kind: 'fold',
+    handle,
+    since: 't2',
+    firstEntryId: '',
+    lastEntryId: '',
+    messages: 0,
+    tokens: 0,
+    headline: handle,
+    keptUserTurns: [],
+    files: []
+  });
+  // The transcript as it stands while the child runs: no record of the fork is in the session.
+  const archive: ForkArchive = {
+    handle: 'fk-1',
+    task: 't',
+    parentEntryId: 'p',
+    messages: [
+      result('k', 'fork', 'Task: build', 0),
+      assistant(call('a', 'bash')),
+      result('a', 'bash', 'raw-a', 2),
+      assistant(call('f0', 'fold')),
+      result('f0', 'fold', 'note-a', 3),
+      assistant(call('b', 'bash')),
+      result('b', 'bash', 'raw-b', 4)
+    ],
+    folds: [{ record: fold('ep-a'), first: 1, last: 2, omit: [1, 2] }]
+  };
+  const { manager } = session([user('go', 1)]);
+
+  const index = new ThreadIndex(manager, new Map(), archive);
+  const threads = await index.onBranch();
+  assert.deepEqual(
+    threads.map((thread) => thread.handle),
+    ['ep-a']
+  );
+  assert.equal(threads[0]!.label, 'turns from t2 on, inside fk-1');
+  assert.deepEqual(threads[0]!.messages.map(readStamp), [undefined, 2]);
+  assert.equal((await index.find('ep-a'))?.handle, 'ep-a');
+  // What the child still sees is not an archived thread.
+  assert.equal(await index.find('fk-1'), undefined);
+  // An index made for anyone else has the session only.
+  const plain = new ThreadIndex(manager, new Map());
+  assert.deepEqual(await plain.onBranch(), []);
+  assert.equal(await plain.find('ep-a'), undefined);
+
+  const made = { sessionId: manager.getSessionId(), transcript: () => archive } as ForkCall;
+  assert.equal(
+    runningFork.run(made, () => callingFork(manager)),
+    archive
+  );
+  assert.equal(callingFork(manager), undefined);
+  assert.equal(
+    runningFork.run({ ...made, sessionId: 'another session' }, () => callingFork(manager)),
+    undefined
+  );
+  // The call has returned: what it left running finds nothing.
+  made.transcript = undefined;
+  assert.equal(
+    runningFork.run(made, () => callingFork(manager)),
+    undefined
+  );
 });
 
 test('lists the turns a fold can start from, newest first, after the latest compaction', () => {
