@@ -755,6 +755,67 @@ test('a running fork reaches the folds it made with recall and ask', async () =>
   }
 });
 
+test('ask rebuilds what a fork started from, also a result that came before it in its response', async () => {
+  let nested = '';
+  // What the child saw: the note of the fold that ran before the fork in the same response.
+  const sawNote = (context: TranscriptContext) => {
+    const messages = conversation(context);
+    assert.ok(messages.some((message) => /Parent note: ran one\./.test(text(message))));
+    assert.ok(messages.some((message) => /Task: Go on\./.test(text(message))));
+    assert.ok(messages.some((message) => /row two/.test(text(message))));
+  };
+  const harness = await createSession([
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo "row one"' })),
+    (context) =>
+      // A fold makes the calls of its response run one after the other.
+      fauxAssistantMessage([
+        fauxToolCall('fold', {
+          since: /\[(t\d+)\]$/.exec(text(conversation(context).at(-1)!))![1]!,
+          note: 'Parent note: ran one.'
+        }),
+        fauxToolCall('fork', { task: 'Go on.' })
+      ]),
+    (context) => {
+      assert.ok(
+        conversation(context).some((message) => /Parent note: ran one\./.test(text(message)))
+      );
+      return fauxAssistantMessage(fauxToolCall('bash', { command: 'echo "row two"' }));
+    },
+    (context) =>
+      fauxAssistantMessage(
+        fauxToolCall('fold', {
+          since: /\[(t\d+)\]$/.exec(text(conversation(context).at(-1)!))![1]!,
+          note: 'Ran two.'
+        })
+      ),
+    (context) => {
+      nested = /ep-[0-9a-f]{8}/.exec(text(conversation(context).at(-1)!))![0];
+      return fauxAssistantMessage(fauxToolCall('ask', { handle: nested, question: 'Rows?' }));
+    },
+    // While the fork runs.
+    (context) => {
+      sawNote(context);
+      return fauxAssistantMessage('One and two.');
+    },
+    () => fauxAssistantMessage('Both rows printed.\n- Open: none.'),
+    () => fauxAssistantMessage(fauxToolCall('ask', { handle: nested, question: 'Rows?' })),
+    // And after it has ended.
+    (context) => {
+      sawNote(context);
+      return fauxAssistantMessage('One and two.');
+    },
+    () => fauxAssistantMessage('done')
+  ]);
+
+  try {
+    await harness.session.prompt('go');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test('a fork running next to another does not reach the folds the other made', async () => {
   let folded = () => {};
   const alphaFolded = new Promise<void>((resolve) => {

@@ -113,7 +113,7 @@ export interface ForkDetails {
   kind: 'fork';
   handle: string;
   task: string;
-  /** The assistant entry that called fork; the child started from the view at that entry. */
+  /** The assistant entry that called fork. */
   parentEntryId: string;
   turns: number;
   headline: string;
@@ -196,6 +196,12 @@ export interface ForkArchive {
   handle: string;
   task: string;
   parentEntryId: string;
+  /**
+   * The leaf of the session when the fork started, whose view the child started from. Left out
+   * when it is the calling entry; it is a later one when calls that ran before fork in the same
+   * response have their results in the session already.
+   */
+  prefixEntryId?: string;
   /** Results that closed sibling fork calls in the child's prefix, so `ask` rebuilds it as it was. */
   siblings?: AgentMessage[];
   /** Messages the child added after the parent prefix, starting with the task. */
@@ -483,7 +489,10 @@ export class ThreadIndex {
   /** What the child started from: the parent's view and the results that closed sibling forks. */
   private forkPrefix(archive: ForkArchive): AgentMessage[] {
     return [
-      ...buildSessionProjection(this.sessions.getEntries(), archive.parentEntryId).messages,
+      ...buildSessionProjection(
+        this.sessions.getEntries(),
+        archive.prefixEntryId ?? archive.parentEntryId
+      ).messages,
       ...(archive.siblings ?? [])
     ];
   }

@@ -210,12 +210,14 @@ export function registerFork(pi: ExtensionAPI, state: EpisodeState, registry: Fo
         prefixLength: prefix.length,
         siblings: siblings.length
       });
+      const leaf = ctx.sessionManager.getLeafId();
       // The transcript as it stands: what is written after every turn, and what a call of the
       // child is made with, since no session entry or file holds it mid-turn.
       const transcript = (): ForkArchive => ({
         handle,
         task: params.task,
         parentEntryId: parent.sourceEntry.id,
+        ...(leaf && leaf !== parent.sourceEntry.id ? { prefixEntryId: leaf } : {}),
         siblings,
         messages: agent.state.messages.slice(prefix.length),
         folds: [...folds.folds]
