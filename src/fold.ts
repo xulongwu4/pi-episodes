@@ -1447,16 +1447,29 @@ function unfoldedNoteContent(
     const dropIndices = new Set<number>(
       matchArchivedRefBlocks(rawBody, archivedRefs, protectedPrefix).keys()
     );
-    let droppedImages = 0;
     if (carriedCount > 0) {
-      const forwardStart =
-        protectedPrefix !== undefined
-          ? protectedPrefix
-          : details.written?.blocks !== undefined && details.written.sha256 === undefined
-            ? details.written.blocks
-            : undefined;
-      if (forwardStart !== undefined) {
-        for (let i = forwardStart; i < rawBody.length && droppedImages < carriedCount; i++) {
+      let droppedImages = 0;
+      if (protectedPrefix !== undefined) {
+        for (let i = protectedPrefix; i < rawBody.length && droppedImages < carriedCount; i++) {
+          if (rawBody[i]?.type === 'image') {
+            dropIndices.add(i);
+            droppedImages++;
+          }
+        }
+      } else if (typeof details.written?.sha256 === 'string') {
+        const imageIndices: number[] = [];
+        for (let i = 0; i < rawBody.length; i++) {
+          if (rawBody[i]?.type === 'image') imageIndices.push(i);
+        }
+        if (imageIndices.length === carriedCount) {
+          for (const idx of imageIndices) dropIndices.add(idx);
+        }
+      } else if (details.written?.blocks !== undefined) {
+        for (
+          let i = details.written.blocks;
+          i < rawBody.length && droppedImages < carriedCount;
+          i++
+        ) {
           if (rawBody[i]?.type === 'image') {
             dropIndices.add(i);
             droppedImages++;

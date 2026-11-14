@@ -1922,10 +1922,68 @@ test('readArchivedImage and verifyArchivedImageSync confine paths to archiveDir,
     const afterMsgs = sBroken.manager.buildSessionProjection().messages;
     const unfMsg = afterMsgs.at(-1)!;
     assert.equal(unfMsg.role, 'toolResult');
-    assert.deepEqual(
-      unfMsg.content.filter((b) => b.type === 'image'),
-      [scriptImg],
-      'scriptImg preserved and carriedImg dropped even when prepended block shifted indices'
+    assert.ok(
+      unfMsg.content.some((b) => b.type === 'image' && b.data === scriptImg.data),
+      'scriptImg preserved when prepended block broke written.sha256'
+    );
+
+    // 6) Hook reorders [note, scriptImg, carriedImg] -> [note, carriedImg, scriptImg]:
+    // when written.sha256 fails and > carriedCount images stand, unfold MUST preserve scriptImg!
+    const sReordered = session([
+      user('start', 1),
+      assistant(call('b1', 'bash', { command: 'echo ok' })),
+      result('b1', 'bash', 'ok', 2),
+      assistant(call('cm_reord', 'codemode', { code: 'fold()' }))
+    ]);
+    const pReord = planFold(sReordered.manager.buildSessionProjection().entries, 'cm_reord', 2);
+    const reordDetails: FoldDetails = {
+      ...brkDetails,
+      handle: 'ep-cmreord',
+      firstEntryId: pReord.firstEntryId,
+      lastEntryId: pReord.lastEntryId,
+      renderedNote: '[fold ep-cmreord: t2 (2 messages, ~10 tokens)]\n\nBroken prefix note.',
+      written: writtenMark([
+        {
+          type: 'text',
+          text: 'SCRIPT_OUT\n[fold ep-cmreord: t2 (2 messages, ~10 tokens)]\n\nBroken prefix note.'
+        },
+        scriptImg
+      ])
+    };
+    sReordered.manager.appendMessage(
+      Object.assign({
+        role: 'toolResult' as const,
+        toolCallId: 'cm_reord',
+        toolName: 'codemode',
+        content: [
+          {
+            type: 'text' as const,
+            text: 'SCRIPT_OUT\n[fold ep-cmreord: t2 (2 messages, ~10 tokens)]\n\nBroken prefix note.'
+          },
+          carriedImg,
+          scriptImg,
+          { type: 'text' as const, text: '[t3]' }
+        ],
+        details: { [FOLD_DETAILS_KEY]: reordDetails },
+        isError: false,
+        timestamp: 0
+      })
+    );
+    for (const ed of pReord.edits)
+      sReordered.manager.appendContextEdit(ed.targetId, ed.replacement);
+    sReordered.manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: 'ep-cmreord' });
+    const unfReord = planUnfold(
+      sReordered.manager.getBranch(),
+      sReordered.manager.buildSessionProjection().entries,
+      'ep-cmreord'
+    );
+    for (const ed of unfReord.edits)
+      sReordered.manager.appendContextEdit(ed.targetId, ed.replacement);
+    const reordMsg = sReordered.manager.buildSessionProjection().messages.at(-1)!;
+    assert.equal(reordMsg.role, 'toolResult');
+    assert.ok(
+      reordMsg.content.some((b) => b.type === 'image' && b.data === scriptImg.data),
+      'scriptImg MUST be preserved when a hook reordered [note, carriedImg, scriptImg]'
     );
   } finally {
     await rm(outerDir, { recursive: true, force: true });
