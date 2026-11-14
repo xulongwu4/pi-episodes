@@ -509,19 +509,23 @@ export async function archiveDirs(
       if (!candidates.includes(candidate)) candidates.push(candidate);
     }
 
-    let dirOwner: string | undefined;
+    const dirsWithEpisodes: string[] = [];
     let headerFile: string | undefined;
     for (const candidate of candidates) {
       const hasFile = await isRegularFileOnDisk(candidate);
       if (hasFile && !headerFile) headerFile = candidate;
-      if (!dirOwner && (hasFile || (await pathExistsOnDisk(archiveDirForSessionFile(candidate))))) {
-        dirOwner = candidate;
+      if (await pathExistsOnDisk(archiveDirForSessionFile(candidate))) {
+        dirsWithEpisodes.push(candidate);
       }
     }
-    const chosenDir = archiveDirForSessionFile(dirOwner ?? recordedParent);
-    if (!seenDirs.has(chosenDir)) {
-      seenDirs.add(chosenDir);
-      dirs.push(chosenDir);
+    const dirOwners =
+      dirsWithEpisodes.length > 0 ? dirsWithEpisodes : [headerFile ?? recordedParent];
+    for (const owner of dirOwners) {
+      const chosenDir = archiveDirForSessionFile(owner);
+      if (!seenDirs.has(chosenDir)) {
+        seenDirs.add(chosenDir);
+        dirs.push(chosenDir);
+      }
     }
     if (!headerFile || seenFiles.has(headerFile)) break;
     seenFiles.add(headerFile);

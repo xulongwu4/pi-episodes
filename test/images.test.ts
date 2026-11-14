@@ -55,6 +55,7 @@ import {
   matchArchivedRefBlocks,
   prepareCarriedMedia,
   readArchivedImage,
+  resolveArchivedImagePath,
   sniffImageMimeType,
   verifyArchivedImageSync
 } from '../src/images.js';
@@ -2788,7 +2789,7 @@ test('archiveDirs handles >8KiB UTF-8 headers, short reads, hop-local relocation
       ]);
     }
 
-    // 7) prepareCarriedMedia stops archiving remaining images when AbortSignal aborts before or mid-batch
+    // 7) prepareCarriedMedia throws Fold aborted when AbortSignal aborts before or mid-batch
     const abortArchive = join(root, 'abort.episodes');
     const abortCtrl = new AbortController();
     abortCtrl.abort();
@@ -2802,11 +2803,15 @@ test('archiveDirs handles >8KiB UTF-8 headers, short reads, hop-local relocation
       data: makePng(4, 3, [40, 50, 60]).toString('base64'),
       mimeType: 'image/png'
     };
-    await prepareCarriedMedia(
-      'ep-abort01',
-      [{ kind: 'image', image: pngBlock1 }],
-      abortArchive,
-      abortCtrl.signal
+    await assert.rejects(
+      () =>
+        prepareCarriedMedia(
+          'ep-abort01',
+          [{ kind: 'image', image: pngBlock1 }],
+          abortArchive,
+          abortCtrl.signal
+        ),
+      /Fold aborted/
     );
     await assert.rejects(() => readFile(abortArchive));
     let batchChecks = 0;
@@ -2816,17 +2821,19 @@ test('archiveDirs handles >8KiB UTF-8 headers, short reads, hop-local relocation
         return batchChecks >= 2;
       }
     } as AbortSignal;
-    const midPrepared = await prepareCarriedMedia(
-      'ep-abort02',
-      [
-        { kind: 'image', image: pngBlock1 },
-        { kind: 'image', image: pngBlock2 }
-      ],
-      abortArchive,
-      midBatchSignal
+    await assert.rejects(
+      () =>
+        prepareCarriedMedia(
+          'ep-abort02',
+          [
+            { kind: 'image', image: pngBlock1 },
+            { kind: 'image', image: pngBlock2 }
+          ],
+          abortArchive,
+          midBatchSignal
+        ),
+      /Fold aborted/
     );
-    assert.equal(midPrepared.length, 1);
-    assert.equal(midPrepared[0]?.kind, 'ref');
 
     // 8) session_mismatch lists all allowed directory basenames while matching /outside the session archive directory/
     const mismatchRef = {
@@ -2847,6 +2854,129 @@ test('archiveDirs handles >8KiB UTF-8 headers, short reads, hop-local relocation
         /outside the session archive directory/.test(err.message) &&
         err.message.includes('child.episodes') &&
         err.message.includes('parent.episodes')
+    );
+
+    // 9) Post-open fh.stat() and fh.readFile() EIO errors are caught cleanly (inline fallback on archive, formatted error on readback, always closing fh)
+    const ioDir = join(root, 'io-fault.episodes');
+    const seedArchived = await archiveImage(ioDir, 'ep-io0001', 1, pngBlock1);
+    assert.ok(seedArchived);
+    let statClosed = 0;
+    const failingStatOpen = (async () => ({
+      stat: async () => {
+        throw Object.assign(new Error('EIO: simulated stat failure'), { code: 'EIO' });
+      },
+      readFile: async () => Buffer.alloc(0),
+      close: async () => {
+        statClosed++;
+      }
+    })) as unknown as typeof import('node:fs/promises').open;
+    let readClosed = 0;
+    const failingReadOpen = (async (
+      p: Parameters<typeof import('node:fs/promises').open>[0],
+      f: number
+    ) => {
+      const realFh = await (await import('node:fs/promises')).open(p, f);
+      return {
+        stat: () => realFh.stat(),
+        readFile: async () => {
+          throw Object.assign(new Error('EIO: simulated readFile failure'), { code: 'EIO' });
+        },
+        close: async () => {
+          readClosed++;
+          await realFh.close();
+        }
+      };
+    }) as unknown as typeof import('node:fs/promises').open;
+    assert.equal(
+      await archiveImage(ioDir, 'ep-io0002', 1, pngBlock1, {
+        readOptions: { openFile: failingStatOpen }
+      }),
+      undefined
+    );
+    assert.equal(
+      await archiveImage(ioDir, 'ep-io0003', 1, pngBlock1, {
+        readOptions: { openFile: failingReadOpen }
+      }),
+      undefined
+    );
+    await assert.rejects(
+      () => readArchivedImage(seedArchived, ioDir, { openFile: failingStatOpen }),
+      /Archived image #1 of ep-io0001 could not be read at .*: EIO: simulated stat failure/
+    );
+    await assert.rejects(
+      () => readArchivedImage(seedArchived, ioDir, { openFile: failingReadOpen }),
+      /Archived image #1 of ep-io0001 could not be read at .*: EIO: simulated readFile failure/
+    );
+    const fallbackStatMedia = await prepareCarriedMedia(
+      'ep-io0004',
+      [{ kind: 'image', image: pngBlock1 }],
+      ioDir,
+      undefined,
+      { readOptions: { openFile: failingStatOpen } }
+    );
+    assert.deepEqual(fallbackStatMedia, [{ kind: 'image', image: pngBlock1 }]);
+    const fallbackReadMedia = await prepareCarriedMedia(
+      'ep-io0005',
+      [{ kind: 'image', image: pngBlock1 }],
+      ioDir,
+      undefined,
+      { readOptions: { openFile: failingReadOpen } }
+    );
+    assert.deepEqual(fallbackReadMedia, [{ kind: 'image', image: pngBlock1 }]);
+    assert.equal(statClosed, 3);
+    assert.equal(readClosed, 3);
+
+    // 10) archiveDirs prefers recorded parent with existing .episodes when live dir has only a copied .jsonl,
+    //     and readArchivedImage/verifyArchivedImageSync try all matching-basename allowed directories!
+    const origParentDir = join(root, 'orig-parent');
+    const liveCopyDir = join(root, 'live-copy');
+    await mkdir(origParentDir, { recursive: true });
+    await mkdir(liveCopyDir, { recursive: true });
+    const origParentFile = join(origParentDir, 'shared-parent.jsonl');
+    const copiedParentFile = join(liveCopyDir, 'shared-parent.jsonl');
+    const childInLiveFile = join(liveCopyDir, 'child.jsonl');
+    await writeFile(origParentFile, `${JSON.stringify({ type: 'session' })}\n`);
+    await writeFile(copiedParentFile, `${JSON.stringify({ type: 'session' })}\n`);
+    await writeFile(
+      childInLiveFile,
+      `${JSON.stringify({ type: 'session', parentSession: origParentFile })}\n`
+    );
+    const sharedRef = await archiveImage(
+      join(origParentDir, 'shared-parent.episodes'),
+      'ep-shared1',
+      1,
+      pngBlock2
+    );
+    assert.ok(sharedRef);
+    // Case A: liveCopyDir has copied shared-parent.jsonl WITHOUT .episodes; origParentDir has .episodes
+    const dirsWhenOnlyOrigHasEpisodes = await archiveDirs(viewFor(childInLiveFile, origParentFile));
+    assert.ok(dirsWhenOnlyOrigHasEpisodes.includes(join(origParentDir, 'shared-parent.episodes')));
+    const readCaseA = await readArchivedImage(sharedRef, dirsWhenOnlyOrigHasEpisodes);
+    assert.equal(readCaseA.data, pngBlock2.data);
+    // Case B: liveCopyDir ALSO has an empty shared-parent.episodes (two allowed dirs share basename!)
+    await mkdir(join(liveCopyDir, 'shared-parent.episodes'), { recursive: true });
+    const dirsWhenBothHaveEpisodes = await archiveDirs(viewFor(childInLiveFile, origParentFile));
+    assert.deepEqual(dirsWhenBothHaveEpisodes, [
+      join(liveCopyDir, 'child.episodes'),
+      join(liveCopyDir, 'shared-parent.episodes'),
+      join(origParentDir, 'shared-parent.episodes')
+    ]);
+    assert.equal(
+      resolveArchivedImagePath(sharedRef, dirsWhenBothHaveEpisodes),
+      join(origParentDir, 'shared-parent.episodes', basename(sharedRef.path))
+    );
+    assert.equal(verifyArchivedImageSync(sharedRef, dirsWhenBothHaveEpisodes), true);
+    const readCaseB = await readArchivedImage(sharedRef, dirsWhenBothHaveEpisodes);
+    assert.equal(readCaseB.data, pngBlock2.data);
+    // If the higher-priority directory holds a corrupted file at the target name, fail closed!
+    await writeFile(
+      join(liveCopyDir, 'shared-parent.episodes', basename(sharedRef.path)),
+      Buffer.from('corrupt')
+    );
+    assert.equal(verifyArchivedImageSync(sharedRef, dirsWhenBothHaveEpisodes), false);
+    await assert.rejects(
+      () => readArchivedImage(sharedRef, dirsWhenBothHaveEpisodes),
+      /failed size verification/
     );
   } finally {
     await rm(root, { recursive: true, force: true });

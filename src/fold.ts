@@ -34,6 +34,7 @@ import {
   archivedImagesOf,
   type CarriedMediaItem,
   carriedMediaBlocks,
+  FOLD_ABORTED_MESSAGE,
   holdsArchivedManifest,
   holdsCarriedMedia,
   matchArchivedRefBlocks,
@@ -1425,7 +1426,8 @@ function unfoldedNoteContent(
           }
         }
       } else if (typeof details.written?.sha256 === 'string') {
-        // Recorded written.sha256 failed: inline image ownership is uncertain, so preserve all.
+        // Recorded written.sha256 failed: inline image ownership is uncertain, so preserve all
+        // (preferring potential duplicate images after unfold over losing script-owned images).
       } else if (details.written?.blocks !== undefined) {
         for (
           let i = details.written.blocks;
@@ -2048,7 +2050,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         signal
       );
       // Snapshots and image archiving take time; a run aborted meanwhile, or already settled, must not get edits.
-      if (signal?.aborted || run !== state.run) throw new Error('The fold was cancelled.');
+      if (signal?.aborted || run !== state.run) throw new Error(FOLD_ABORTED_MESSAGE);
       const inlineImages = media.flatMap((item) => (item.kind === 'image' ? [item.image] : []));
       const archivedRefs = media.flatMap((item) => (item.kind === 'ref' ? [{ ...item.ref }] : []));
       // A fold from a script takes effect with the script's result, which then stands as the

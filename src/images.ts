@@ -373,13 +373,16 @@ export function archivedImagesOf(value: unknown): ArchivedImage[] {
 export interface ArchiveReadOptions {
   /** Override `fsConstants.O_NOFOLLOW` (for example `0` in tests simulating platforms without `O_NOFOLLOW`). */
   noFollowFlag?: number;
+  /** Optional `fs/promises.open` override used in fault-injection tests for post-open `stat`/`readFile` failures. */
+  openFile?: typeof open;
 }
 
 export interface ArchiveWriteOptions {
   /** Optional hook invoked after writing the temp file and before atomic link publication (used in race tests). */
   beforePublish?: (targetPath: string) => Promise<void> | void;
+  /** Optional read options forwarded to existing-file checks (used in fault-injection tests). */
+  readOptions?: ArchiveReadOptions;
 }
-
 function openReadFlags(options?: ArchiveReadOptions): { flags: number; hasNoFollow: boolean } {
   const noFollow =
     options?.noFollowFlag !== undefined ? options.noFollowFlag : (fsConstants.O_NOFOLLOW ?? 0);
@@ -443,7 +446,7 @@ async function readRegularFileNoFollow(
   const { flags, hasNoFollow } = openReadFlags(options);
   let fh: Awaited<ReturnType<typeof open>>;
   try {
-    fh = await open(resolvedPath, flags);
+    fh = await (options?.openFile ?? open)(resolvedPath, flags);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | undefined)?.code;
     if (code === 'ENOENT') return { ok: false, reason: 'missing' };
@@ -469,6 +472,12 @@ async function readRegularFileNoFollow(
       return { ok: false, reason: 'size_mismatch', actualSize: st.size };
     }
     return { ok: true, bytes: await fh.readFile() };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: 'io_error',
+      message: error instanceof Error ? error.message : String(error)
+    };
   } finally {
     await fh.close().catch(() => undefined);
   }
@@ -532,7 +541,12 @@ export async function archiveImage(
   } catch {
     return undefined;
   }
-  const existing = await checkExistingArchiveFile(path, bytes.length, digest);
+  let existing: 'same' | 'missing' | 'conflict';
+  try {
+    existing = await checkExistingArchiveFile(path, bytes.length, digest, options?.readOptions);
+  } catch {
+    return undefined;
+  }
   if (existing === 'conflict') return undefined;
   if (existing === 'missing') {
     const temporary = `${path}.${randomUUID()}.tmp`;
@@ -541,7 +555,10 @@ export async function archiveImage(
       await options?.beforePublish?.(path);
       await publishArchiveFileNoReplace(temporary, path);
     } catch {
-      if ((await checkExistingArchiveFile(path, bytes.length, digest)) !== 'same') {
+      if (
+        (await checkExistingArchiveFile(path, bytes.length, digest, options?.readOptions)) !==
+        'same'
+      ) {
         return undefined;
       }
     } finally {
@@ -571,9 +588,10 @@ function expectedImageBasename(ref: ArchivedImage): string | undefined {
 }
 
 type PathResolution =
-  | { ok: true; path: string }
+  | { ok: true; paths: [string, ...string[]] }
   | { ok: false; reason: 'outside' }
   | { ok: false; reason: 'session_mismatch'; recordedDir: string; expectedDirs: string[] };
+
 function normalizeAllowedDirs(allowedDirs?: string | readonly string[]): string[] {
   if (!allowedDirs) return [];
   const list = typeof allowedDirs === 'string' ? [allowedDirs] : allowedDirs;
@@ -600,8 +618,8 @@ function classifyArchivedImagePath(
   const recordedDir = rawSegments.at(-2);
   if (!recordedDir) return { ok: false, reason: 'outside' };
   const resolvedDirs = dirs.map((dir) => resolve(dir));
-  const matched = resolvedDirs.find((dir) => basename(dir) === recordedDir);
-  if (!matched) {
+  const matchedDirs = [...new Set(resolvedDirs.filter((dir) => basename(dir) === recordedDir))];
+  if (matchedDirs.length === 0) {
     if (recordedDir.endsWith('.episodes')) {
       const expectedDirs = [...new Set(resolvedDirs.map((dir) => basename(dir)))];
       return {
@@ -613,7 +631,8 @@ function classifyArchivedImagePath(
     }
     return { ok: false, reason: 'outside' };
   }
-  return { ok: true, path: join(matched, expectedBase) };
+  const paths = matchedDirs.map((dir) => join(dir, expectedBase)) as [string, ...string[]];
+  return { ok: true, paths };
 }
 
 /**
@@ -626,35 +645,52 @@ export function resolveArchivedImagePath(
   allowedDirs?: string | readonly string[]
 ): string | undefined {
   const result = classifyArchivedImagePath(ref, allowedDirs);
-  return result.ok ? result.path : undefined;
+  if (!result.ok) return undefined;
+  if (result.paths.length === 1) return result.paths[0];
+  for (const candidate of result.paths) {
+    try {
+      if (lstatSync(candidate).isFile()) return candidate;
+    } catch {
+      // Try the next matching-basename directory.
+    }
+  }
+  return result.paths[0];
 }
 
-/** Synchronous integrity and path-confinement check used at `turn_end` before committing fold edits. */
-export function verifyArchivedImageSync(
+function verifySingleArchivedImageSync(
+  resolvedPath: string,
   ref: ArchivedImage,
-  allowedDirs?: string | readonly string[],
   options?: ArchiveReadOptions
-): boolean {
+): 'ok' | 'missing' | 'invalid' {
   let fd: number | undefined;
   try {
-    const resolvedPath = resolveArchivedImagePath(ref, allowedDirs);
-    if (!resolvedPath) return false;
-    const lst = lstatSync(resolvedPath);
-    if (!lst.isFile() || lst.size !== ref.bytes) return false;
+    let lst: ReturnType<typeof lstatSync>;
+    try {
+      lst = lstatSync(resolvedPath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      return code === 'ENOENT' ? 'missing' : 'invalid';
+    }
+    if (!lst.isFile() || lst.size !== ref.bytes) return 'invalid';
     const { flags, hasNoFollow } = openReadFlags(options);
-    fd = openSync(resolvedPath, flags);
+    try {
+      fd = openSync(resolvedPath, flags);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      return code === 'ENOENT' ? 'missing' : 'invalid';
+    }
     const st = fstatSync(fd);
-    if (!st.isFile() || st.size !== ref.bytes) return false;
+    if (!st.isFile() || st.size !== ref.bytes) return 'invalid';
     if (!hasNoFollow) {
-      if (lst.ino !== 0 && (st.dev !== lst.dev || st.ino !== lst.ino)) return false;
-      if (!leafIsNotSymlinkSync(resolvedPath)) return false;
+      if (lst.ino !== 0 && (st.dev !== lst.dev || st.ino !== lst.ino)) return 'invalid';
+      if (!leafIsNotSymlinkSync(resolvedPath)) return 'invalid';
     }
     const bytes = readFileSync(fd);
-    if (bytes.length !== ref.bytes) return false;
-    if (sniffImageMimeType(bytes) !== ref.mimeType) return false;
-    return createHash('sha256').update(bytes).digest('hex') === ref.sha256;
+    if (bytes.length !== ref.bytes) return 'invalid';
+    if (sniffImageMimeType(bytes) !== ref.mimeType) return 'invalid';
+    return createHash('sha256').update(bytes).digest('hex') === ref.sha256 ? 'ok' : 'invalid';
   } catch {
-    return false;
+    return 'invalid';
   } finally {
     if (fd !== undefined) {
       try {
@@ -664,6 +700,22 @@ export function verifyArchivedImageSync(
       }
     }
   }
+}
+
+/** Synchronous integrity and path-confinement check used at `turn_end` before committing fold edits. */
+export function verifyArchivedImageSync(
+  ref: ArchivedImage,
+  allowedDirs?: string | readonly string[],
+  options?: ArchiveReadOptions
+): boolean {
+  const classified = classifyArchivedImagePath(ref, allowedDirs);
+  if (!classified.ok) return false;
+  for (const resolvedPath of classified.paths) {
+    const status = verifySingleArchivedImageSync(resolvedPath, ref, options);
+    if (status === 'ok') return true;
+    if (status === 'invalid') return false;
+  }
+  return false;
 }
 
 /** Reads and verifies a confined archived image from disk without following leaf symlinks or blocking on FIFOs. */
@@ -684,44 +736,48 @@ export async function readArchivedImage(
       `Archived image #${ref.index} of ${ref.handle} has a path outside the session archive directory.`
     );
   }
-  const resolvedPath = classified.path;
-  const opened = await readRegularFileNoFollow(resolvedPath, ref.bytes, options);
-  if (!opened.ok) {
-    if (opened.reason === 'missing') {
+  let firstMissingPath: string | undefined;
+  for (const resolvedPath of classified.paths) {
+    const opened = await readRegularFileNoFollow(resolvedPath, ref.bytes, options);
+    if (!opened.ok) {
+      if (opened.reason === 'missing') {
+        firstMissingPath ??= resolvedPath;
+        continue;
+      }
+      if (opened.reason === 'not_regular') {
+        throw new Error(
+          `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} is not a regular file.`
+        );
+      }
+      if (opened.reason === 'size_mismatch') {
+        throw new Error(
+          `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} failed size verification (expected ${ref.bytes} bytes, got ${opened.actualSize}).`
+        );
+      }
       throw new Error(
-        `Archived image #${ref.index} of ${ref.handle} is missing at ${resolvedPath}.`
+        `Archived image #${ref.index} of ${ref.handle} could not be read at ${resolvedPath}: ${opened.message}`
       );
     }
-    if (opened.reason === 'not_regular') {
+    const { bytes } = opened;
+    const actualSha = createHash('sha256').update(bytes).digest('hex');
+    if (
+      bytes.length !== ref.bytes ||
+      actualSha !== ref.sha256 ||
+      sniffImageMimeType(bytes) !== ref.mimeType
+    ) {
       throw new Error(
-        `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} is not a regular file.`
+        `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} failed SHA-256 verification (expected ${ref.sha256.slice(0, 16)}).`
       );
     }
-    if (opened.reason === 'size_mismatch') {
-      throw new Error(
-        `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} failed size verification (expected ${ref.bytes} bytes, got ${opened.actualSize}).`
-      );
-    }
-    throw new Error(
-      `Archived image #${ref.index} of ${ref.handle} could not be read at ${resolvedPath}: ${opened.message}`
-    );
+    return {
+      type: 'image',
+      data: bytes.toString('base64'),
+      mimeType: ref.mimeType
+    };
   }
-  const { bytes } = opened;
-  const actualSha = createHash('sha256').update(bytes).digest('hex');
-  if (
-    bytes.length !== ref.bytes ||
-    actualSha !== ref.sha256 ||
-    sniffImageMimeType(bytes) !== ref.mimeType
-  ) {
-    throw new Error(
-      `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} failed SHA-256 verification (expected ${ref.sha256.slice(0, 16)}).`
-    );
-  }
-  return {
-    type: 'image',
-    data: bytes.toString('base64'),
-    mimeType: ref.mimeType
-  };
+  throw new Error(
+    `Archived image #${ref.index} of ${ref.handle} is missing at ${firstMissingPath ?? classified.paths[0]}.`
+  );
 }
 export function withoutTrailingStamp(
   content: readonly (TextContent | ImageContent)[]
@@ -804,11 +860,14 @@ export type CarriedMediaItem =
  * their original `(handle, index)` identity unchanged, and newly offloaded inline images receive
  * immutable sequential `(archivingHandle, index)` identities (or stay inline on fallback).
  */
+export const FOLD_ABORTED_MESSAGE = 'Fold aborted.';
+
 export async function prepareCarriedMedia(
   archivingHandle: string,
   items: readonly CarriedMediaItem[],
   dir: string | undefined,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  writeOptions?: ArchiveWriteOptions
 ): Promise<CarriedMediaItem[]> {
   const prepared: CarriedMediaItem[] = [];
   let nextIndex = 1;
@@ -817,13 +876,14 @@ export async function prepareCarriedMedia(
       nextIndex = item.ref.index + 1;
     }
   }
+  if (items.length === 0 && signal?.aborted) throw new Error(FOLD_ABORTED_MESSAGE);
   for (const item of items) {
-    if (signal?.aborted) return prepared;
+    if (signal?.aborted) throw new Error(FOLD_ABORTED_MESSAGE);
     if (item.kind === 'ref') {
       prepared.push({ kind: 'ref', ref: { ...item.ref } });
       continue;
     }
-    const archived = await archiveImage(dir, archivingHandle, nextIndex, item.image);
+    const archived = await archiveImage(dir, archivingHandle, nextIndex, item.image, writeOptions);
     if (archived) {
       nextIndex++;
       prepared.push({ kind: 'ref', ref: archived });

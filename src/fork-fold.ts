@@ -13,7 +13,7 @@ import {
   retiredResponsesCallIds,
   writtenMark
 } from './fold.js';
-import { carriedMediaBlocks, prepareCarriedMedia } from './images.js';
+import { carriedMediaBlocks, FOLD_ABORTED_MESSAGE, prepareCarriedMedia } from './images.js';
 import { estimateTokens, skillPaths, touchedPaths } from './messages.js';
 import { parseStamp, readStamp, stampLabel, withStamp } from './stamps.js';
 import type { EpisodeState } from './state.js';
@@ -179,7 +179,7 @@ export class ForkFolds {
     if (!note) {
       throw new Error('The note is empty. Write what the rest of the task needs from the span.');
     }
-    if (signal?.aborted) throw new Error('Fold aborted.');
+    if (signal?.aborted) throw new Error(FOLD_ABORTED_MESSAGE);
 
     const entries = this.entries(messages);
     // The task is the first entry after the parent's view and the siblings; the fork's own
@@ -194,7 +194,7 @@ export class ForkFolds {
     // Archive covered-note media before mutating any ForkFolds state so errors or cancellation
     // leave omitted/retired/applied/folds untouched.
     const prepared = await prepareCarriedMedia(plan.handle, plan.media, this.archiveDir, signal);
-    if (signal?.aborted) throw new Error('Fold aborted.');
+    if (signal?.aborted) throw new Error(FOLD_ABORTED_MESSAGE);
 
     const ownMessages = messages.slice(this.prefixLength);
     const index = (id: string) => Number(id.slice(this.forkHandle.length + 1));
