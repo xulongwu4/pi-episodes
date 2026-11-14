@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ImageContent, TextContent } from '@earendil-works/pi-ai';
+import { isStampBlock } from './stamps.js';
 
 export type SupportedImageMime = 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
 
@@ -441,19 +442,50 @@ export async function readArchivedImage(ref: ArchivedImage): Promise<ImageConten
   };
 }
 
+function withoutTrailingStamp(
+  content: readonly (TextContent | ImageContent)[]
+): readonly (TextContent | ImageContent)[] {
+  const last = content.at(-1);
+  return last && isStampBlock(last) ? content.slice(0, -1) : content;
+}
+
 /**
- * Whether `content` still preserves `ref` as a reference line (or as its original inline image).
+ * Matches standalone text blocks in `blocks` (1-to-1, in block order) whose `text` equals
+ * `formatImageRef(ref)` for an entry in `archived`. Modified blocks, substring embeds, and blocks
+ * without a manifest entry are left unmatched so callers preserve them as ordinary text.
  */
+export function matchArchivedRefBlocks(
+  blocks: readonly (TextContent | ImageContent)[],
+  archived: readonly ArchivedImage[]
+): Map<number, ArchivedImage> {
+  const matched = new Map<number, ArchivedImage>();
+  if (archived.length === 0) return matched;
+  const remaining = [...archived];
+  for (let i = 0; i < blocks.length && remaining.length > 0; i++) {
+    const block = blocks[i];
+    if (block?.type !== 'text') continue;
+    const hit = remaining.findIndex((ref) => block.text === formatImageRef(ref));
+    if (hit >= 0) {
+      matched.set(i, remaining[hit]!);
+      remaining.splice(hit, 1);
+    }
+  }
+  return matched;
+}
+
+/** Whether `content` holds `ref` as an exact standalone text block. */
 export function holdsImageReference(
   content: readonly (TextContent | ImageContent)[],
   ref: ArchivedImage
 ): boolean {
   const expected = formatImageRef(ref);
-  return content.some((block) => block.type === 'text' && block.text.includes(expected));
+  return withoutTrailingStamp(content).some(
+    (block) => block.type === 'text' && block.text === expected
+  );
 }
 
 export type CarriedMediaInput =
-  | { kind: 'image'; handle?: string | undefined; image: ImageContent }
+  | { kind: 'image'; image: ImageContent }
   | { kind: 'ref'; ref: ArchivedImage };
 
 export type PreparedMediaItem =
@@ -461,21 +493,20 @@ export type PreparedMediaItem =
   | { kind: 'ref'; ref: ArchivedImage; original?: ImageContent };
 
 /**
- * Prepares covered-note media items for a new fold: existing archive references stay unchanged,
- * and inline images are archived under their source note's handle (or `fallbackHandle`) when
- * possible, or kept inline on fallback.
+ * Prepares covered-note media items for `archivingHandle`: existing archive references retain
+ * their original `(handle, index)` identity unchanged, and newly offloaded inline images receive
+ * immutable sequential `(archivingHandle, index)` identities (or stay inline on fallback).
  */
 export async function prepareCarriedMedia(
-  fallbackHandle: string,
+  archivingHandle: string,
   items: readonly CarriedMediaInput[],
   dir: string | undefined
 ): Promise<PreparedMediaItem[]> {
   const prepared: PreparedMediaItem[] = [];
-  const nextIndexByHandle = new Map<string, number>();
+  let nextIndex = 1;
   for (const item of items) {
-    if (item.kind === 'ref') {
-      const current = nextIndexByHandle.get(item.ref.handle) ?? 1;
-      if (item.ref.index >= current) nextIndexByHandle.set(item.ref.handle, item.ref.index + 1);
+    if (item.kind === 'ref' && item.ref.handle === archivingHandle && item.ref.index >= nextIndex) {
+      nextIndex = item.ref.index + 1;
     }
   }
   for (const item of items) {
@@ -483,11 +514,9 @@ export async function prepareCarriedMedia(
       prepared.push({ kind: 'ref', ref: item.ref });
       continue;
     }
-    const targetHandle = item.handle ?? fallbackHandle;
-    const nextIndex = nextIndexByHandle.get(targetHandle) ?? 1;
-    const archived = await archiveImage(dir, targetHandle, nextIndex, item.image);
+    const archived = await archiveImage(dir, archivingHandle, nextIndex, item.image);
     if (archived) {
-      nextIndexByHandle.set(targetHandle, nextIndex + 1);
+      nextIndex++;
       prepared.push({ kind: 'ref', ref: archived, original: item.image });
     } else {
       prepared.push({ kind: 'image', image: item.image });
@@ -505,33 +534,49 @@ export function carriedMediaBlocks(
 }
 
 /**
- * Verifies at `turn_end` that every carried media item survived on the fold result either as its
- * verified archive reference (with intact file on disk when newly archived) or as its original
+ * Verifies at `turn_end` (1-to-1 across standalone blocks) that every carried media item survived
+ * on the fold result either as its verified standalone archive reference block or as its original
  * inline image block.
  */
 export function holdsCarriedMedia(
   content: readonly (TextContent | ImageContent)[],
   items: readonly PreparedMediaItem[]
 ): boolean {
+  const blocks = withoutTrailingStamp(content);
+  const used = new Set<number>();
+  const takeImage = (target: ImageContent): boolean => {
+    for (let i = 0; i < blocks.length; i++) {
+      if (used.has(i)) continue;
+      const block = blocks[i];
+      if (
+        block?.type === 'image' &&
+        block.data === target.data &&
+        block.mimeType === target.mimeType
+      ) {
+        used.add(i);
+        return true;
+      }
+    }
+    return false;
+  };
+  const takeRef = (ref: ArchivedImage): boolean => {
+    const expected = formatImageRef(ref);
+    for (let i = 0; i < blocks.length; i++) {
+      if (used.has(i)) continue;
+      const block = blocks[i];
+      if (block?.type === 'text' && block.text === expected) {
+        used.add(i);
+        return true;
+      }
+    }
+    return false;
+  };
   return items.every((item) => {
-    if (item.kind === 'image') {
-      return content.some(
-        (block) =>
-          block.type === 'image' &&
-          block.data === item.image.data &&
-          block.mimeType === item.image.mimeType
-      );
-    }
+    if (item.kind === 'image') return takeImage(item.image);
     if (item.original !== undefined) {
-      const refOk = verifyArchivedImageSync(item.ref) && holdsImageReference(content, item.ref);
-      const inlineOk = content.some(
-        (block) =>
-          block.type === 'image' &&
-          block.data === item.original!.data &&
-          block.mimeType === item.original!.mimeType
-      );
-      return refOk || inlineOk;
+      if (verifyArchivedImageSync(item.ref) && takeRef(item.ref)) return true;
+      return takeImage(item.original);
     }
-    return holdsImageReference(content, item.ref);
+    return takeRef(item.ref);
   });
 }

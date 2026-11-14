@@ -26,7 +26,12 @@ import {
   type Theme
 } from '@earendil-works/pi-coding-agent';
 import {
+  archiveDir,
   callingFork,
+  FOLD_APPLIED_TYPE,
+  FOLD_DETAILS_KEY,
+  FOLD_STARTED_TYPE,
+  FOLD_UNFOLD_STARTED_TYPE,
   FORK_TOOL,
   type FoldDetails,
   type ForkArchive,
@@ -36,12 +41,17 @@ import {
   threadRecords,
   writeForkArchive
 } from '../src/archive.js';
+import { completeCutShortFolds, planFold, writtenMark } from '../src/fold.js';
 import { ForkFolds } from '../src/fork-fold.js';
 import {
+  archivedImagesOf,
   archiveImage,
   decodeImageBlock,
   formatImageRef,
+  holdsCarriedMedia,
+  holdsImageReference,
   imageDimensions,
+  prepareCarriedMedia,
   readArchivedImage,
   sniffImageMimeType,
   verifyArchivedImageSync
@@ -187,9 +197,10 @@ function script(code: string): AssistantMessage {
 async function createPersistedSession(
   mode: Mode,
   steps: Step[],
-  extensions: ExtensionFactory[] = []
+  extensions: ExtensionFactory[] = [],
+  options: { sessionManager?: SessionManager; dir?: string; keepDir?: boolean } = {}
 ) {
-  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-images-'));
+  const dir = options.dir ?? (await mkdtemp(join(tmpdir(), 'pi-episodes-images-')));
   const faux = fauxProvider();
   const requests: TranscriptContext[] = [];
   const failures: unknown[] = [];
@@ -235,7 +246,7 @@ async function createPersistedSession(
       'fork',
       ...(mode === 'off' ? [] : ['codemode'])
     ],
-    sessionManager: SessionManager.create(dir, join(dir, 'sessions')),
+    sessionManager: options.sessionManager ?? SessionManager.create(dir, join(dir, 'sessions')),
     settingsManager: SettingsManager.inMemory({
       compaction: { enabled: false },
       ...(mode === 'off' ? {} : { codemode: { mode } })
@@ -254,7 +265,9 @@ async function createPersistedSession(
     },
     async cleanup() {
       agentSession.dispose();
-      await rm(dir, { recursive: true, force: true });
+      if (!options.keepDir) {
+        await rm(dir, { recursive: true, force: true });
+      }
     }
   };
 }
@@ -351,7 +364,7 @@ test('covering folds offload covered-note images to disk and recall reads them b
   };
 
   for (const mode of ['off', 'only'] as const) {
-    let ep1 = '';
+    let ep2 = '';
     let archivedPath = '';
     const invoke = (tool: string, args: JsonObject) => () =>
       mode === 'only'
@@ -375,7 +388,7 @@ test('covering folds offload covered-note images to disk and recall reads them b
           );
           assert.deepEqual(inlineImages, [pngBlock], mode);
           const foldText = view.map(text).join('\n');
-          ep1 = /ep-[0-9a-f]{8}/.exec(foldText)![0];
+          assert.match(foldText, /ep-[0-9a-f]{8}/);
           return mode === 'only'
             ? script('text(await tools.bash({ command: "echo step-two" }));')
             : fauxAssistantMessage(fauxToolCall('bash', { command: 'echo step-two' }), {
@@ -395,8 +408,9 @@ test('covering folds offload covered-note images to disk and recall reads them b
             `${mode}: covering fold should offload inline image`
           );
           const latest = text(view.at(-1)!);
+          ep2 = /\[fold (ep-[0-9a-f]{8}):/.exec(latest)![1]!;
           const match = new RegExp(
-            `\\[${ep1} image #1: image/png, 2x3, \\d+ B, sha256 [0-9a-f]{16} — ([^;]+); recall\\(\\{ handle: "${ep1}", image: 1 \\}\\) or read path\\]`
+            `\\[${ep2} image #1: image/png, 2x3, \\d+ B, sha256 [0-9a-f]{16} — ([^;]+); recall\\(\\{ handle: "${ep2}", image: 1 \\}\\) or read path\\]`
           ).exec(latest);
           assert.ok(match, `${mode}: missing offloaded image reference in:\n${latest}`);
           archivedPath = match[1]!;
@@ -412,15 +426,15 @@ test('covering folds offload covered-note images to disk and recall reads them b
           const view = conversation(context);
           const latest = text(view.at(-1)!);
           assert.equal(
-            latest.split(`[${ep1} image #1:`).length - 1,
+            latest.split(`[${ep2} image #1:`).length - 1,
             1,
             `${mode}: reference should appear exactly once on third fold`
           );
           return mode === 'only'
             ? script(
-                `const out = await tools.recall({ handle: ${JSON.stringify(ep1)}, image: 1 }); image(out); text(out.note);`
+                `const out = await tools.recall({ handle: ${JSON.stringify(ep2)}, image: 1 }); image(out); text(out.note);`
               )
-            : fauxAssistantMessage(fauxToolCall('recall', { handle: ep1, image: 1 }), {
+            : fauxAssistantMessage(fauxToolCall('recall', { handle: ep2, image: 1 }), {
                 stopReason: 'toolUse'
               });
         },
@@ -429,7 +443,7 @@ test('covering folds offload covered-note images to disk and recall reads them b
           assert.ok(typeof last.content !== 'string');
           const returnedImages = last.content.filter((b) => b.type === 'image');
           assert.deepEqual(returnedImages, [pngBlock], `${mode}: recall should return exact PNG`);
-          assert.match(text(last), new RegExp(`\\[${ep1} image #1: image/png, 2x3,`));
+          assert.match(text(last), new RegExp(`\\[${ep2} image #1: image/png, 2x3,`));
           return mode === 'only'
             ? script(`image(await tools.read({ path: ${JSON.stringify(archivedPath)} }));`)
             : fauxAssistantMessage(fauxToolCall('read', { path: archivedPath }), {
@@ -534,7 +548,7 @@ test('stripping an offloaded image reference from a covering fold aborts the fol
       (context) => {
         const latest = text(conversation(context).at(-1)!);
         ep2 = /\[fold (ep-[0-9a-f]{8}):/.exec(latest)![1]!;
-        assert.match(latest, new RegExp(`\\[${ep1} image #1: image/png`));
+        assert.match(latest, new RegExp(`\\[${ep2} image #1: image/png`));
         return fauxAssistantMessage(fauxToolCall('unfold', { handle: ep2 }), {
           stopReason: 'toolUse'
         });
@@ -547,7 +561,7 @@ test('stripping an offloaded image reference from a covering fold aborts the fol
         assert.deepEqual(inlineImages, [pngBlock]);
         const joined = view.map(text).join('\n');
         assert.doesNotMatch(joined, /image #1: image\/png/);
-        return fauxAssistantMessage(fauxToolCall('recall', { handle: ep1, image: 1 }), {
+        return fauxAssistantMessage(fauxToolCall('recall', { handle: ep2, image: 1 }), {
           stopReason: 'toolUse'
         });
       },
@@ -555,7 +569,7 @@ test('stripping an offloaded image reference from a covering fold aborts the fol
         const last = conversation(context).at(-1)!;
         assert.equal(last.role, 'toolResult');
         assert.equal(last.isError, true);
-        assert.match(text(last), new RegExp(`No archived image #1 in ${ep1}`));
+        assert.match(text(last), new RegExp(`No archived thread ${ep2}`));
         return fauxAssistantMessage('done');
       }
     ],
@@ -638,7 +652,7 @@ test('ForkFolds offloads covered child-note images with running-fork isolation, 
     assert.equal(cf2Res.content.filter((b) => b.type === 'image').length, 0);
     assert.ok(
       cf2Res.content.some(
-        (b) => b.type === 'text' && b.text.includes(`[${cf1Handle} image #1: image/png, 5x4,`)
+        (b) => b.type === 'text' && b.text.includes(`[${cf2Handle} image #1: image/png, 5x4,`)
       )
     );
     const cf2Msg: Message = {
@@ -661,29 +675,33 @@ test('ForkFolds offloads covered child-note images with running-fork isolation, 
       folds: folds.folds.map((f) => ({ ...f }))
     });
 
-    // Running child sees its offloaded image; outside / sibling fork does not.
-    const outsideHit = await new ThreadIndex(manager, state.forkArchives).findImage(cf1Handle, 1);
-    assert.equal(outsideHit, undefined);
-    const runningHit = await runningFork.run(
+    // Running child sees cf2's offloaded image via cf2's own record; outside / sibling fork does not.
+    const outsideThread = await new ThreadIndex(manager, state.forkArchives).find(cf2Handle);
+    assert.equal(outsideThread, undefined);
+    const runningThread = await runningFork.run(
       { sessionId: manager.getSessionId(), transcript: snapshot },
-      () =>
-        new ThreadIndex(manager, state.forkArchives, callingFork(manager)).findImage(cf1Handle, 1)
+      () => new ThreadIndex(manager, state.forkArchives, callingFork(manager)).find(cf2Handle)
+    );
+    assert.ok(runningThread && runningThread.record.kind === 'fold');
+    const runningHit = runningThread.record.archivedImages?.find(
+      (item) => item.handle === cf2Handle && item.index === 1
     );
     assert.ok(runningHit);
     assert.deepEqual(await readArchivedImage(runningHit), pngBlock);
 
-    // Unfolding cf2 inside the fork retires cf2's offloaded manifest.
+    // Unfolding cf2 inside the fork retires cf2 and its offloaded manifest.
     await unfoldTool.execute('cu1', { handle: cf2Handle });
     const afterUnfold = await runningFork.run(
       { sessionId: manager.getSessionId(), transcript: snapshot },
-      () =>
-        new ThreadIndex(manager, state.forkArchives, callingFork(manager)).findImage(cf1Handle, 1)
+      () => new ThreadIndex(manager, state.forkArchives, callingFork(manager)).find(cf2Handle)
     );
     assert.equal(afterUnfold, undefined);
 
-    // Re-folding and finishing the fork makes the archived image reachable from the parent session.
+    // Re-folding mints a fresh cf3 identity and finishing the fork makes cf3 reachable from parent.
     childMsgs.push(assistant(call('cf3', 'fold', { since: 't11', note: 'child re-covered' })));
     const cf3Res = await foldTool.execute('cf3', { since: 't11', note: 'child re-covered' });
+    const cf3Handle = (cf3Res.details as FoldDetails).handle;
+    assert.notEqual(cf3Handle, cf2Handle);
     const cf3Msg: Message = {
       role: 'toolResult',
       toolCallId: 'cf3',
@@ -712,7 +730,11 @@ test('ForkFolds offloads covered child-note images with running-fork isolation, 
         } satisfies ForkDetails as never
       })
     );
-    const parentHit = await new ThreadIndex(manager, state.forkArchives).findImage(cf1Handle, 1);
+    const parentThread = await new ThreadIndex(manager, state.forkArchives).find(cf3Handle);
+    assert.ok(parentThread && parentThread.record.kind === 'fold');
+    const parentHit = parentThread.record.archivedImages?.find(
+      (item) => item.handle === cf3Handle && item.index === 1
+    );
     assert.ok(parentHit);
     assert.deepEqual(await readArchivedImage(parentHit), pngBlock);
   } finally {
@@ -749,4 +771,758 @@ test('recallRenderers renders image readback call and result summaries', () => {
     .render(120)
     .join('\n');
   assert.match(resText, /image #2 read back, image\/png, 10x20, 99 bytes/);
+});
+
+test('reference matching is exact standalone 1-to-1 across verification, reordering, modification, and manifest stripping', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-ref-match-'));
+  try {
+    const png = makePng(3, 3, [12, 34, 56]);
+    const pngBlock: ImageContent = {
+      type: 'image',
+      data: png.toString('base64'),
+      mimeType: 'image/png'
+    };
+    const prepared = await prepareCarriedMedia(
+      'ep-22222222',
+      [{ kind: 'image', image: pngBlock }],
+      dir
+    );
+    assert.equal(prepared[0]?.kind, 'ref');
+    const ref = prepared[0].ref;
+    assert.equal(ref.handle, 'ep-22222222');
+    const refText = formatImageRef(ref);
+
+    // Substring embeds must NOT satisfy reference verification.
+    assert.equal(holdsImageReference([{ type: 'text', text: `Wrapped: ${refText}` }], ref), false);
+    assert.equal(
+      holdsCarriedMedia([{ type: 'text', text: `Wrapped: ${refText}` }], [{ kind: 'ref', ref }]),
+      false
+    );
+    assert.equal(holdsImageReference([{ type: 'text', text: refText }], ref), true);
+
+    // Reordered standalone ref block BEFORE written.blocks is still carried as media and omitted from note text.
+    const noteBody = '[ep-22222222: folded t1 (2 messages, ~10 tokens)]\n\nClean covering note.';
+    const detailsWithManifest: FoldDetails = {
+      kind: 'fold',
+      handle: 'ep-22222222',
+      since: 't1',
+      firstEntryId: 'x',
+      lastEntryId: 'x',
+      messages: 2,
+      tokens: 10,
+      headline: 'Clean covering note.',
+      keptUserTurns: [],
+      files: [],
+      note: 'Clean covering note.',
+      written: writtenMark([{ type: 'text', text: noteBody }]),
+      archivedImages: [ref]
+    };
+
+    const reorderedSession = session([
+      user('start', 1),
+      assistant(call('f2', 'fold', { since: 't1', note: 'Clean covering note.' })),
+      Object.assign({
+        role: 'toolResult' as const,
+        toolCallId: 'f2',
+        toolName: 'fold',
+        content: [
+          { type: 'text' as const, text: refText },
+          { type: 'text' as const, text: noteBody },
+          { type: 'text' as const, text: '[t2]' }
+        ],
+        details: detailsWithManifest,
+        isError: false,
+        timestamp: 0
+      }),
+      assistant(call('f3', 'fold', { since: 't2', note: 'Third fold' }))
+    ]);
+    const reorderedPlan = planFold(
+      reorderedSession.manager.buildSessionProjection().entries,
+      'f3',
+      2,
+      { latestStamp: 2, applied: new Set(['ep-22222222']) }
+    );
+    assert.equal(reorderedPlan.media.length, 1);
+    assert.equal(reorderedPlan.media[0]?.kind, 'ref');
+    assert.equal(reorderedPlan.covers[0]?.text, 'Clean covering note.');
+
+    // Modified reference text is NOT dropped; it stays verbatim in CoveredNote.text.
+    const modifiedSession = session([
+      user('start', 1),
+      assistant(call('f2', 'fold', { since: 't1', note: 'Clean covering note.' })),
+      Object.assign({
+        role: 'toolResult' as const,
+        toolCallId: 'f2',
+        toolName: 'fold',
+        content: [
+          { type: 'text' as const, text: noteBody },
+          { type: 'text' as const, text: `Edited: ${refText}` },
+          { type: 'text' as const, text: '[t2]' }
+        ],
+        details: detailsWithManifest,
+        isError: false,
+        timestamp: 0
+      }),
+      assistant(call('f3', 'fold', { since: 't2', note: 'Third fold' }))
+    ]);
+    const modifiedPlan = planFold(
+      modifiedSession.manager.buildSessionProjection().entries,
+      'f3',
+      2,
+      { latestStamp: 2, applied: new Set(['ep-22222222']) }
+    );
+    assert.equal(modifiedPlan.media.length, 0);
+    assert.match(modifiedPlan.covers[0]?.text ?? '', /Edited:/);
+
+    // Stripped archivedImages manifest preserves the text block verbatim in CoveredNote.text.
+    const strippedDetails: FoldDetails = { ...detailsWithManifest };
+    delete strippedDetails.archivedImages;
+    const strippedSession = session([
+      user('start', 1),
+      assistant(call('f2', 'fold', { since: 't1', note: 'Clean covering note.' })),
+      Object.assign({
+        role: 'toolResult' as const,
+        toolCallId: 'f2',
+        toolName: 'fold',
+        content: [
+          { type: 'text' as const, text: noteBody },
+          { type: 'text' as const, text: refText },
+          { type: 'text' as const, text: '[t2]' }
+        ],
+        details: strippedDetails,
+        isError: false,
+        timestamp: 0
+      }),
+      assistant(call('f3', 'fold', { since: 't2', note: 'Third fold' }))
+    ]);
+    const strippedPlan = planFold(
+      strippedSession.manager.buildSessionProjection().entries,
+      'f3',
+      2,
+      { latestStamp: 2, applied: new Set(['ep-22222222']) }
+    );
+    assert.equal(strippedPlan.media.length, 0);
+    assert.ok((strippedPlan.covers[0]?.text ?? '').includes(refText));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('offloaded images survive session restart and post-compaction readback', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-restart-compact-'));
+  const pngBlock: ImageContent = {
+    type: 'image',
+    data: makePng(4, 3, [90, 20, 180]).toString('base64'),
+    mimeType: 'image/png'
+  };
+  const attachFirst: ExtensionFactory = (pi) => {
+    pi.on('tool_result', (event) => {
+      const joined = event.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+      if (!/Initial screenshot note/.test(joined) || /Notes of the earlier folds/.test(joined)) {
+        return undefined;
+      }
+      return { content: [...event.content, pngBlock] };
+    });
+  };
+
+  try {
+    let ep2 = '';
+    const first = await createPersistedSession(
+      'off',
+      [
+        () =>
+          fauxAssistantMessage(fauxToolCall('bash', { command: 'echo init' }), {
+            stopReason: 'toolUse'
+          }),
+        () =>
+          fauxAssistantMessage(
+            fauxToolCall('fold', { since: 't2', note: 'Initial screenshot note.' }),
+            { stopReason: 'toolUse' }
+          ),
+        () =>
+          fauxAssistantMessage(fauxToolCall('bash', { command: 'echo next' }), {
+            stopReason: 'toolUse'
+          }),
+        () =>
+          fauxAssistantMessage(
+            fauxToolCall('fold', { since: 't3', note: 'Covering note before restart.' }),
+            { stopReason: 'toolUse' }
+          ),
+        (context) => {
+          const latest = text(conversation(context).at(-1)!);
+          ep2 = /\[fold (ep-[0-9a-f]{8}):/.exec(latest)![1]!;
+          return fauxAssistantMessage('done before restart');
+        }
+      ],
+      [attachFirst],
+      { dir, keepDir: true }
+    );
+    await first.run('start');
+    const sessionFile = first.session.sessionManager.getSessionFile()!;
+    assert.ok(sessionFile);
+    await first.cleanup();
+
+    // Reopen persisted session from disk, verify recall across restart, then compact and recall again.
+    const reopenedManager = SessionManager.open(sessionFile);
+    const second = await createPersistedSession(
+      'off',
+      [
+        () =>
+          fauxAssistantMessage(fauxToolCall('recall', { handle: ep2, image: 1 }), {
+            stopReason: 'toolUse'
+          }),
+        (context) => {
+          const last = conversation(context).at(-1)!;
+          assert.ok(typeof last.content !== 'string');
+          assert.deepEqual(
+            last.content.filter((b) => b.type === 'image'),
+            [pngBlock],
+            'recall after restart'
+          );
+          const branch = reopenedManager.getBranch();
+          reopenedManager.appendCompaction('Compacted summary after ep2.', branch.at(-1)!.id, 500);
+          return fauxAssistantMessage(fauxToolCall('recall', { handle: ep2, image: 1 }), {
+            stopReason: 'toolUse'
+          });
+        },
+        (context) => {
+          const last = conversation(context).at(-1)!;
+          assert.ok(typeof last.content !== 'string');
+          assert.deepEqual(
+            last.content.filter((b) => b.type === 'image'),
+            [pngBlock],
+            'recall after compaction'
+          );
+          return fauxAssistantMessage('done after restart + compaction');
+        }
+      ],
+      [],
+      { dir, keepDir: true, sessionManager: reopenedManager }
+    );
+    await second.run('continue');
+    await second.cleanup();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('valid images fall back to inline ImageContent in inMemory sessions and on archive storage failure', async () => {
+  const pngBlock: ImageContent = {
+    type: 'image',
+    data: makePng(2, 2, [40, 120, 200]).toString('base64'),
+    mimeType: 'image/png'
+  };
+  const attachFirst: ExtensionFactory = (pi) => {
+    pi.on('tool_result', (event) => {
+      const joined = event.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+      if (!/First valid image note/.test(joined) || /Notes of the earlier folds/.test(joined)) {
+        return undefined;
+      }
+      return { content: [...event.content, pngBlock] };
+    });
+  };
+
+  // 1) SessionManager.inMemory() -> archiveDir is undefined -> valid PNG stays inline.
+  const memHarness = await createPersistedSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo mem1' }), {
+          stopReason: 'toolUse'
+        }),
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', { since: 't2', note: 'First valid image note.' }),
+          { stopReason: 'toolUse' }
+        ),
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo mem2' }), {
+          stopReason: 'toolUse'
+        }),
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', { since: 't3', note: 'Covering note in memory.' }),
+          { stopReason: 'toolUse' }
+        ),
+      (context) => {
+        const view = conversation(context);
+        const inlineImages = view.flatMap((msg) =>
+          typeof msg.content === 'string' ? [] : msg.content.filter((b) => b.type === 'image')
+        );
+        assert.deepEqual(inlineImages, [pngBlock]);
+        return fauxAssistantMessage('done mem');
+      }
+    ],
+    [attachFirst],
+    { sessionManager: SessionManager.inMemory() }
+  );
+  try {
+    await memHarness.run('go');
+    const records = threadRecords(memHarness.session.sessionManager.getBranch());
+    const covering = records.at(-1);
+    assert.ok(covering && covering.kind === 'fold');
+    assert.equal(covering.carriedImages, 1);
+    assert.equal(covering.archivedImages, undefined);
+  } finally {
+    await memHarness.cleanup();
+  }
+
+  // 2) Storage failure: occupy <session>.episodes with a regular file so mkdir fails.
+  const diskFailHarness = await createPersistedSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo d1' }), {
+          stopReason: 'toolUse'
+        }),
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', { since: 't2', note: 'First valid image note.' }),
+          { stopReason: 'toolUse' }
+        ),
+      async () => {
+        const epDir = archiveDir(diskFailHarness.session.sessionManager)!;
+        await writeFile(epDir, 'not-a-directory');
+        return fauxAssistantMessage(fauxToolCall('bash', { command: 'echo d2' }), {
+          stopReason: 'toolUse'
+        });
+      },
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', { since: 't3', note: 'Covering note on storage error.' }),
+          { stopReason: 'toolUse' }
+        ),
+      (context) => {
+        const view = conversation(context);
+        const inlineImages = view.flatMap((msg) =>
+          typeof msg.content === 'string' ? [] : msg.content.filter((b) => b.type === 'image')
+        );
+        assert.deepEqual(inlineImages, [pngBlock]);
+        return fauxAssistantMessage('done disk fail');
+      }
+    ],
+    [attachFirst]
+  );
+  try {
+    await diskFailHarness.run('go');
+    const records = threadRecords(diskFailHarness.session.sessionManager.getBranch());
+    const covering = records.at(-1);
+    assert.ok(covering && covering.kind === 'fold');
+    assert.equal(covering.carriedImages, 1);
+    assert.equal(covering.archivedImages, undefined);
+  } finally {
+    await diskFailHarness.cleanup();
+  }
+});
+
+test('codemode unfold drops offloaded reference blocks while preserving script-owned images and script output', async () => {
+  const coveredPng: ImageContent = {
+    type: 'image',
+    data: makePng(2, 3, [200, 10, 10]).toString('base64'),
+    mimeType: 'image/png'
+  };
+  const scriptOwnPng: ImageContent = {
+    type: 'image',
+    data: makePng(4, 2, [10, 200, 30]).toString('base64'),
+    mimeType: 'image/png'
+  };
+
+  let ep2 = '';
+  const harness = await createPersistedSession('only', [
+    () => script('text(await tools.bash({ command: "echo step1" }));'),
+    () =>
+      script(
+        `image(${JSON.stringify(coveredPng)}); text(await tools.fold({ since: "t2", note: "Covered screenshot note." }));`
+      ),
+    () => script('text(await tools.bash({ command: "echo step2" }));'),
+    // Script emits its own image AND text AND folds from t3 (offloading coveredPng to [ep2 image #1]).
+    () =>
+      script(
+        `image(${JSON.stringify(scriptOwnPng)}); text("script-owned-banner"); text(await tools.fold({ since: "t3", note: "Codemode covering note." }));`
+      ),
+    (context) => {
+      const last = conversation(context).at(-1)!;
+      assert.ok(typeof last.content !== 'string');
+      assert.deepEqual(
+        last.content.filter((b) => b.type === 'image'),
+        [scriptOwnPng],
+        'only scriptOwnPng stays inline after covering fold'
+      );
+      const latest = text(last);
+      ep2 = /\[fold (ep-[0-9a-f]{8}):/.exec(latest)![1]!;
+      assert.match(latest, new RegExp(`\\[${ep2} image #1: image/png`));
+      return script(`text(await tools.unfold({ handle: ${JSON.stringify(ep2)} }));`);
+    },
+    (context) => {
+      const view = conversation(context);
+      const joined = view.map(text).join('\n');
+      assert.match(joined, /script-owned-banner/);
+      assert.match(joined, new RegExp(`\\[unfolded ${ep2}\\]`));
+      assert.doesNotMatch(joined, new RegExp(`\\[${ep2} image #1:`));
+      const inlineImages = view.flatMap((msg) =>
+        typeof msg.content === 'string' ? [] : msg.content.filter((b) => b.type === 'image')
+      );
+      assert.deepEqual(inlineImages, [coveredPng, scriptOwnPng]);
+      return fauxAssistantMessage('done codemode unfold');
+    }
+  ]);
+  try {
+    await harness.run('start');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('multiple images, branch/unfold/refold immutable identities, interrupted recovery, and ForkFolds cancellation safety', async () => {
+  const pngA: ImageContent = {
+    type: 'image',
+    data: makePng(2, 2, [250, 0, 0]).toString('base64'),
+    mimeType: 'image/png'
+  };
+  const pngB: ImageContent = {
+    type: 'image',
+    data: makePng(3, 2, [0, 250, 0]).toString('base64'),
+    mimeType: 'image/png'
+  };
+  const pngC: ImageContent = {
+    type: 'image',
+    data: makePng(2, 4, [0, 0, 250]).toString('base64'),
+    mimeType: 'image/png'
+  };
+
+  // 1-to-1 duplicate check in holdsCarriedMedia: two identical items require two distinct blocks.
+  const dupDir = await mkdtemp(join(tmpdir(), 'pi-episodes-dup-'));
+  try {
+    const dupPrepared = await prepareCarriedMedia(
+      'ep-dup00001',
+      [
+        { kind: 'image', image: pngA },
+        { kind: 'image', image: pngA }
+      ],
+      dupDir
+    );
+    assert.equal(dupPrepared.length, 2);
+    assert.equal(dupPrepared[0]?.kind, 'ref');
+    assert.equal(dupPrepared[1]?.kind, 'ref');
+    assert.equal(dupPrepared[0].ref.index, 1);
+    assert.equal(dupPrepared[1].ref.index, 2);
+    assert.equal(
+      holdsCarriedMedia([{ type: 'text', text: formatImageRef(dupPrepared[0].ref) }], dupPrepared),
+      false
+    );
+    assert.equal(
+      holdsCarriedMedia(
+        [
+          { type: 'text', text: formatImageRef(dupPrepared[0].ref) },
+          { type: 'text', text: formatImageRef(dupPrepared[1].ref) }
+        ],
+        dupPrepared
+      ),
+      true
+    );
+
+    // ForkFolds cancellation safety: aborted signal leaves omitted/retired/applied/folds untouched.
+    const { manager } = session([
+      user('parent', 1),
+      assistant(call('fk_abort', FORK_TOOL, { task: 'child' }))
+    ]);
+    const st = new EpisodeState();
+    st.nextStamp = 10;
+    const proj = manager.buildSessionProjection();
+    const childMsgs = [...proj.messages, result('fk_abort', FORK_TOOL, 'Task: child', 2)];
+    const forkFolds = new ForkFolds({
+      forkHandle: 'fk-abort001',
+      state: st,
+      parentEntries: proj.entries,
+      prefixLength: proj.messages.length,
+      siblings: 0,
+      archiveDir: dupDir
+    });
+    const fTool = forkFolds.tool(
+      { name: 'fold', description: '', parameters: {} as never },
+      () => childMsgs
+    );
+    childMsgs.push(assistant(call('b1', 'bash', { command: 'echo x' })));
+    const r1 = result('b1', 'bash', 'x');
+    forkFolds.stamp(r1);
+    childMsgs.push(r1);
+    const ac = new AbortController();
+    ac.abort();
+    await assert.rejects(
+      () => fTool.execute('cf_aborted', { since: 't10', note: 'aborted note' }, ac.signal),
+      /Fold aborted/
+    );
+    assert.equal(forkFolds.folds.length, 0);
+    assert.equal(forkFolds.view(childMsgs).length, childMsgs.length);
+
+    // Also verify cancellation AFTER async prepareCarriedMedia completes leaves ForkFolds untouched.
+    childMsgs.push(assistant(call('cf_ok1', 'fold', { since: 't10', note: 'first ok' })));
+    const ok1 = await fTool.execute('cf_ok1', { since: 't10', note: 'first ok' });
+    const ok1Msg: Message = {
+      role: 'toolResult',
+      toolCallId: 'cf_ok1',
+      toolName: 'fold',
+      content: [{ type: 'text', text: (ok1.content[0] as TextContent).text }, pngA],
+      details: ok1.details,
+      isError: false,
+      timestamp: 0
+    };
+    forkFolds.stamp(ok1Msg);
+    childMsgs.push(ok1Msg);
+    childMsgs.push(assistant(call('b2', 'bash', { command: 'echo y' })));
+    const r2 = result('b2', 'bash', 'y');
+    forkFolds.stamp(r2);
+    childMsgs.push(r2);
+    childMsgs.push(assistant(call('cf_mid_abort', 'fold', { since: 't11', note: 'mid abort' })));
+    const viewLenBeforeMidAbort = forkFolds.view(childMsgs).length;
+    let abortChecks = 0;
+    const midAbortSignal = {
+      get aborted() {
+        abortChecks++;
+        return abortChecks >= 2;
+      }
+    } as AbortSignal;
+    await assert.rejects(
+      () => fTool.execute('cf_mid_abort', { since: 't11', note: 'mid abort' }, midAbortSignal),
+      /Fold aborted/
+    );
+    assert.equal(abortChecks, 2);
+    assert.equal(forkFolds.folds.length, 1);
+    assert.equal(forkFolds.view(childMsgs).length, viewLenBeforeMidAbort);
+
+    // Interrupted covering fold + interrupted codemode unfold recovery via completeCutShortFolds.
+    const ref1 = dupPrepared[0].ref;
+    const sCut = session([
+      user('u1', 1),
+      assistant(call('b_cut', 'bash', { command: 'echo cut' })),
+      result('b_cut', 'bash', 'cut', 2)
+    ]);
+    const noteContent: (TextContent | ImageContent)[] = [
+      {
+        type: 'text',
+        text: 'script-banner\n[fold ep-cut00001: t2 (2 messages, ~10 tokens)]\n\nCut note.'
+      },
+      pngB,
+      { type: 'text', text: formatImageRef(ref1) },
+      { type: 'text', text: '[t3]' }
+    ];
+    const cutRecord: FoldDetails = {
+      kind: 'fold',
+      handle: 'ep-cut00001',
+      since: 't2',
+      firstEntryId: sCut.ids[1]!,
+      lastEntryId: sCut.ids[2]!,
+      messages: 2,
+      tokens: 10,
+      headline: 'Cut note.',
+      keptUserTurns: [],
+      files: [],
+      note: 'Cut note.',
+      renderedNote: '[fold ep-cut00001: t2 (2 messages, ~10 tokens)]\n\nCut note.',
+      written: writtenMark(noteContent.slice(0, 2)),
+      archivedImages: [ref1]
+    };
+    sCut.manager.appendMessage(assistant(call('cm_cut', 'codemode', { code: 'fold()' })));
+    const noteId = sCut.manager.appendMessage(
+      Object.assign({
+        role: 'toolResult' as const,
+        toolCallId: 'cm_cut',
+        toolName: 'codemode',
+        content: noteContent,
+        details: { [FOLD_DETAILS_KEY]: cutRecord },
+        isError: false,
+        timestamp: 0
+      })
+    );
+    const foldEdits = [
+      { type: 'context_edit' as const, targetId: sCut.ids[1]!, replacement: null },
+      { type: 'context_edit' as const, targetId: sCut.ids[2]!, replacement: null }
+    ];
+    sCut.manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: 'ep-cut00001', edits: foldEdits });
+    sCut.manager.appendContextEdit(foldEdits[0]!.targetId, null);
+    // Crash before second edit & FOLD_APPLIED_TYPE: thread is not reachable yet.
+    assert.equal(await new ThreadIndex(sCut.manager, new Map()).find('ep-cut00001'), undefined);
+    for (const draft of completeCutShortFolds(sCut.manager.getBranch())) {
+      if (draft.type === 'context_edit') {
+        sCut.manager.appendContextEdit(draft.targetId, draft.replacement);
+      } else {
+        sCut.manager.appendCustomEntry(draft.customType, draft.data);
+      }
+    }
+    const recovered = await new ThreadIndex(sCut.manager, new Map()).find('ep-cut00001');
+    assert.ok(recovered && recovered.record.kind === 'fold');
+    assert.deepEqual(
+      archivedImagesOf(recovered.record.archivedImages).map((r) => r.sha256),
+      [ref1.sha256]
+    );
+
+    // Now start an unfold of ep-cut00001 that crashes when another boundary edit touches noteId:
+    sCut.manager.appendCustomEntry(FOLD_UNFOLD_STARTED_TYPE, {
+      handle: 'ep-cut00001',
+      edits: [
+        {
+          type: 'context_edit' as const,
+          targetId: noteId,
+          replacement: { content: [{ type: 'text' as const, text: 'stale' }] }
+        }
+      ]
+    });
+    sCut.manager.appendContextEdit(noteId, { content: noteContent });
+    for (const draft of completeCutShortFolds(sCut.manager.getBranch())) {
+      if (draft.type === 'context_edit') {
+        sCut.manager.appendContextEdit(draft.targetId, draft.replacement);
+      } else {
+        sCut.manager.appendCustomEntry(draft.customType, draft.data);
+      }
+    }
+    const afterUnfoldView = sCut.manager.buildSessionProjection().messages;
+    const unfoldedScriptMsg = afterUnfoldView.at(-1)!;
+    assert.equal(unfoldedScriptMsg.role, 'toolResult');
+    assert.deepEqual(
+      unfoldedScriptMsg.content.filter((b) => b.type === 'image'),
+      [pngB]
+    );
+    assert.doesNotMatch(text(unfoldedScriptMsg), /ep-dup00001 image #1/);
+    assert.match(text(unfoldedScriptMsg), /\[unfolded ep-cut00001\]/);
+  } finally {
+    await rm(dupDir, { recursive: true, force: true });
+  }
+
+  // Multiple images (#1, #2) + branch / unfold / refold immutable (handle, index) identities.
+  const attachImages: ExtensionFactory = (pi) => {
+    pi.on('tool_result', (event) => {
+      const joined = event.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+      if (/Note with image A/.test(joined) && !/Notes of the earlier folds/.test(joined)) {
+        return { content: [...event.content, pngA] };
+      }
+      if (/Note with image B/.test(joined) && !/Notes of the earlier folds/.test(joined)) {
+        return { content: [...event.content, pngB] };
+      }
+      if (
+        /Replacement note with image C/.test(joined) &&
+        !/Notes of the earlier folds/.test(joined)
+      ) {
+        return { content: [...event.content, pngC] };
+      }
+      return undefined;
+    });
+  };
+
+  let epCoverAB = '';
+  let epCoverBC = '';
+  let branchBeforeUnfold = '';
+  const branchHarness = await createPersistedSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo a' }), {
+          stopReason: 'toolUse'
+        }),
+      () =>
+        fauxAssistantMessage(fauxToolCall('fold', { since: 't2', note: 'Note with image A.' }), {
+          stopReason: 'toolUse'
+        }),
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo b' }), {
+          stopReason: 'toolUse'
+        }),
+      () =>
+        fauxAssistantMessage(fauxToolCall('fold', { since: 't4', note: 'Note with image B.' }), {
+          stopReason: 'toolUse'
+        }),
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo c' }), {
+          stopReason: 'toolUse'
+        }),
+      // Cover both Note A and Note B -> mints (epCoverAB, 1) = pngA and (epCoverAB, 2) = pngB.
+      () =>
+        fauxAssistantMessage(fauxToolCall('fold', { since: 't3', note: 'Covered A and B.' }), {
+          stopReason: 'toolUse'
+        }),
+      (context) => {
+        const latest = text(conversation(context).at(-1)!);
+        epCoverAB = /\[fold (ep-[0-9a-f]{8}):/.exec(latest)![1]!;
+        assert.match(latest, new RegExp(`\\[${epCoverAB} image #1:`));
+        assert.match(latest, new RegExp(`\\[${epCoverAB} image #2:`));
+        branchBeforeUnfold = branchHarness.session.sessionManager.getLeafId()!;
+        return fauxAssistantMessage(fauxToolCall('unfold', { handle: epCoverAB }), {
+          stopReason: 'toolUse'
+        });
+      },
+      // After unfolding epCoverAB, create a new fold with image C and cover from Note B onward -> mints epCoverBC.
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo c2' }), {
+          stopReason: 'toolUse'
+        }),
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', { since: 't8', note: 'Replacement note with image C.' }),
+          { stopReason: 'toolUse' }
+        ),
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', { since: 't5', note: 'Covered B and C on unfolded branch.' }),
+          { stopReason: 'toolUse' }
+        ),
+      (context) => {
+        const latest = text(conversation(context).at(-1)!);
+        epCoverBC = /\[fold (ep-[0-9a-f]{8}):/.exec(latest)![1]!;
+        assert.notEqual(epCoverBC, epCoverAB);
+        return fauxAssistantMessage(fauxToolCall('recall', { handle: epCoverBC, image: 2 }), {
+          stopReason: 'toolUse'
+        });
+      },
+      (context) => {
+        const last = conversation(context).at(-1)!;
+        assert.ok(typeof last.content !== 'string');
+        assert.deepEqual(
+          last.content.filter((b) => b.type === 'image'),
+          [pngC]
+        );
+        // Switch back to the branch BEFORE unfold: (epCoverAB, 1)=pngA and (epCoverAB, 2)=pngB are intact,
+        // AND (epCoverBC, 2)=pngC on the other branch still resolves without collision!
+        branchHarness.session.sessionManager.branch(branchBeforeUnfold);
+        return fauxAssistantMessage(fauxToolCall('recall', { handle: epCoverAB, image: 1 }), {
+          stopReason: 'toolUse'
+        });
+      },
+      (context) => {
+        const last = conversation(context).at(-1)!;
+        assert.ok(typeof last.content !== 'string');
+        assert.deepEqual(
+          last.content.filter((b) => b.type === 'image'),
+          [pngA]
+        );
+        return fauxAssistantMessage(fauxToolCall('recall', { handle: epCoverAB, image: 2 }), {
+          stopReason: 'toolUse'
+        });
+      },
+      (context) => {
+        const last = conversation(context).at(-1)!;
+        assert.ok(typeof last.content !== 'string');
+        assert.deepEqual(
+          last.content.filter((b) => b.type === 'image'),
+          [pngB]
+        );
+        return fauxAssistantMessage(fauxToolCall('recall', { handle: epCoverBC, image: 2 }), {
+          stopReason: 'toolUse'
+        });
+      },
+      (context) => {
+        const last = conversation(context).at(-1)!;
+        assert.ok(typeof last.content !== 'string');
+        assert.deepEqual(
+          last.content.filter((b) => b.type === 'image'),
+          [pngC]
+        );
+        return fauxAssistantMessage('done branch identity');
+      }
+    ],
+    [attachImages]
+  );
+  try {
+    await branchHarness.run('start');
+  } finally {
+    await branchHarness.cleanup();
+  }
 });

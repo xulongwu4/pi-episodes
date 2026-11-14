@@ -78,10 +78,11 @@ cheap; quote the query to match exact text. Query for the specific thing you nee
 match's line is not enough, recall with its handle and turn and no query returns that turn
 verbatim, and a range such as "t14-t16" returns those turns; what is long is cut, with the
 rest in a file. Images on covered notes are offloaded to [ep-... image #k] markers; recall
-with handle and image returns the original image. Read back the turns you need, not a whole
-span: that brings back what the fold removed. Run one recall before retrying something a note
-editing a file a note points at, before acting on an error string or symbol you have seen
-before, and before saying "we already checked that". ask resumes an archived thread to
+with handle and image reads that archived image back. Read back the turns you need, not a
+whole span: that brings back what the fold removed. Run one recall before retrying something
+a note says was rejected, before editing a file a note points at, before acting on an error
+string or symbol you have seen before, and before saying "we already checked that". ask
+resumes an archived thread to
 answer one judgment question, such as why something was done; it re-reads the whole thread,
 usually uncached, so prefer recall when a search will do. When you folded too early and
 still need the whole span verbatim in context, unfold("ep-...") restores a post-compaction

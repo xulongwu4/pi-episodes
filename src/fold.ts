@@ -34,8 +34,8 @@ import {
   archivedImagesOf,
   type CarriedMediaInput,
   carriedMediaBlocks,
-  formatImageRef,
   holdsCarriedMedia,
+  matchArchivedRefBlocks,
   prepareCarriedMedia
 } from './images.js';
 import { estimateTokens, readOnlyPaths, skillPaths, textOf, touchedPaths } from './messages.js';
@@ -200,37 +200,18 @@ function keptUnder(text: string): CoveredNote[] | undefined {
  * So nothing is taken for kept notes by its form, wherever it stands, and once anything was
  * changed, moved or cut, the changed text is in `own`, whole.
  */
-function matchedArchivedRefIndices(
-  blocks: readonly (TextContent | ImageContent)[],
-  fromIndex: number,
-  archived: readonly ArchivedImage[]
-): Set<number> {
-  const matched = new Set<number>();
-  if (archived.length === 0) return matched;
-  const remaining = [...archived];
-  for (let i = Math.max(0, fromIndex); i < blocks.length && remaining.length > 0; i++) {
-    const block = blocks[i];
-    if (block?.type !== 'text') continue;
-    const hit = remaining.findIndex((ref) => block.text === formatImageRef(ref));
-    if (hit >= 0) {
-      matched.add(i);
-      remaining.splice(hit, 1);
-    }
-  }
-  return matched;
-}
-
 function standing(
   content: readonly (TextContent | ImageContent)[],
   written: FoldDetails['written'],
   archived: readonly ArchivedImage[] = []
 ): { own: string; kept: CoveredNote[]; added?: string } {
-  const blocks = content.filter(
+  const rawBlocks = content.filter(
     (block, index) =>
       !(index === content.length - 1 && block.type === 'text' && isStampBlock(block))
   );
+  const refMap = matchArchivedRefBlocks(rawBlocks, archived);
+  const blocks = refMap.size === 0 ? rawBlocks : rawBlocks.filter((_, index) => !refMap.has(index));
   const count = typeof written?.blocks === 'number' ? written.blocks : 0;
-  const refIndices = matchedArchivedRefIndices(blocks, count, archived);
   const holder = blocks[count - 1];
   const at =
     holder?.type === 'text' && typeof written?.kept?.chars === 'number'
@@ -246,8 +227,8 @@ function standing(
   const texts = (from: number, to?: number) =>
     blocks
       .slice(from, to)
-      .flatMap((block, offset) =>
-        block.type !== 'text' || refIndices.has(from + offset)
+      .flatMap((block) =>
+        block.type !== 'text'
           ? []
           : [block === holder && kept.length > 0 ? block.text.slice(0, at) : block.text]
       )
@@ -357,22 +338,16 @@ export function coveredMedia(
       (block, index) =>
         !(index === shown.content.length - 1 && block.type === 'text' && isStampBlock(block))
     );
-    const count = typeof fold?.written?.blocks === 'number' ? fold.written.blocks : 0;
-    const remaining = [...archivedImagesOf(fold?.archivedImages)];
+    const refMap = matchArchivedRefBlocks(blocks, archivedImagesOf(fold?.archivedImages));
     const items: CarriedMediaInput[] = [];
     for (let i = 0; i < blocks.length; i++) {
       const block = blocks[i]!;
       if (block.type === 'image') {
-        items.push({ kind: 'image', handle: fold?.handle, image: block });
+        items.push({ kind: 'image', image: block });
         continue;
       }
-      if (i >= count && remaining.length > 0) {
-        const hit = remaining.findIndex((ref) => block.text === formatImageRef(ref));
-        if (hit >= 0) {
-          items.push({ kind: 'ref', ref: remaining[hit]! });
-          remaining.splice(hit, 1);
-        }
-      }
+      const ref = refMap.get(i);
+      if (ref) items.push({ kind: 'ref', ref });
     }
     return items;
   });
@@ -1447,42 +1422,25 @@ function unfoldedNoteContent(
   const archivedRefs = archivedImagesOf(details.archivedImages);
   let body = rawBody;
   if (carriedCount > 0 || archivedRefs.length > 0) {
-    const dropIndices = new Set<number>();
+    const dropIndices = new Set<number>(matchArchivedRefBlocks(rawBody, archivedRefs).keys());
     let droppedImages = 0;
-    const remainingRefs = [...archivedRefs];
-    if (details.written?.blocks !== undefined) {
-      for (
-        let i = details.written.blocks;
-        i < rawBody.length && (droppedImages < carriedCount || remainingRefs.length > 0);
-        i++
-      ) {
-        const block = rawBody[i];
-        if (block?.type === 'image' && droppedImages < carriedCount) {
-          dropIndices.add(i);
-          droppedImages++;
-        } else if (block?.type === 'text' && remainingRefs.length > 0) {
-          const hit = remainingRefs.findIndex((ref) => block.text === formatImageRef(ref));
-          if (hit >= 0) {
+    if (carriedCount > 0) {
+      if (details.written?.blocks !== undefined) {
+        for (
+          let i = details.written.blocks;
+          i < rawBody.length && droppedImages < carriedCount;
+          i++
+        ) {
+          if (rawBody[i]?.type === 'image') {
             dropIndices.add(i);
-            remainingRefs.splice(hit, 1);
+            droppedImages++;
           }
         }
-      }
-    } else {
-      for (
-        let i = rawBody.length - 1;
-        i >= 0 && (droppedImages < carriedCount || remainingRefs.length > 0);
-        i--
-      ) {
-        const block = rawBody[i];
-        if (block?.type === 'image' && droppedImages < carriedCount) {
-          dropIndices.add(i);
-          droppedImages++;
-        } else if (block?.type === 'text' && remainingRefs.length > 0) {
-          const hit = remainingRefs.findIndex((ref) => block.text === formatImageRef(ref));
-          if (hit >= 0) {
+      } else {
+        for (let i = rawBody.length - 1; i >= 0 && droppedImages < carriedCount; i--) {
+          if (rawBody[i]?.type === 'image') {
             dropIndices.add(i);
-            remainingRefs.splice(hit, 1);
+            droppedImages++;
           }
         }
       }

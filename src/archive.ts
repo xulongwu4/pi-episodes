@@ -492,53 +492,6 @@ export class ThreadIndex {
     return compaction ? this.compactionThread(compactionRecord(compaction)) : undefined;
   }
 
-  /** Offloaded image `#index` of `handle` standing on any non-unfolded covering fold. */
-  async findImage(handle: string, index: number): Promise<ArchivedImage | undefined> {
-    const currentBranch = this.sessions.getBranch();
-    const activeOnBranch = appliedFolds(currentBranch);
-    const unfolded = this.unfoldedHandles(currentBranch, activeOnBranch);
-    if (unfolded.has(handle)) return undefined;
-
-    const matchIn = (records: readonly FoldDetails[]): ArchivedImage | undefined => {
-      for (const record of records) {
-        const hit = record.archivedImages?.find(
-          (item) => item.handle === handle && item.index === index
-        );
-        if (hit) return hit;
-      }
-      return undefined;
-    };
-
-    const branchHit = matchIn(foldRecords(currentBranch, activeOnBranch));
-    if (branchHit) return branchHit;
-
-    if (this.running) {
-      const ownRecords = (this.running.folds ?? [])
-        .filter((fold) => !isNestedFoldUnfoldedAt(fold, this.running!.messages.length))
-        .map((fold) => fold.record);
-      const ownHit = matchIn(ownRecords);
-      if (ownHit) return ownHit;
-    }
-
-    const entries = this.sessions.getEntries();
-    for (const fork of forkRecords(entries)) {
-      const archive = this.memory.get(fork.handle) ?? (await readArchive(fork.archive));
-      if (!archive) continue;
-      const forkHit = matchIn(
-        (archive.folds ?? [])
-          .filter((fold) => !isNestedFoldUnfoldedAt(fold, archive.messages.length))
-          .map((fold) => fold.record)
-      );
-      if (forkHit) return forkHit;
-    }
-
-    return matchIn(
-      foldRecords(entries, everAppliedFolds(entries)).filter(
-        (record) => !unfolded.has(record.handle)
-      )
-    );
-  }
-
   private unfoldedHandles(
     currentBranch: readonly SessionEntry[],
     activeOnBranch: ReadonlySet<string>

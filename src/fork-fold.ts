@@ -113,10 +113,10 @@ export class ForkFolds {
       ...declaration,
       label: declaration.name,
       executionMode: 'sequential',
-      execute: async (toolCallId, args) =>
+      execute: async (toolCallId, args, signal) =>
         declaration.name === UNFOLD_TOOL
           ? this.unfold(args, messages())
-          : this.fold(toolCallId, args, messages())
+          : this.fold(toolCallId, args, messages(), signal)
     };
   }
 
@@ -162,7 +162,8 @@ export class ForkFolds {
   private async fold(
     toolCallId: string,
     args: unknown,
-    messages: readonly AgentMessage[]
+    messages: readonly AgentMessage[],
+    signal?: AbortSignal
   ): Promise<AgentToolResult<FoldDetails>> {
     const params = args as { since?: unknown; until?: unknown; note?: unknown };
     const since = typeof params.since === 'string' ? parseStamp(params.since) : undefined;
@@ -178,6 +179,7 @@ export class ForkFolds {
     if (!note) {
       throw new Error('The note is empty. Write what the rest of the task needs from the span.');
     }
+    if (signal?.aborted) throw new Error('Fold aborted.');
 
     const entries = this.entries(messages);
     // The task is the first entry after the parent's view and the siblings; the fork's own
@@ -188,6 +190,11 @@ export class ForkFolds {
       applied: this.applied,
       ...(last === undefined ? {} : { until: last })
     });
+
+    // Archive covered-note media before mutating any ForkFolds state so errors or cancellation
+    // leave omitted/retired/applied/folds untouched.
+    const prepared = await prepareCarriedMedia(plan.handle, plan.media, this.archiveDir);
+    if (signal?.aborted) throw new Error('Fold aborted.');
 
     const ownMessages = messages.slice(this.prefixLength);
     const index = (id: string) => Number(id.slice(this.forkHandle.length + 1));
@@ -265,7 +272,6 @@ export class ForkFolds {
       }
     ];
     record.written = writtenMark(content, carried);
-    const prepared = await prepareCarriedMedia(plan.handle, plan.media, this.archiveDir);
     const mediaBlocks = carriedMediaBlocks(prepared);
     const archivedManifest = prepared.flatMap((item) => (item.kind === 'ref' ? [item.ref] : []));
     const carriedCount = prepared.filter((item) => item.kind === 'image').length;

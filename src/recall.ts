@@ -5,7 +5,7 @@ import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { archiveDir, callingFork, type Thread, ThreadIndex } from './archive.js';
-import { readArchivedImage } from './images.js';
+import { archivedImagesOf, readArchivedImage } from './images.js';
 import { messageText } from './messages.js';
 import { withFullOutput } from './output.js';
 import { excerpt, RecallIndex, type RecallMatch, type SearchableThread } from './search.js';
@@ -233,7 +233,12 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
       if (askedImage !== undefined) {
         const thread = await index.find(params.handle!);
         if (!thread) throw new Error(`No archived thread ${params.handle}.`);
-        const archived = await index.findImage(thread.handle, askedImage);
+        const archived =
+          thread.record.kind === 'fold'
+            ? archivedImagesOf(thread.record.archivedImages).find(
+                (item) => item.handle === thread.handle && item.index === askedImage
+              )
+            : undefined;
         if (!archived) {
           throw new Error(
             `No archived image #${askedImage} in ${thread.handle} (${thread.label}).`
