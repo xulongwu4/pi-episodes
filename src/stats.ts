@@ -7,6 +7,7 @@ import {
   FOLD_UNFOLDED_TYPE,
   FORK_TOOL,
   foldNoteDetails,
+  foldSpans,
   isForkDetails
 } from './archive.js';
 import { COMPACTION_NOTICE_TYPE } from './compaction.js';
@@ -429,12 +430,22 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
   const applied = everAppliedFolds(entries);
   const entryIndexById = new Map(entries.map((entry, idx) => [entry.id, idx]));
   const entryById = new Map(entries.map((entry) => [entry.id, entry]));
-  const lastIndexByHandle = new Map<string, number>();
+  const firstIndexByHandle = new Map<string, number>();
+  const spanIntervalsByHandle = new Map<string, [number, number][]>();
   for (const entry of entries) {
     const found = message(entry);
     const fold = found?.role === 'toolResult' ? foldNoteDetails(found) : undefined;
     if (fold && applied.has(fold.handle)) {
-      lastIndexByHandle.set(fold.handle, entryIndexById.get(fold.lastEntryId) ?? -1);
+      const intervals: [number, number][] = [];
+      for (const span of foldSpans(fold)) {
+        const first = entryIndexById.get(span.firstEntryId) ?? -1;
+        const last = entryIndexById.get(span.lastEntryId) ?? first;
+        if (first >= 0) intervals.push([first, Math.max(first, last)]);
+      }
+      if (intervals.length > 0) {
+        firstIndexByHandle.set(fold.handle, intervals[0]![0]);
+        spanIntervalsByHandle.set(fold.handle, intervals);
+      }
     }
   }
   const editOwners = attributeEpisodesEdits(entries);
@@ -462,9 +473,12 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
     projectedMsgById.set(entry.targetId, next);
     const owner = editOwners.get(entry.id);
     if (owner?.kind === 'fold' && prev !== null && next !== null) {
-      const lastIdx = lastIndexByHandle.get(owner.handle);
+      const firstIdx = firstIndexByHandle.get(owner.handle);
       const targetIdx = entryIndexById.get(entry.targetId) ?? -1;
-      if (lastIdx !== undefined && targetIdx > lastIdx) {
+      const insideOwnSpan = (spanIntervalsByHandle.get(owner.handle) ?? []).some(
+        ([first, last]) => targetIdx >= first && targetIdx <= last
+      );
+      if (firstIdx !== undefined && targetIdx > firstIdx && !insideOwnSpan) {
         const isReadStubOrRollback =
           prev.role === 'toolResult' &&
           next.role === 'toolResult' &&

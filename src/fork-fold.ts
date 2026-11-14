@@ -1,12 +1,19 @@
 import type { AgentMessage, AgentTool, AgentToolResult } from '@earendil-works/pi-agent-core';
 import type { ImageContent, TextContent, Tool } from '@earendil-works/pi-ai';
 import type { ProjectedSessionEntry, SessionEntry } from '@earendil-works/pi-coding-agent';
-import { type FoldDetails, foldNoteDetails, type NestedFold, UNFOLD_TOOL } from './archive.js';
+import {
+  type FoldDetails,
+  type FoldSpanDetails,
+  foldNoteDetails,
+  formatFoldRange,
+  type NestedFold,
+  nestedFoldSpans,
+  UNFOLD_TOOL
+} from './archive.js';
 import {
   coveredTokens,
-  headline,
-  openItems,
-  planFold,
+  normalizeFoldSpans,
+  planFoldBatch,
   renderCovered,
   renderNote,
   retireAssistantMessage,
@@ -14,8 +21,8 @@ import {
   writtenMark
 } from './fold.js';
 import { carriedMediaBlocks, FOLD_ABORTED_MESSAGE, prepareCarriedMedia } from './images.js';
-import { estimateTokens, skillPaths, touchedPaths } from './messages.js';
-import { parseStamp, readStamp, stampLabel, withStamp } from './stamps.js';
+import { skillPaths, touchedPaths } from './messages.js';
+import { readStamp, stampLabel, withStamp } from './stamps.js';
 import type { EpisodeState } from './state.js';
 import { formatTokens, type UnfoldDetails } from './ui.js';
 
@@ -165,41 +172,28 @@ export class ForkFolds {
     messages: readonly AgentMessage[],
     signal?: AbortSignal
   ): Promise<AgentToolResult<FoldDetails>> {
-    const params = args as { since?: unknown; until?: unknown; note?: unknown };
-    const since = typeof params.since === 'string' ? parseStamp(params.since) : undefined;
-    if (since === undefined) {
-      throw new Error(`since must be a turn stamp such as "t12", got "${String(params.since)}".`);
-    }
-    const bounded = typeof params.until === 'string' && params.until.trim() !== '';
-    const last = bounded ? parseStamp(params.until as string) : undefined;
-    if (bounded && last === undefined) {
-      throw new Error(`until must be a turn stamp such as "t20", got "${String(params.until)}".`);
-    }
-    const note = typeof params.note === 'string' ? params.note.trim() : '';
-    if (!note) {
-      throw new Error('The note is empty. Write what the rest of the task needs from the span.');
-    }
     if (signal?.aborted) throw new Error(FOLD_ABORTED_MESSAGE);
+    const normalizedSpans = normalizeFoldSpans((args ?? {}) as Record<string, unknown>);
 
     const entries = this.entries(messages);
+    const foldIndex = entries.length - 1;
     // The task is the first entry after the parent's view and the siblings; the fork's own
     // work starts after it.
-    const plan = planFold(entries, toolCallId, since, {
+    const batch = planFoldBatch(entries, toolCallId, normalizedSpans, {
       latestStamp: this.state.nextStamp - 1,
       floorIndex: this.parentEntries.length + this.siblings,
-      applied: this.applied,
-      ...(last === undefined ? {} : { until: last })
+      applied: this.applied
     });
 
-    // Archive covered-note media before mutating any ForkFolds state so errors or cancellation
-    // leave omitted/retired/applied/folds untouched.
-    const prepared = await prepareCarriedMedia(plan.handle, plan.media, this.archiveDir, signal);
+    // Archive covered-note media once for the combined batch before mutating any ForkFolds
+    // state so errors or cancellation leave omitted/retired/applied/folds untouched.
+    const prepared = await prepareCarriedMedia(batch.handle, batch.media, this.archiveDir, signal);
     if (signal?.aborted) throw new Error(FOLD_ABORTED_MESSAGE);
 
     const ownMessages = messages.slice(this.prefixLength);
     const index = (id: string) => Number(id.slice(this.forkHandle.length + 1));
     const omit: number[] = [];
-    for (const edit of plan.edits) {
+    for (const edit of batch.edits) {
       // Children have no user messages, so a fold only omits span entries (and retires assistant
       // signatures through `mutatedFrom` below).
       if (edit.replacement !== null) continue;
@@ -209,41 +203,68 @@ export class ForkFolds {
       this.omitted.add(message);
       omit.push(ownIndex);
     }
-    const firstIndex = index(plan.firstEntryId);
+    const firstIndex = index(batch.firstEntryId);
+    const lastIndex = index(batch.lastEntryId);
+    const childSpans = batch.spans.map((span) => ({
+      first: index(span.firstEntryId),
+      last: index(span.lastEntryId)
+    }));
     const retired = this.collectRetiredFrom(ownMessages, firstIndex);
-    this.applied.add(plan.handle);
-    const sinceLabel = stampLabel(since);
-    const lastStamp = plan.spanMessages.map(readStamp).findLast((stamp) => stamp !== undefined);
-    const until =
-      lastStamp !== undefined && lastStamp !== since ? stampLabel(lastStamp) : undefined;
-    const touched = touchedPaths(plan.spanMessages, this.state.cwd);
-    const tokens = estimateTokens(plan.omitted);
+    this.applied.add(batch.handle);
+
+    const spanDetails: FoldSpanDetails[] = batch.spans.map((span) => {
+      const sinceLabel = stampLabel(span.since);
+      const runsToCall = span.endIndex === foldIndex;
+      const untilLabel = runsToCall
+        ? span.lastStamp !== undefined && span.lastStamp !== span.since
+          ? stampLabel(span.lastStamp)
+          : undefined
+        : batch.spans.length === 1
+          ? span.lastStamp !== undefined && span.lastStamp !== span.since
+            ? stampLabel(span.lastStamp)
+            : undefined
+          : stampLabel(span.lastStamp ?? span.until ?? span.since);
+      return {
+        since: sinceLabel,
+        ...(untilLabel ? { until: untilLabel } : {}),
+        firstEntryId: span.firstEntryId,
+        lastEntryId: span.lastEntryId,
+        note: span.note
+      };
+    });
+    const firstSpanDetail = spanDetails[0]!;
+    const lastSpanDetail = spanDetails.at(-1)!;
+    const sinceLabel = firstSpanDetail.since;
+    const until = batch.spans.length === 1 ? firstSpanDetail.until : lastSpanDetail.until;
+    const touched = touchedPaths(batch.spanMessages, this.state.cwd);
+    const tokens = batch.tokens;
     const record: FoldDetails = {
       kind: 'fold',
-      handle: plan.handle,
+      handle: batch.handle,
       since: sinceLabel,
       ...(until ? { until } : {}),
-      firstEntryId: plan.firstEntryId,
-      lastEntryId: plan.lastEntryId,
-      messages: plan.omitted.length,
+      ...(spanDetails.length > 1 ? { spans: spanDetails } : {}),
+      firstEntryId: batch.firstEntryId,
+      lastEntryId: batch.lastEntryId,
+      messages: batch.omitted.length,
       tokens,
-      headline: headline(note),
-      keptUserTurns: plan.keptUserTurns,
+      headline: batch.headline,
+      keptUserTurns: batch.keptUserTurns,
       files: touched
     };
-    if (plan.covers.length > 0) record.covers = plan.covers.map((fold) => fold.handle);
-    record.note = note;
-    record.noteTokens = Math.ceil(note.length / 4);
-    if (plan.covers.length > 0) record.keptTokens = coveredTokens(plan.covers);
-    const carried = renderCovered(plan.covers);
-    const keptFrom = plan.keptFrom === undefined ? undefined : stampLabel(plan.keptFrom);
+    if (batch.covers.length > 0) record.covers = batch.covers.map((fold) => fold.handle);
+    record.note = batch.note;
+    record.noteTokens = Math.ceil(batch.note.length / 4);
+    if (batch.covers.length > 0) record.keptTokens = coveredTokens(batch.covers);
+    const carried = renderCovered(batch.covers);
+    const keptFrom = batch.keptFrom;
     if (keptFrom) record.keptFrom = keptFrom;
-    const open = openItems(note);
-    if (open) record.open = open;
+    if (batch.open) record.open = batch.open;
     this.folds.push({
       record,
       first: firstIndex,
-      last: index(plan.lastEntryId),
+      last: lastIndex,
+      ...(childSpans.length > 1 ? { spans: childSpans } : {}),
       omit,
       createdAt: ownMessages.length,
       retired
@@ -253,20 +274,22 @@ export class ForkFolds {
       {
         type: 'text' as const,
         text: `${renderNote({
-          handle: plan.handle,
+          handle: batch.handle,
           since: sinceLabel,
           until,
-          messages: plan.omitted.length,
+          ...(spanDetails.length > 1 ? { spans: spanDetails } : {}),
+          messages: batch.omitted.length,
           tokens,
-          note,
+          note: batch.note,
           // The fork's own result carries the working tree diff for all of its work.
           changes: undefined,
           touched,
-          keptUserTurns: plan.keptUserTurns,
-          archivedReadTurns: plan.archivedReadTurns,
+          keptUserTurns: batch.keptUserTurns,
+          archivedReadTurns: batch.archivedReadTurns,
           keptFrom,
-          covers: plan.covers,
-          skills: skillPaths(plan.spanMessages, this.state.cwd),
+          keptNotice: batch.keptNotice,
+          covers: batch.covers,
+          skills: skillPaths(batch.spanMessages, this.state.cwd),
           cwd: this.state.cwd
         })}${carried ? `\n\n${carried}` : ''}`
       }
@@ -306,7 +329,12 @@ export class ForkFolds {
           `${handle} is covered by ${other.record.handle}; unfold ${other.record.handle} first.`
         );
       }
-      if (other.first <= nested.last && other.last >= nested.first) {
+      const ownSpans = nestedFoldSpans(nested);
+      const otherSpans = nestedFoldSpans(other);
+      const overlaps = ownSpans.some((a) =>
+        otherSpans.some((b) => a.first <= b.last && b.first <= a.last)
+      );
+      if (overlaps) {
         throw new Error(
           `${handle} overlaps active fold ${other.record.handle}; unfold ${other.record.handle} first.`
         );
@@ -337,7 +365,7 @@ export class ForkFolds {
     }
     nested.unfoldRetired = this.collectRetiredFrom(ownMessages, nested.first);
     const record = nested.record;
-    const range = record.until ? `${record.since}-${record.until}` : `from ${record.since} on`;
+    const range = formatFoldRange(record);
     return {
       content: [
         {
@@ -350,6 +378,14 @@ export class ForkFolds {
         handle,
         since: record.since,
         ...(record.until ? { until: record.until } : {}),
+        ...(record.spans && record.spans.length > 1
+          ? {
+              spans: record.spans.map((span) => ({
+                since: span.since,
+                ...(span.until ? { until: span.until } : {})
+              }))
+            }
+          : {}),
         messages: record.messages,
         tokens: record.tokens
       }

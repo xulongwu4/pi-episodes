@@ -22,6 +22,8 @@ export interface PendingFold {
   edits: ContextEditEntryDraft[];
   /** Last session entry inside the folded span, where any surviving `until` tail begins. */
   lastEntryId?: string;
+  /** Last entry of the earliest span in a batch, where surviving gap/tail pruning begins. */
+  pruneAfterEntryId?: string;
   /** Assistant message entry that initiated the fold call (or calling script). */
   callerEntryId?: string;
   /** The notes the fold covers, as its result holds them under its own note. */

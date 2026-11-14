@@ -76,6 +76,14 @@ export function everAppliedFolds(entries: readonly SessionEntry[]): Set<string> 
   return handles;
 }
 
+export interface FoldSpanDetails {
+  since: string;
+  until?: string;
+  firstEntryId: string;
+  lastEntryId: string;
+  note: string;
+}
+
 /** Stored on the fold tool result, so the record follows the branch it belongs to. */
 export interface FoldDetails {
   kind: 'fold';
@@ -85,6 +93,8 @@ export interface FoldDetails {
   lastEntryId: string;
   /** Last stamp inside the span, so the range it covered can be shown. */
   until?: string;
+  /** Disjoint spans when multiple non-overlapping ranges were folded in one batch. */
+  spans?: FoldSpanDetails[];
   messages: number;
   tokens: number;
   headline: string;
@@ -213,6 +223,8 @@ export interface NestedFold {
   record: FoldDetails;
   first: number;
   last: number;
+  /** Disjoint child-message intervals when multiple spans were folded in one batch. */
+  spans?: { first: number; last: number }[];
   /** Messages the fold hid from the child's view. */
   omit: number[];
   unfolded?: boolean;
@@ -224,6 +236,55 @@ export interface NestedFold {
   retired?: number[];
   /** Child assistant message indices whose replay signatures were retired when unfolded. */
   unfoldRetired?: number[];
+}
+
+export function foldSpans(fold: FoldDetails): readonly FoldSpanDetails[] {
+  if (fold.spans && fold.spans.length > 0) return fold.spans;
+  return [
+    {
+      since: fold.since,
+      ...(fold.until !== undefined ? { until: fold.until } : {}),
+      firstEntryId: fold.firstEntryId,
+      lastEntryId: fold.lastEntryId,
+      note: fold.note ?? ''
+    }
+  ];
+}
+
+export function formatFoldRange(
+  fold: {
+    since: string;
+    until?: string | undefined;
+    spans?: readonly { since: string; until?: string | undefined }[] | undefined;
+  },
+  options: { onSuffix?: boolean; turnsPrefix?: boolean } = {}
+): string {
+  const onSuffix = options.onSuffix ?? true;
+  const turnsPrefix = options.turnsPrefix ?? false;
+  const spans =
+    fold.spans && fold.spans.length > 0
+      ? fold.spans
+      : [{ since: fold.since, ...(fold.until !== undefined ? { until: fold.until } : {}) }];
+  if (spans.length === 1) {
+    const only = spans[0]!;
+    if (turnsPrefix) {
+      if (!only.until) return `turns from ${only.since} on`;
+      return only.until === only.since ? `turn ${only.since}` : `turns ${only.since}-${only.until}`;
+    }
+    if (only.until) return only.until === only.since ? only.since : `${only.since}-${only.until}`;
+    return onSuffix ? `from ${only.since} on` : only.since;
+  }
+  const parts = spans.map((span) => {
+    if (!span.until) return onSuffix ? `from ${span.since} on` : `from ${span.since}`;
+    return span.until === span.since ? span.since : `${span.since}-${span.until}`;
+  });
+  return turnsPrefix ? `turns ${parts.join(', ')}` : parts.join(', ');
+}
+
+export function nestedFoldSpans(fold: NestedFold): readonly { first: number; last: number }[] {
+  return fold.spans && fold.spans.length > 0
+    ? fold.spans
+    : [{ first: fold.first, last: fold.last }];
 }
 
 function isNestedFoldUnfoldedAt(fold: NestedFold, stateAt: number): boolean {
@@ -682,8 +743,13 @@ export class ThreadIndex {
 
   private foldThread(fold: FoldDetails): Thread | undefined {
     const path = this.sessions.getBranch(fold.lastEntryId);
-    const start = path.findIndex((entry) => entry.id === fold.firstEntryId);
-    if (start < 0) return undefined;
+    const intervals: [number, number][] = [];
+    for (const span of foldSpans(fold)) {
+      const first = path.findIndex((entry) => entry.id === span.firstEntryId);
+      const last = path.findIndex((entry) => entry.id === span.lastEntryId);
+      if (first < 0 || last < first) return undefined;
+      intervals.push([first, last]);
+    }
     // The spans of folds applied before this one are already archived under their own
     // handles: the folds this one covers, whose notes this thread holds, and those that
     // ended at an `until` inside this span, whose notes lie after it.
@@ -692,20 +758,23 @@ export class ThreadIndex {
       .find((entry) => foldEntryDetails(entry)?.handle === fold.handle);
     const covered = new Set<string>();
     for (const record of note ? foldRecords(this.sessions.getBranch(note.id)) : []) {
-      const first = path.findIndex((entry) => entry.id === record.firstEntryId);
-      if (first < 0) continue;
-      const last = path.findIndex((entry) => entry.id === record.lastEntryId);
-      for (const entry of path.slice(first, last < 0 ? undefined : last + 1)) {
-        covered.add(entry.id);
+      if (record.handle === fold.handle) continue;
+      for (const span of foldSpans(record)) {
+        const first = path.findIndex((entry) => entry.id === span.firstEntryId);
+        if (first < 0) continue;
+        const last = path.findIndex((entry) => entry.id === span.lastEntryId);
+        for (const entry of path.slice(first, last < 0 ? undefined : last + 1)) {
+          covered.add(entry.id);
+        }
       }
     }
 
     return {
       handle: fold.handle,
       kind: 'fold',
-      label: fold.until ? `turns ${fold.since}-${fold.until}` : `turns from ${fold.since} on`,
-      messages: path
-        .slice(start)
+      label: formatFoldRange(fold, { turnsPrefix: true }),
+      messages: intervals
+        .flatMap(([first, last]) => path.slice(first, last + 1))
         .filter((entry) => !covered.has(entry.id))
         .flatMap(sessionEntryToContextMessages),
       context: () => {
@@ -819,10 +888,12 @@ export class ThreadIndex {
       threads.push({
         handle: fold.record.handle,
         kind: 'fold',
-        label: `${fold.record.until ? `turns ${fold.record.since}-${fold.record.until}` : `turns from ${fold.record.since} on`}, inside ${archive.handle}`,
-        messages: archive.messages
-          .slice(fold.first, fold.last + 1)
-          .filter((_, index) => !earlier.has(fold.first + index)),
+        label: `${formatFoldRange(fold.record, { turnsPrefix: true })}, inside ${archive.handle}`,
+        messages: nestedFoldSpans(fold).flatMap((span) =>
+          archive.messages
+            .slice(span.first, span.last + 1)
+            .filter((_, index) => !earlier.has(span.first + index))
+        ),
         // What the child saw when it folded: its earlier folds at `snapAt`, this one not yet.
         context: () => [...this.forkPrefix(archive), ...snapReplay().messages],
         retiredCallIds: () => {

@@ -9,6 +9,7 @@ import { Container, Markdown, Spacer, Text } from '@earendil-works/pi-tui';
 import {
   type FoldDetails,
   type ForkDetails,
+  formatFoldRange,
   isFoldDetails,
   isForkDetails,
   threadRecords
@@ -58,6 +59,7 @@ export interface UnfoldDetails {
   handle: string;
   since: string;
   until?: string;
+  spans?: { since: string; until?: string }[];
   messages: number;
   tokens: number;
 }
@@ -111,7 +113,27 @@ function markdownPreview(text: string, expanded: boolean, count: number, theme: 
 }
 
 export const foldRenderers = {
-  renderCall(args: { since?: string; until?: string; note?: string }, theme: Theme): Text {
+  renderCall(
+    args: {
+      since?: string;
+      until?: string;
+      note?: string;
+      spans?: { since?: string; until?: string; note?: string }[];
+    },
+    theme: Theme
+  ): Text {
+    if (Array.isArray(args.spans) && args.spans.length > 0) {
+      const parts = args.spans.map((span) => {
+        const since = span?.since ? theme.fg('accent', span.since) : theme.fg('dim', '...');
+        if (span?.until) {
+          return span.until === span.since
+            ? since
+            : `${since}${theme.fg('muted', '-')}${theme.fg('accent', span.until)}`;
+        }
+        return `${theme.fg('muted', 'from ')}${since}`;
+      });
+      return title(theme, 'fold', parts.join(theme.fg('muted', ', ')));
+    }
     const since = args.since ? theme.fg('accent', args.since) : theme.fg('dim', '...');
     const until = args.until ? ` ${theme.fg('muted', 'to')} ${theme.fg('accent', args.until)}` : '';
     return title(theme, 'fold', `${theme.fg('muted', 'from')} ${since}${until}`);
@@ -127,7 +149,11 @@ export const foldRenderers = {
       return new Text(theme.fg('error', resultText(result.content)), 0, 0);
     }
 
-    const range = details.until ? `${details.since}-${details.until}` : `${details.since} on`;
+    const range = details.spans?.length
+      ? formatFoldRange(details)
+      : details.until
+        ? `${details.since}-${details.until}`
+        : `${details.since} on`;
     const summary =
       `${theme.fg('success', '▸')} ${theme.fg('accent', details.handle)} ${theme.fg('accent', range)} ` +
       theme.fg(
@@ -160,7 +186,11 @@ export const unfoldRenderers = {
     const details = result.details;
     const text = resultText(result.content);
     if (!details || result.isError) return new Text(theme.fg('error', text), 0, 0);
-    const range = details.until ? `${details.since}-${details.until}` : `${details.since} on`;
+    const range = details.spans?.length
+      ? formatFoldRange(details)
+      : details.until
+        ? `${details.since}-${details.until}`
+        : `${details.since} on`;
     return new Text(
       `${theme.fg('success', '◂')} ${theme.fg('accent', details.handle)} ${theme.fg('accent', range)} ` +
         theme.fg(

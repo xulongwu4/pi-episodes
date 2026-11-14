@@ -26,7 +26,9 @@ export type FoldRejection =
   | 'behind-note'
   | 'behind-compaction'
   | 'behind-fork-start'
-  | 'nothing-to-fold';
+  | 'nothing-to-fold'
+  | 'bad-spans'
+  | 'overlapping-spans';
 
 export interface FoldRejectedEvent {
   kind: 'fold-rejected';

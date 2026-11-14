@@ -41,7 +41,9 @@ response that [t20] answers, and the turns after them stay (older identical read
 aged failed tool inputs inside them are trimmed): the next step then has the note and
 those turns to go on. What stays after the span is sent uncached once, so do this
 when the span is larger than what stays after it; otherwise wait and fold the whole tail
-when that work is done too.
+when that work is done too. When two or more non-overlapping episodes are done with work
+you still need between them, batch them in one fold call with spans:
+[{ since, until?, note }, ...] so the prefix is rewritten once from the earliest since.
 
 Do not fold right before your final reply to the user; that reply needs the span. If the
 episode was the whole request, fold at the start of the next request, before working on
@@ -97,7 +99,7 @@ for another agent, give it the user's requests and the diff, not your reasoning.
 
 /** Appended when fold, unfold, recall and ask are called from codemode scripts, out of the model's view. */
 export const CODEMODE_CALLS = /* md */ `
-From a codemode script: tools.fold({ since: "t13", until?, note }),
+From a codemode script: tools.fold({ since: "t13", until?, note }) or tools.fold({ spans: [{ since, until?, note }, ...] }),
 tools.unfold({ handle: "ep-..." }), tools.recall({ query, handle?, regex?, limit? })
 (limit 30 by default, at most 200; the rest go to a file),
 tools.recall({ handle, turn }) for a turn or a range of turns verbatim,
