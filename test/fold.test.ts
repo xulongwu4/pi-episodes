@@ -9,6 +9,7 @@ import { convertToLlm, type SessionManager } from '@earendil-works/pi-coding-age
 import {
   callingFork,
   FOLD_APPLIED_TYPE,
+  FOLD_RECOVERY_STARTED_TYPE,
   FOLD_STARTED_TYPE,
   type FoldDetails,
   type ForkArchive,
@@ -304,6 +305,11 @@ test('a cut-short fold whose note an edit removed is completed like any other', 
     assert.deepEqual(
       rest,
       [
+        {
+          type: 'custom',
+          customType: FOLD_RECOVERY_STARTED_TYPE,
+          data: { kind: 'fold', handle: plan.handle, edits: plan.edits.slice(1) }
+        },
         ...plan.edits.slice(1),
         { type: 'custom', customType: FOLD_APPLIED_TYPE, data: { handle: plan.handle } }
       ],

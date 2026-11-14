@@ -11,7 +11,8 @@ import {
 } from './archive.js';
 import { COMPACTION_NOTICE_TYPE } from './compaction.js';
 import { type EpisodeEvent, EVENT_TYPE } from './events.js';
-import { absolutePath } from './messages.js';
+import { attributeEpisodesEdits } from './fold.js';
+import { absolutePath, messageText } from './messages.js';
 import { NUDGE_TYPE } from './nudge.js';
 import { cappedOutput } from './output.js';
 import { EPISODES_SECTION } from './prompt.js';
@@ -426,6 +427,68 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
   };
 
   const applied = everAppliedFolds(entries);
+  const entryIndexById = new Map(entries.map((entry, idx) => [entry.id, idx]));
+  const entryById = new Map(entries.map((entry) => [entry.id, entry]));
+  const lastIndexByHandle = new Map<string, number>();
+  for (const entry of entries) {
+    const found = message(entry);
+    const fold = found?.role === 'toolResult' ? foldNoteDetails(found) : undefined;
+    if (fold && applied.has(fold.handle)) {
+      lastIndexByHandle.set(fold.handle, entryIndexById.get(fold.lastEntryId) ?? -1);
+    }
+  }
+  const editOwners = attributeEpisodesEdits(entries);
+  const projectedMsgById = new Map<string, AgentMessage | null>();
+  const tailSavedCharsByHandle = new Map<string, number>();
+  for (const entry of entries) {
+    if (entry.type !== 'context_edit') continue;
+    const rawMsg = message(entryById.get(entry.targetId));
+    const prev = projectedMsgById.has(entry.targetId)
+      ? projectedMsgById.get(entry.targetId)!
+      : (rawMsg ?? null);
+    const next =
+      entry.replacement === null
+        ? null
+        : rawMsg &&
+            'content' in rawMsg &&
+            entry.replacement &&
+            typeof entry.replacement === 'object' &&
+            'content' in entry.replacement
+          ? ({
+              ...rawMsg,
+              content: (entry.replacement as { content: never }).content
+            } as AgentMessage)
+          : prev;
+    projectedMsgById.set(entry.targetId, next);
+    const owner = editOwners.get(entry.id);
+    if (owner?.kind === 'fold' && prev !== null && next !== null) {
+      const lastIdx = lastIndexByHandle.get(owner.handle);
+      const targetIdx = entryIndexById.get(entry.targetId) ?? -1;
+      if (lastIdx !== undefined && targetIdx > lastIdx) {
+        const isReadStubOrRollback =
+          prev.role === 'toolResult' &&
+          next.role === 'toolResult' &&
+          (messageText(next).startsWith('[duplicate read of ') ||
+            messageText(prev).startsWith('[duplicate read of '));
+        const isArgPrune =
+          prev.role === 'assistant' &&
+          next.role === 'assistant' &&
+          JSON.stringify(
+            prev.content.flatMap((b) => (b.type === 'toolCall' ? [b.arguments] : []))
+          ) !==
+            JSON.stringify(
+              next.content.flatMap((b) => (b.type === 'toolCall' ? [b.arguments] : []))
+            );
+        if (isReadStubOrRollback || isArgPrune) {
+          const delta = messageText(prev).length - messageText(next).length;
+          tailSavedCharsByHandle.set(
+            owner.handle,
+            (tailSavedCharsByHandle.get(owner.handle) ?? 0) + delta
+          );
+        }
+      }
+    }
+  }
   const foldNet = new Map<string, number>();
   const foldNote = new Map<string, number>();
   /** Net tokens of folds in effect, saved again on every request until a compaction. */
@@ -612,9 +675,10 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       if (fold.tokens < SMALL_SPAN_TOKENS) folds.small++;
       if (fold.keptFrom) folds.bounded++;
       folds.noteTokens += fold.noteTokens ?? 0;
+      const tailSavedTokens = tokensOf(Math.max(0, tailSavedCharsByHandle.get(fold.handle) ?? 0));
       foldNet.set(
         fold.handle,
-        Math.max(0, fold.tokens - (fold.noteTokens ?? 0) - (fold.keptTokens ?? 0))
+        Math.max(0, fold.tokens + tailSavedTokens - (fold.noteTokens ?? 0) - (fold.keptTokens ?? 0))
       );
       foldNote.set(fold.handle, fold.noteTokens ?? 0);
       if (fold.anchor?.placed !== undefined) {

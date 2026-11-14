@@ -15,6 +15,7 @@ import {
   appliedFolds,
   FOLD_APPLIED_TYPE,
   FOLD_DETAILS_KEY,
+  FOLD_RECOVERY_STARTED_TYPE,
   FOLD_REQUEST_TYPE,
   FOLD_STARTED_TYPE,
   FOLD_TOOL,
@@ -81,6 +82,8 @@ export interface FoldPlan {
   before: AgentMessage[];
   sent: AgentMessage[];
   keptUserTurns: string[];
+  /** Stamps of `read` turns inside the span still cited by live duplicate-read stubs before it. */
+  archivedReadTurns: string[];
   /** The notes of earlier folds that the new note stands for from now on, oldest first. */
   covers: CoveredNote[];
   /** The images in the results of the notes the fold covers, which its result takes over. */
@@ -748,8 +751,18 @@ function unfinishedBatches(branch: readonly SessionEntry[]): {
  */
 export function completeCutShortFolds(
   branch: readonly SessionEntry[],
-  pending: readonly PendingDraft[] = []
-): (ContextEditEntryDraft | { type: 'custom'; customType: string; data: { handle: string } })[] {
+  pending: readonly PendingDraft[] = [],
+  laterRemovals: ReadonlySet<string> = new Set()
+): (
+  | ContextEditEntryDraft
+  | {
+      type: 'custom';
+      customType: string;
+      data:
+        | { handle: string }
+        | { kind: 'fold' | 'unfold'; handle: string; edits: ContextEditEntryDraft[] };
+    }
+)[] {
   const branchById = new Map(branch.map((entry) => [entry.id, entry]));
   const assistantBlocks = (replacement: unknown): AssistantMessage['content'] | undefined => {
     if (!replacement || typeof replacement !== 'object') return undefined;
@@ -796,6 +809,7 @@ export function completeCutShortFolds(
             : (newerBlocks as (TextContent | ImageContent)[])
           : undefined;
         const newerIntact =
+          !laterRemovals.has(dep.newerEntryId) &&
           !latestRaw.has(dep.newerEntryId) &&
           currentNewer !== null &&
           currentNewer !== undefined &&
@@ -857,7 +871,41 @@ export function completeCutShortFolds(
       }
       return [];
     });
-    return [...rest, marker];
+    if (rest.length === 0) return [marker];
+    const restTargets = new Set(rest.map((edit) => edit.targetId));
+    const interveningRetires: ContextEditEntryDraft[] = [];
+    for (let m = branch.length - 1; m > index; m--) {
+      const step = branch[m]!;
+      if (
+        step.type !== 'message' ||
+        step.message.role !== 'assistant' ||
+        restTargets.has(step.id) ||
+        laterRemovals.has(step.id)
+      ) {
+        continue;
+      }
+      const current = effectiveReplacement(step.id);
+      if (!current) continue;
+      const blocks = assistantBlocks(current);
+      const retired = blocks ? retireAssistantContent(blocks) : undefined;
+      if (retired) {
+        interveningRetires.push({
+          type: 'context_edit',
+          targetId: step.id,
+          replacement: { content: retired }
+        });
+      }
+    }
+    const finalRest = [...interveningRetires, ...rest];
+    return [
+      {
+        type: 'custom' as const,
+        customType: FOLD_RECOVERY_STARTED_TYPE,
+        data: { kind, handle, edits: finalRest }
+      },
+      ...finalRest,
+      marker
+    ];
   });
 }
 
@@ -1104,6 +1152,25 @@ export function planFold(
     anchorStamp = before && readStamp(before);
   }
 
+  const beforeMessages = entries.slice(0, startIndex).flatMap((entry) => entry.messages);
+  const omittedReadStamps = new Set<string>();
+  for (const msg of omitted) {
+    if (msg.role === 'toolResult' && msg.toolName === 'read') {
+      const s = readStamp(msg);
+      if (s !== undefined) omittedReadStamps.add(stampLabel(s));
+    }
+  }
+  const archivedReadTurns: string[] = [];
+  const seenArchived = new Set<string>();
+  for (const msg of beforeMessages) {
+    if (msg.role !== 'toolResult' || msg.toolName !== 'read') continue;
+    const hit = /^\[duplicate read of .+; identical to (t\d+)\b/.exec(textOf(msg.content));
+    const ref = hit?.[1];
+    if (ref && omittedReadStamps.has(ref) && !seenArchived.has(ref)) {
+      seenArchived.add(ref);
+      archivedReadTurns.push(ref);
+    }
+  }
   return {
     handle,
     anchorStamp,
@@ -1113,9 +1180,10 @@ export function planFold(
     keptFrom,
     omitted,
     spanMessages: span.flatMap((entry) => entry.messages),
-    before: entries.slice(0, startIndex).flatMap((entry) => entry.messages),
+    before: beforeMessages,
     sent: entries.slice(0, foldIndex).flatMap((entry) => entry.messages),
     keptUserTurns,
+    archivedReadTurns,
     covers: coveredNotes(entries, span, applied),
     images: coveredImages(span, applied),
     edits
@@ -1190,6 +1258,8 @@ export function renderNote(options: {
   covers?: readonly CoveredNote[];
   /** Skill files read inside the span. */
   skills?: readonly string[];
+  /** Read turns inside this span still referenced by live duplicate-read stubs above it. */
+  archivedReadTurns?: readonly string[];
   cwd: string;
 }): string {
   const lines = [
@@ -1217,6 +1287,15 @@ export function renderNote(options: {
     );
   }
 
+  if (options.archivedReadTurns?.length) {
+    const calls = options.archivedReadTurns
+      .map((turn) => `recall({ handle: "${options.handle}", turn: "${turn}" })`)
+      .join(', ');
+    lines.push(
+      '',
+      `Earlier duplicate-read stub(s) above point into this span: read them back with ${calls}.`
+    );
+  }
   // A note says what was learned, not how to work; a skill's instructions would be lost unseen.
   if (options.skills?.length) {
     lines.push(
@@ -1368,11 +1447,28 @@ export function attributeEpisodesEdits(
   branch: readonly SessionEntry[]
 ): Map<string, { kind: 'fold' | 'unfold'; handle: string }> {
   const owners = new Map<string, { kind: 'fold' | 'unfold'; handle: string }>();
-  const latestStartedSigs = new Map<string, Set<string>>();
+  const claimForward = (
+    fromIndex: number,
+    kind: 'fold' | 'unfold',
+    handle: string,
+    sigs: ReadonlySet<string>
+  ) => {
+    for (let j = fromIndex + 1; j < branch.length; j++) {
+      const step = branch[j]!;
+      if (step.type !== 'context_edit') break;
+      if (!sigs.has(editSignature(step.targetId, step.replacement))) break;
+      owners.set(step.id, { kind, handle });
+    }
+  };
   for (let i = 0; i < branch.length; i++) {
     const entry = branch[i]!;
     if (entry.type !== 'custom') continue;
-    const data = (entry.data ?? {}) as { handle?: unknown; edits?: unknown; readDeps?: unknown };
+    const data = (entry.data ?? {}) as {
+      kind?: unknown;
+      handle?: unknown;
+      edits?: unknown;
+      readDeps?: unknown;
+    };
     if (typeof data.handle !== 'string') continue;
     if (
       (entry.customType === FOLD_STARTED_TYPE || entry.customType === FOLD_UNFOLD_STARTED_TYPE) &&
@@ -1389,23 +1485,18 @@ export function attributeEpisodesEdits(
           sigs.add(editSignature(dep.targetId, dep.restoreReplacement));
         }
       }
-      latestStartedSigs.set(`${kind}:${data.handle}`, sigs);
-      for (let j = i + 1; j < branch.length; j++) {
-        const step = branch[j]!;
-        if (step.type !== 'context_edit') break;
-        if (!sigs.has(editSignature(step.targetId, step.replacement))) break;
-        owners.set(step.id, { kind, handle: data.handle });
-      }
-    } else if (entry.customType === FOLD_APPLIED_TYPE || entry.customType === FOLD_UNFOLDED_TYPE) {
-      const kind: 'fold' | 'unfold' = entry.customType === FOLD_APPLIED_TYPE ? 'fold' : 'unfold';
-      const sigs = latestStartedSigs.get(`${kind}:${data.handle}`);
-      if (!sigs) continue;
-      for (let j = i - 1; j >= 0; j--) {
-        const step = branch[j]!;
-        if (step.type !== 'context_edit') break;
-        if (!sigs.has(editSignature(step.targetId, step.replacement))) break;
-        if (!owners.has(step.id)) owners.set(step.id, { kind, handle: data.handle });
-      }
+      claimForward(i, kind, data.handle, sigs);
+    } else if (
+      entry.customType === FOLD_RECOVERY_STARTED_TYPE &&
+      (data.kind === 'fold' || data.kind === 'unfold') &&
+      Array.isArray(data.edits)
+    ) {
+      const sigs = new Set<string>(
+        (data.edits as ContextEditEntryDraft[]).map((edit) =>
+          editSignature(edit.targetId, edit.replacement)
+        )
+      );
+      claimForward(i, data.kind, data.handle, sigs);
     }
   }
   return owners;
@@ -1640,6 +1731,7 @@ export function planUnfold(
     const idx = branchIndexById.get(entry.sourceEntry.id) ?? -1;
     if (idx < firstBranchIndex) continue;
     const restoredAssistant = postSpanAssistantRestores.get(entry.sourceEntry.id);
+    if (restoredAssistant) postSpanAssistantRestores.delete(entry.sourceEntry.id);
     if (restoredAssistant) {
       retireEdits.push({
         type: 'context_edit',
@@ -1660,6 +1752,9 @@ export function planUnfold(
     }
   }
 
+  for (const [targetId, replacement] of postSpanAssistantRestores) {
+    retireEdits.push({ type: 'context_edit', targetId, replacement });
+  }
   return {
     handle: trimmed,
     record,
@@ -1878,6 +1973,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         changes,
         touched,
         keptUserTurns: plan.keptUserTurns,
+        archivedReadTurns: plan.archivedReadTurns,
         keptFrom,
         covers: plan.covers,
         skills: skillPaths(plan.spanMessages, state.cwd),
@@ -2111,7 +2207,15 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         state.pendingUnfolds.delete(result.toolCallId);
         return [pending];
       });
-    const repairs = completeCutShortFolds(branch, event.entries);
+    const appliedSpanRemovals = new Set(
+      applied.flatMap((fold) =>
+        fold.edits.flatMap((edit) => (edit.replacement === null ? [edit.targetId] : []))
+      )
+    );
+    const repairs = completeCutShortFolds(branch, event.entries, appliedSpanRemovals);
+    const repairDrafts = repairs.filter(
+      (item): item is ContextEditEntryDraft => item.type === 'context_edit'
+    );
     if (applied.length === 0 && unfolded.length === 0 && repairs.length === 0) return undefined;
 
     const branchById = new Map(branch.map((entry) => [entry.id, entry]));
@@ -2178,6 +2282,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
           ? planFoldTailPruning({
               branch,
               pending: event.entries as readonly PendingDraft[],
+              repairDrafts,
               editOwners,
               afterEntryId: fold.lastEntryId,
               beforeEntryId,

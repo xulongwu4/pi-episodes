@@ -172,7 +172,12 @@ function sameCut(shown: string, part: string): boolean {
  * than one place, and the wrong one would take a handler's line for part of the output.
  * Undefined when the text does not fit.
  */
-function putBack(text: string, marker: RegExp, full: string, head?: number): string | undefined {
+function putBackSpan(
+  text: string,
+  marker: RegExp,
+  full: string,
+  head?: number
+): { whole: string; head: number; tail: number } | undefined {
   for (const match of text.matchAll(marker)) {
     const before = match.index;
     const after = before + match[0].length;
@@ -182,9 +187,17 @@ function putBack(text: string, marker: RegExp, full: string, head?: number): str
     if (start < 0 || start > before || end < 0 || end > text.length - after) continue;
     if (!sameCut(text.slice(before - start, before), full.slice(0, start))) continue;
     if (!sameCut(text.slice(after, after + end), full.slice(full.length - end))) continue;
-    return text.slice(0, before - start) + full + text.slice(after + end);
+    return {
+      whole: text.slice(0, before - start) + full + text.slice(after + end),
+      head: start,
+      tail: end
+    };
   }
   return undefined;
+}
+
+function putBack(text: string, marker: RegExp, full: string, head?: number): string | undefined {
+  return putBackSpan(text, marker, full, head)?.whole;
 }
 
 /**
@@ -317,17 +330,29 @@ const UNTRACKED_CUT_MARKER =
  * cut by an external offloader, carries an untracked cut marker, or had its archived
  * `episodesOutput` file removed or altered on disk.
  */
-export function completeReadBlocks(
+export type ReadPayloadCoverage =
+  | { uncapped: true }
+  | { uncapped: false; block: number; head: number; tail: number };
+
+export interface VerifiedRead {
+  blocks: TextContent[];
+  coverage: ReadPayloadCoverage;
+}
+
+export function verifyCompleteRead(
   content: readonly Block[],
   details: unknown
-): TextContent[] | undefined {
+): VerifiedRead | undefined {
   if (content.some((block) => block.type !== 'text')) return undefined;
   const textBlocks = content as readonly TextContent[];
   if (offloadedOutput(details)) return undefined;
   const capped = cappedOutput(details);
   if (!capped) {
     if (textBlocks.some((block) => UNTRACKED_CUT_MARKER.test(block.text))) return undefined;
-    return textBlocks.map((block) => ({ type: 'text', text: block.text }));
+    return {
+      blocks: textBlocks.map((block) => ({ type: 'text', text: block.text })),
+      coverage: { uncapped: true }
+    };
   }
   let full: string;
   try {
@@ -351,8 +376,10 @@ export function completeReadBlocks(
   );
   if (marked.length === 0) return undefined;
   const fits = marked.flatMap(({ index, text }) => {
-    const whole = putBack(text, marker, full, capped.head);
-    return whole === undefined ? [] : [{ index, text: whole }];
+    const span = putBackSpan(text, marker, full, capped.head);
+    return span === undefined
+      ? []
+      : [{ index, text: span.whole, head: span.head, tail: span.tail }];
   });
   const fit =
     fits.find(({ index }) => index === capped.block) ?? (fits.length === 1 ? fits[0] : undefined);
@@ -363,5 +390,15 @@ export function completeReadBlocks(
       : [{ type: 'text', text: block.text }]
   );
   if (rebuilt.some((block) => UNTRACKED_CUT_MARKER.test(block.text))) return undefined;
-  return rebuilt;
+  return {
+    blocks: rebuilt,
+    coverage: { uncapped: false, block: fit.index, head: fit.head, tail: fit.tail }
+  };
+}
+
+export function completeReadBlocks(
+  content: readonly Block[],
+  details: unknown
+): TextContent[] | undefined {
+  return verifyCompleteRead(content, details)?.blocks;
 }

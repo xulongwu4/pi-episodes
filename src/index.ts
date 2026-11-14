@@ -1,4 +1,4 @@
-import { relative } from 'node:path';
+import { basename, relative } from 'node:path';
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -7,11 +7,9 @@ import type {
 import {
   appliedFolds,
   archiveDir,
-  FOLD_TOOL,
   FORK_TOOL,
   type ThreadRecord,
-  threadRecords,
-  UNFOLD_TOOL
+  threadRecords
 } from './archive.js';
 import { registerAsk } from './ask.js';
 import { cacheAnchor, placeAnchor } from './cache.js';
@@ -32,6 +30,7 @@ import { absolutePath, type FileTouch, fileTouch, withFiles } from './messages.j
 import { registerNudge } from './nudge.js';
 import { CAPPED_KEY, capOutput } from './output.js';
 import { CODEMODE_CALLS, EPISODES_SECTION } from './prompt.js';
+import { UNCAPPED_TOOLS } from './prune.js';
 import { registerRecall } from './recall.js';
 import { registerReminder } from './reminder.js';
 import { episodesSettings } from './settings.js';
@@ -41,8 +40,6 @@ import { refreshStatus } from './ui.js';
 
 const STALE_STAMP = /\s*\[t\d+\]\s*$/;
 const MAX_SURFACED_THREADS = 2;
-/** Results the output cap leaves whole: the extension's own, which are bounded or are the note. */
-const UNCAPPED_TOOLS = new Set([FOLD_TOOL, UNFOLD_TOOL, FORK_TOOL, 'recall', 'ask']);
 
 /** Threads to point at from a tool result that touched one of their files. */
 interface Cue {
@@ -217,6 +214,9 @@ export default function episodes(pi: ExtensionAPI): void {
       event.parentToolCallId ||
       event.isError ||
       UNCAPPED_TOOLS.has(event.toolName) ||
+      (event.toolName === 'read' &&
+        typeof event.input?.path === 'string' &&
+        basename(event.input.path.trim().replace(/^@/, '')) === 'SKILL.md') ||
       // The result of a script that folded stands as the note, as the fold tool's own does:
       // cut, it would get the whole note added after the cut one. What the script printed
       // next to the note is cut like any output once that alone is over the limit.

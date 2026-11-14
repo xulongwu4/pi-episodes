@@ -7,7 +7,7 @@ import {
 } from '@earendil-works/pi-coding-agent';
 import { FOLD_TOOL, FORK_TOOL, UNFOLD_TOOL } from './archive.js';
 import { absolutePath } from './messages.js';
-import { completeReadBlocks } from './output.js';
+import { type ReadPayloadCoverage, verifyCompleteRead } from './output.js';
 import { retireAssistantContent } from './retire.js';
 import { isStampBlock, readStamp, stampLabel, withStamp } from './stamps.js';
 
@@ -18,13 +18,21 @@ export const ERROR_ARG_MIN_CHARS = 512;
 /** Minimum character savings required before replacing an older identical `read` result. */
 export const MIN_DUPLICATE_READ_SAVINGS = 64;
 
-const OWN_TOOLS = new Set([FOLD_TOOL, UNFOLD_TOOL, FORK_TOOL, 'recall', 'ask']);
+/** Results and tool calls belonging to episodes itself: bounded or standing as notes. */
+export const UNCAPPED_TOOLS: ReadonlySet<string> = new Set([
+  FOLD_TOOL,
+  UNFOLD_TOOL,
+  FORK_TOOL,
+  'recall',
+  'ask'
+]);
 const PRESERVED_ARG_KEYS = new Set(['path', 'file', 'filePath']);
-const ALREADY_OMITTED_ARG = /^\[\d+ characters omitted from failed .+ call\]$/;
 
 export interface FoldTailPruneOptions {
   branch: readonly SessionEntry[];
   pending?: readonly { type: string; targetId?: string; replacement?: unknown }[];
+  /** Cut-short recovery edits emitted just ahead of this fold in the same `turn_end` batch. */
+  repairDrafts?: readonly ContextEditEntryDraft[];
   editOwners: ReadonlyMap<string, { kind: 'fold' | 'unfold'; handle: string }>;
   afterEntryId: string;
   beforeEntryId: string;
@@ -67,12 +75,20 @@ function totalChars(blocks: readonly (TextContent | ImageContent)[]): number {
   return chars;
 }
 
+function payloadCovers(later: ReadPayloadCoverage, earlier: ReadPayloadCoverage): boolean {
+  if (later.uncapped) return true;
+  if (earlier.uncapped) return false;
+  return later.block === earlier.block && later.head >= earlier.head && later.tail >= earlier.tail;
+}
+
 function readSignature(
   args: Record<string, unknown> | undefined,
   cwd: string
 ): { key: string; resolvedPath: string } | undefined {
-  if (!args || typeof args.path !== 'string' || !args.path.trim()) return undefined;
-  const resolvedPath = absolutePath(cwd, args.path);
+  if (!args || typeof args.path !== 'string') return undefined;
+  const stripped = args.path.trim().replace(/^@/, '');
+  if (!stripped) return undefined;
+  const resolvedPath = absolutePath(cwd, stripped);
   const rest: Record<string, unknown> = {};
   for (const key of Object.keys(args).sort()) {
     const value = args[key];
@@ -85,8 +101,8 @@ function readSignature(
 
 function displayPath(cwd: string, resolvedPath: string): string {
   const rel = relative(cwd, resolvedPath);
-  if (!rel) return '.';
-  return rel.startsWith('..') ? resolvedPath : rel;
+  if (rel && !rel.startsWith('..') && !rel.startsWith('/')) return rel;
+  return resolvedPath;
 }
 
 function trimFailedArgValue(
@@ -94,17 +110,18 @@ function trimFailedArgValue(
   toolName: string,
   key?: string
 ): { value: unknown; changed: boolean } {
-  if (key !== undefined && PRESERVED_ARG_KEYS.has(key)) {
-    return { value, changed: false };
-  }
   if (typeof value === 'string') {
-    if (value.length >= ERROR_ARG_MIN_CHARS && !ALREADY_OMITTED_ARG.test(value)) {
-      return {
-        value: `[${value.length} characters omitted from failed ${toolName} call]`,
-        changed: true
-      };
+    if (key && PRESERVED_ARG_KEYS.has(key)) return { value, changed: false };
+    if (
+      value.length < ERROR_ARG_MIN_CHARS ||
+      /^\[\d+ characters omitted from failed /.test(value)
+    ) {
+      return { value, changed: false };
     }
-    return { value, changed: false };
+    return {
+      value: `[${value.length} characters omitted from failed ${toolName} call]`,
+      changed: true
+    };
   }
   if (Array.isArray(value)) {
     let changed = false;
@@ -115,13 +132,13 @@ function trimFailedArgValue(
     });
     return changed ? { value: next, changed: true } : { value, changed: false };
   }
-  if (value !== null && typeof value === 'object') {
+  if (value && typeof value === 'object') {
     let changed = false;
     const next: Record<string, unknown> = {};
-    for (const [entryKey, entryValue] of Object.entries(value as Record<string, unknown>)) {
-      const res = trimFailedArgValue(entryValue, toolName, entryKey);
+    for (const [prop, child] of Object.entries(value as Record<string, unknown>)) {
+      const res = trimFailedArgValue(child, toolName, prop);
       if (res.changed) changed = true;
-      next[entryKey] = res.value;
+      next[prop] = res.value;
     }
     return changed ? { value: next, changed: true } : { value, changed: false };
   }
@@ -129,89 +146,143 @@ function trimFailedArgValue(
 }
 
 /**
- * Plans deterministic context edits on the surviving tail strictly after a folded span
- * (`afterEntryId`) and strictly before the assistant response that called `fold` (`beforeEntryId`):
- * 1. Stubs older `read` results when a newer `read` in the surviving tail has identical file/range
- *    arguments and identical verified complete content, keeping the older stamp and pairing.
- * 2. Trims large string arguments on tool calls paired with `isError` results once at least
- *    `ERROR_PRUNE_AFTER_TURNS` later surviving assistant turns follow them in the tail,
- *    composing into a single replacement with `retireAssistantContent`.
+ * Plans deterministic cleanup on the surviving tail after a folded span (`afterEntryId`, exclusive)
+ * and before the assistant turn that invoked `fold` (`beforeEntryId`, exclusive).
+ *
+ * Pre-fold prefixes are never inspected or edited.
  */
 export function planFoldTailPruning(options: FoldTailPruneOptions): FoldTailPrunePlan {
+  const {
+    branch,
+    pending = [],
+    repairDrafts = [],
+    editOwners,
+    afterEntryId,
+    beforeEntryId,
+    cwd
+  } = options;
   const assistantReplacements = new Map<string, AssistantMessage['content']>();
   const readEdits: ContextEditEntryDraft[] = [];
   const readDeps: ReadPruneDependency[] = [];
 
-  const { branch, pending = [], editOwners, afterEntryId, beforeEntryId, cwd } = options;
   const afterIndex = branch.findIndex((entry) => entry.id === afterEntryId);
   const beforeIndex = branch.findIndex((entry) => entry.id === beforeEntryId);
-  if (afterIndex < 0 || beforeIndex <= afterIndex + 1) {
+  if (afterIndex < 0 || beforeIndex < 0 || afterIndex + 1 >= beforeIndex) {
     return { assistantReplacements, readEdits, readDeps };
   }
 
-  const externallyEdited = new Set<string>();
-  const pendingNull = new Set<string>();
-  for (const entry of branch) {
-    if (entry.type === 'context_edit' && !editOwners.has(entry.id)) {
-      externallyEdited.add(entry.targetId);
+  const pendingEditedIds = new Set<string>();
+  const synthEdits: SessionEntry[] = [];
+  let seq = 0;
+  let lastParentId: string | null = branch.at(-1)?.id ?? null;
+  for (const draft of pending) {
+    if (draft.type === 'context_edit' && typeof draft.targetId === 'string') {
+      pendingEditedIds.add(draft.targetId);
+      const id = `__pending_${seq++}`;
+      synthEdits.push({
+        type: 'context_edit',
+        id,
+        parentId: lastParentId,
+        timestamp: new Date(0).toISOString(),
+        targetId: draft.targetId,
+        replacement: draft.replacement as ContextEditEntryDraft['replacement']
+      });
+      lastParentId = id;
     }
   }
-  for (const draft of pending) {
-    if (draft.type === 'context_edit' && draft.targetId !== undefined) {
-      externallyEdited.add(draft.targetId);
-      if (draft.replacement === null) pendingNull.add(draft.targetId);
-      else pendingNull.delete(draft.targetId);
+  for (const draft of repairDrafts) {
+    const id = `__repair_${seq++}`;
+    synthEdits.push({
+      type: 'context_edit',
+      id,
+      parentId: lastParentId,
+      timestamp: new Date(0).toISOString(),
+      targetId: draft.targetId,
+      replacement: draft.replacement
+    });
+    lastParentId = id;
+  }
+
+  const externallyEditedIds = new Set<string>(pendingEditedIds);
+  for (const entry of branch) {
+    if (entry.type === 'context_edit' && !editOwners.has(entry.id)) {
+      externallyEditedIds.add(entry.targetId);
     }
   }
 
-  const projection = buildSessionProjection([...branch]);
-  const byId = new Map(projection.entries.map((entry) => [entry.sourceEntry.id, entry]));
-  const tailSlice = branch.slice(afterIndex + 1, beforeIndex);
+  const effectiveEntries: SessionEntry[] =
+    synthEdits.length > 0 ? [...branch, ...synthEdits] : [...branch];
+  const projection = buildSessionProjection(effectiveEntries);
+  const projectedById = new Map(projection.entries.map((entry) => [entry.sourceEntry.id, entry]));
 
   interface TailAssistant {
     entryId: string;
+    order: number;
     projected: AssistantMessage;
     externallyEdited: boolean;
   }
   interface TailToolResult {
     entryId: string;
-    sourceDetails: unknown;
-    projected: Extract<SessionEntry, { type: 'message' }>['message'] & { role: 'toolResult' };
-    externallyEdited: boolean;
     order: number;
+    projected: Extract<
+      (typeof projection.entries)[number]['messages'][number],
+      { role: 'toolResult' }
+    >;
+    sourceDetails: unknown;
+    externallyEdited: boolean;
   }
 
   const survivingAssistants: TailAssistant[] = [];
-  const callsById = new Map<string, { call: ToolCall; assistantExternallyEdited: boolean }>();
-  const resultsByCallId = new Map<string, TailToolResult>();
   const tailResults: TailToolResult[] = [];
+  const callsById = new Map<
+    string,
+    { assistantId: string; assistantExternallyEdited: boolean; call: ToolCall }
+  >();
+  const ambiguousCallIds = new Set<string>();
+  const resultsByCallId = new Map<string, TailToolResult>();
+  const ambiguousResultIds = new Set<string>();
 
-  for (let i = 0; i < tailSlice.length; i++) {
-    const entry = tailSlice[i]!;
-    if (entry.type !== 'message' || pendingNull.has(entry.id)) continue;
-    const projectedMsg = byId.get(entry.id)?.messages[0];
-    if (!projectedMsg) continue;
-    const isExternal = externallyEdited.has(entry.id);
-    if (entry.message.role === 'assistant' && projectedMsg.role === 'assistant') {
+  for (let idx = afterIndex + 1; idx < beforeIndex; idx++) {
+    const source = branch[idx]!;
+    if (source.type !== 'message') continue;
+    const projEntry = projectedById.get(source.id);
+    if (!projEntry || projEntry.messages.length === 0) continue;
+    const externallyEdited = externallyEditedIds.has(source.id);
+    const msg = projEntry.messages[0]!;
+    if (source.message.role === 'assistant' && msg.role === 'assistant') {
       survivingAssistants.push({
-        entryId: entry.id,
-        projected: projectedMsg,
-        externallyEdited: isExternal
+        entryId: source.id,
+        order: idx,
+        projected: msg,
+        externallyEdited
       });
-      for (const block of projectedMsg.content) {
-        if (block.type === 'toolCall') {
-          callsById.set(block.id, { call: block, assistantExternallyEdited: isExternal });
+      for (const block of msg.content) {
+        if (block.type !== 'toolCall') continue;
+        if (callsById.has(block.id) || ambiguousCallIds.has(block.id)) {
+          callsById.delete(block.id);
+          ambiguousCallIds.add(block.id);
+        } else {
+          callsById.set(block.id, {
+            assistantId: source.id,
+            assistantExternallyEdited: externallyEdited,
+            call: block
+          });
         }
       }
-    } else if (entry.message.role === 'toolResult' && projectedMsg.role === 'toolResult') {
+    } else if (source.message.role === 'toolResult' && msg.role === 'toolResult') {
       const item: TailToolResult = {
-        entryId: entry.id,
-        sourceDetails: entry.message.details,
-        projected: projectedMsg,
-        externallyEdited: isExternal,
-        order: i
+        entryId: source.id,
+        order: idx,
+        projected: msg,
+        sourceDetails: source.message.details,
+        externallyEdited
       };
-      resultsByCallId.set(projectedMsg.toolCallId, item);
+      if (resultsByCallId.has(msg.toolCallId) || ambiguousResultIds.has(msg.toolCallId)) {
+        resultsByCallId.delete(msg.toolCallId);
+        ambiguousResultIds.add(msg.toolCallId);
+      } else {
+        resultsByCallId.set(msg.toolCallId, item);
+      }
       tailResults.push(item);
     }
   }
@@ -223,12 +294,25 @@ export function planFoldTailPruning(options: FoldTailPruneOptions): FoldTailPrun
     resolvedPath: string;
     stamp: number | undefined;
     projectedContent: (TextContent | ImageContent)[];
-    unstamped: (TextContent | ImageContent)[];
+    visibleChars: number;
+    coverage: ReadPayloadCoverage;
     complete: TextContent[];
   }
-  const groups = new Map<string, ReadCandidate[]>();
+  interface RawReadItem {
+    item: TailToolResult;
+    resolvedPath: string;
+    stamp: number | undefined;
+    unstamped: (TextContent | ImageContent)[];
+  }
+  const rawBuckets = new Map<string, RawReadItem[]>();
   for (const item of tailResults) {
-    if (item.externallyEdited || item.projected.isError || item.projected.toolName !== 'read') {
+    if (
+      item.externallyEdited ||
+      item.projected.isError ||
+      item.projected.toolName !== 'read' ||
+      ambiguousCallIds.has(item.projected.toolCallId) ||
+      ambiguousResultIds.has(item.projected.toolCallId)
+    ) {
       continue;
     }
     const pairedCall = callsById.get(item.projected.toolCallId);
@@ -249,22 +333,33 @@ export function planFoldTailPruning(options: FoldTailPruneOptions): FoldTailPrun
     ) {
       continue;
     }
-    const complete = completeReadBlocks(unstamped, item.sourceDetails);
-    if (!complete) continue;
-    let list = groups.get(sig.key);
-    if (!list) {
-      list = [];
-      groups.set(sig.key, list);
+    let bucket = rawBuckets.get(sig.key);
+    if (!bucket) {
+      bucket = [];
+      rawBuckets.set(sig.key, bucket);
     }
-    list.push({
-      entryId: item.entryId,
-      order: item.order,
-      resolvedPath: sig.resolvedPath,
-      stamp,
-      projectedContent: [...item.projected.content],
-      unstamped,
-      complete
-    });
+    bucket.push({ item, resolvedPath: sig.resolvedPath, stamp, unstamped });
+  }
+
+  const groups = new Map<string, ReadCandidate[]>();
+  for (const [key, bucket] of rawBuckets) {
+    if (bucket.length < 2) continue;
+    const list: ReadCandidate[] = [];
+    for (const { item, resolvedPath, stamp, unstamped } of bucket) {
+      const verified = verifyCompleteRead(unstamped, item.sourceDetails);
+      if (!verified) continue;
+      list.push({
+        entryId: item.entryId,
+        order: item.order,
+        resolvedPath,
+        stamp,
+        projectedContent: [...item.projected.content],
+        visibleChars: totalChars(unstamped),
+        coverage: verified.coverage,
+        complete: verified.blocks
+      });
+    }
+    if (list.length >= 2) groups.set(key, list);
   }
 
   const pendingReadEdits: {
@@ -279,7 +374,10 @@ export function planFoldTailPruning(options: FoldTailPruneOptions): FoldTailPrun
       let newestMatch: ReadCandidate | undefined;
       for (let j = candidates.length - 1; j > i; j--) {
         const later = candidates[j]!;
-        if (sameTextBlocks(earlier.complete, later.complete)) {
+        if (
+          payloadCovers(later.coverage, earlier.coverage) &&
+          sameTextBlocks(earlier.complete, later.complete)
+        ) {
           newestMatch = later;
           break;
         }
@@ -287,11 +385,14 @@ export function planFoldTailPruning(options: FoldTailPruneOptions): FoldTailPrun
       if (!newestMatch) continue;
       const shownPath = displayPath(cwd, earlier.resolvedPath);
       const fullChars = totalChars(earlier.complete);
-      const projectedChars = totalChars(earlier.unstamped);
       const laterRef =
         newestMatch.stamp !== undefined ? stampLabel(newestMatch.stamp) : 'a later read';
-      const stub = `[duplicate read of ${shownPath}, ${fullChars} chars; identical to ${laterRef}]`;
-      if (projectedChars - stub.length < MIN_DUPLICATE_READ_SAVINGS) continue;
+      const redirectHint =
+        newestMatch.stamp !== undefined
+          ? ` (if ${laterRef} is later folded, check that fold note for its handle and call recall with turn "${laterRef}")`
+          : '';
+      const stub = `[duplicate read of ${shownPath}, ${fullChars} chars; identical to ${laterRef}${redirectHint}]`;
+      if (earlier.visibleChars - stub.length < MIN_DUPLICATE_READ_SAVINGS) continue;
       const content =
         earlier.stamp !== undefined
           ? withStamp(stub, earlier.stamp)
@@ -322,7 +423,14 @@ export function planFoldTailPruning(options: FoldTailPruneOptions): FoldTailPrun
     if (item.externallyEdited) continue;
     let modified = false;
     const nextBlocks = item.projected.content.map((block) => {
-      if (block.type !== 'toolCall' || OWN_TOOLS.has(block.name)) return block;
+      if (
+        block.type !== 'toolCall' ||
+        UNCAPPED_TOOLS.has(block.name) ||
+        ambiguousCallIds.has(block.id) ||
+        ambiguousResultIds.has(block.id)
+      ) {
+        return block;
+      }
       const paired = resultsByCallId.get(block.id);
       if (!paired || paired.externallyEdited || !paired.projected.isError) return block;
       const trimmed = trimFailedArgValue(block.arguments, block.name);

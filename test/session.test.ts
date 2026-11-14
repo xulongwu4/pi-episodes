@@ -1162,6 +1162,67 @@ test('a large read result arrives cut, leaves errors and images whole, and recal
   }
 });
 
+test('large SKILL.md reads and --no-session reads stay whole', async () => {
+  const skillRows = Array.from(
+    { length: 600 },
+    (_, i) => `skill rule ${i + 1}: follow invariant`
+  ).join('\n');
+  const regularRows = Array.from({ length: 600 }, (_, i) => `data line ${i + 1} of dataset`).join(
+    '\n'
+  );
+
+  // 1. SKILL.md (including @-prefixed path) stays whole even when outputCapChars is exceeded.
+  const skillHarness = await createSession(
+    [
+      () =>
+        fauxAssistantMessage([
+          fauxToolCall('read', { path: 'skills/demo/SKILL.md' }),
+          fauxToolCall('read', { path: '@skills/demo/SKILL.md' })
+        ]),
+      (context) => {
+        const recent = conversation(context).slice(-2);
+        for (const msg of recent) {
+          assert.match(text(msg), /skill rule 300: follow invariant/);
+          assert.doesNotMatch(text(msg), /left out here/);
+        }
+        return fauxAssistantMessage('done');
+      }
+    ],
+    { persist: true, episodes: { outputCapChars: 2000, outputCapKeepChars: 600 } }
+  );
+  try {
+    await mkdir(join(skillHarness.dir, 'skills/demo'), { recursive: true });
+    await writeFile(join(skillHarness.dir, 'skills/demo/SKILL.md'), `${skillRows}\n`);
+    await skillHarness.session.prompt('load skill');
+    if (skillHarness.failures[0]) throw skillHarness.failures[0];
+    assert.equal(skillHarness.pending(), 0);
+  } finally {
+    await skillHarness.cleanup();
+  }
+
+  // 2. --no-session (persist: false) leaves large reads whole.
+  const noSessionHarness = await createSession(
+    [
+      () => fauxAssistantMessage(fauxToolCall('read', { path: 'dataset.txt' })),
+      (context) => {
+        const out = text(conversation(context).at(-1)!);
+        assert.match(out, /data line 300 of dataset/);
+        assert.doesNotMatch(out, /left out here/);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    { persist: false, episodes: { outputCapChars: 2000, outputCapKeepChars: 600 } }
+  );
+  try {
+    await writeFile(join(noSessionHarness.dir, 'dataset.txt'), `${regularRows}\n`);
+    await noSessionHarness.session.prompt('read dataset');
+    if (noSessionHarness.failures[0]) throw noSessionHarness.failures[0];
+    assert.equal(noSessionHarness.pending(), 0);
+  } finally {
+    await noSessionHarness.cleanup();
+  }
+});
+
 test('an output cap that is off leaves large results whole', async () => {
   const harness = await createSession(
     [

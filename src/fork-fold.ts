@@ -252,6 +252,7 @@ export class ForkFolds {
           changes: undefined,
           touched,
           keptUserTurns: plan.keptUserTurns,
+          archivedReadTurns: plan.archivedReadTurns,
           keptFrom,
           covers: plan.covers,
           skills: skillPaths(plan.spanMessages, this.state.cwd),

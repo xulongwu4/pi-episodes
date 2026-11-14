@@ -26,7 +26,12 @@ import {
   SessionManager,
   SettingsManager
 } from '@earendil-works/pi-coding-agent';
-import { FOLD_STARTED_TYPE } from '../src/archive.js';
+import {
+  FOLD_APPLIED_TYPE,
+  FOLD_STARTED_TYPE,
+  FOLD_UNFOLD_STARTED_TYPE,
+  FOLD_UNFOLDED_TYPE
+} from '../src/archive.js';
 import {
   attributeEpisodesEdits,
   completeCutShortFolds,
@@ -39,6 +44,7 @@ import {
 import episodes from '../src/index.js';
 import { CAPPED_KEY, capOutput } from '../src/output.js';
 import { readStamp, withStamp } from '../src/stamps.js';
+import { episodeStats } from '../src/stats.js';
 import { assistant, call, result, session, user } from './helpers.js';
 
 function text(message: AgentMessage): string {
@@ -223,7 +229,10 @@ test('duplicate reads in surviving tail keep only newest identical read, preserv
       timestamp: 0
     };
     assert.equal(readStamp(msg), expectedStamp);
-    assert.match(text(msg), /\[duplicate read of src\/same\.ts, \d+ chars; identical to t6\]/);
+    assert.match(
+      text(msg),
+      /\[duplicate read of src\/same\.ts, \d+ chars; identical to t6 \(if t6 is later folded, check that fold note for its handle and call recall with turn "t6"\)\]/
+    );
   }
 });
 
@@ -512,11 +521,23 @@ test('real session end-to-end: fold with until prunes duplicate reads and aged f
     const oldBrokenMarker = 'OLD_BROKEN_PAYLOAD_'.repeat(40);
     const recentBrokenMarker = 'RECENT_BROKEN_PAYLOAD_'.repeat(40);
     await writeFile(join(dir, 'big.ts'), `${bigFile}\n`);
+    const hugeInner = Array.from(
+      { length: 700 },
+      (_, i) => `inner codemode line ${i + 1} payload`
+    ).join('\n');
+    await writeFile(join(dir, 'huge-inner.txt'), `${hugeInner}\n`);
 
     let handle = '';
     const faux = fauxProvider({ models: [{ id: 'faux-prune', reasoning: true }] });
     faux.setResponses([
-      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo ep1' })),
+      () =>
+        mode === 'only'
+          ? fauxAssistantMessage(
+              fauxToolCall('codemode', {
+                code: 'const r = await tools.read({ path: "huge-inner.txt" }); const body = typeof r === "string" ? r : JSON.stringify(r); if (!body.includes("inner codemode line 350") || body.includes("left out here")) throw new Error("nested codemode read was capped"); return "ep1-ok";'
+              })
+            )
+          : fauxAssistantMessage(fauxToolCall('bash', { command: 'echo ep1' })),
       () =>
         fauxAssistantMessage([
           fauxToolCall('read', { path: 'big.ts' }),
@@ -570,7 +591,7 @@ test('real session end-to-end: fold with until prunes duplicate reads and aged f
         assert.equal(readResults.length, 2);
         assert.match(
           text(readResults[0]!),
-          /^\[duplicate read of big\.ts, \d+ chars; identical to t\d+\]\n\[t3\]$/
+          /^\[duplicate read of big\.ts, \d+ chars; identical to t\d+ \(if t\d+ is later folded, check that fold note for its handle and call recall with turn "t\d+"\)\]\n\[t3\]$/
         );
         assert.match(text(readResults[1]!), /export const line_40/);
 
@@ -1148,7 +1169,8 @@ test('completeCutShortFolds revalidates newer-read dependency across before/afte
 });
 
 test('completeCutShortFolds revalidates newer capped-read archive file across before and after crash points', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-prune-rec-cap-'));
+  const dirOlder = await mkdtemp(join(tmpdir(), 'pi-episodes-prune-rec-old-'));
+  const dirNewer = await mkdtemp(join(tmpdir(), 'pi-episodes-prune-rec-new-'));
   try {
     const headLines = Array.from({ length: 20 }, (_, i) => `head line ${i}`).join('\n');
     const midLines = Array.from(
@@ -1157,10 +1179,20 @@ test('completeCutShortFolds revalidates newer capped-read archive file across be
     ).join('\n');
     const tailLines = Array.from({ length: 20 }, (_, i) => `tail line ${i}`).join('\n');
     const fullText = `${headLines}\n${midLines}\n${tailLines}`;
-    const cutNewer = await capOutput([{ type: 'text', text: fullText }], dir, 500, 200);
-    assert.ok(cutNewer);
+    const cutOlder = await capOutput([{ type: 'text', text: fullText }], dirOlder, 500, 200);
+    const cutNewer = await capOutput([{ type: 'text', text: fullText }], dirNewer, 500, 200);
+    assert.ok(cutOlder && cutNewer);
 
     const buildCappedDepScenario = () => {
+      const olderMsg = {
+        role: 'toolResult' as const,
+        toolCallId: 'r1',
+        toolName: 'read',
+        content: withStamp(cutOlder.content, 3),
+        details: { [CAPPED_KEY]: { ...cutOlder.capped } },
+        isError: false,
+        timestamp: 0
+      };
       const newerMsg = {
         role: 'toolResult' as const,
         toolCallId: 'r2',
@@ -1174,9 +1206,8 @@ test('completeCutShortFolds revalidates newer capped-read archive file across be
         user('go', 1),
         assistant(call('s1', 'bash', { command: 'echo 1' })),
         result('s1', 'bash', '1', 2),
-        // Older read holds full uncapped text; newer identical read is capped.
         assistant(call('r1', 'read', { path: 'big.ts' })),
-        result('r1', 'read', fullText, 3),
+        olderMsg,
         assistant(call('r2', 'read', { path: 'big.ts' })),
         newerMsg,
         assistant(call('f1', 'fold', { since: 't2', until: 't2', note: 'Ep1.' }))
@@ -1205,13 +1236,12 @@ test('completeCutShortFolds revalidates newer capped-read archive file across be
         editOwners: attributeEpisodesEdits(branch),
         afterEntryId: plan.lastEntryId,
         beforeEntryId: ids[7]!,
-        cwd: dir
+        cwd: dirNewer
       });
       assert.equal(tail.readEdits.length, 1);
       return { manager, plan, tail, edits: [...plan.edits, ...tail.readEdits] };
     };
 
-    // 1. Interruption BEFORE older-read stub; newer capped archive middle is corrupted without changing preview.
     {
       const { manager, plan, tail, edits } = buildCappedDepScenario();
       manager.appendCustomEntry(FOLD_STARTED_TYPE, {
@@ -1233,12 +1263,10 @@ test('completeCutShortFolds revalidates newer capped-read archive file across be
         msgs.some((m) => text(m).includes('[duplicate read of big.ts')),
         false
       );
-      assert.ok(msgs.some((m) => text(m).includes('middle line 060')));
-      // Restore intact archive for Case 2.
+      assert.ok(msgs.some((m) => text(m).includes(cutOlder.capped.path)));
       await writeFile(cutNewer.capped.path, fullText);
     }
 
-    // 2. Interruption AFTER older-read stub; newer capped archive is deleted without changing preview.
     {
       const { manager, plan, tail, edits } = buildCappedDepScenario();
       manager.appendCustomEntry(FOLD_STARTED_TYPE, {
@@ -1261,9 +1289,712 @@ test('completeCutShortFolds revalidates newer capped-read archive file across be
         msgs.some((m) => text(m).includes('[duplicate read of big.ts')),
         false
       );
-      assert.ok(msgs.some((m) => text(m).includes('middle line 060')));
+      assert.ok(msgs.some((m) => text(m).includes(cutOlder.capped.path)));
+    }
+  } finally {
+    await rm(dirOlder, { recursive: true, force: true });
+    await rm(dirNewer, { recursive: true, force: true });
+  }
+});
+
+test('double crash persists recovery-segment markers, restores episodes edits, and never claims identical external edits', () => {
+  const dupBody = 'export const keep = 42;\n'.repeat(30);
+  const hugeArg = 'BROKEN_MULTI_CRASH_'.repeat(40);
+  const { manager, ids } = session([
+    user('start', 1),
+    assistant(call('s1', 'bash', { command: 'echo 1' })),
+    result('s1', 'bash', '1', 2),
+    assistant(call('s2', 'bash', { command: 'echo 2' })),
+    result('s2', 'bash', '2', 3),
+    assistant(
+      call('r1', 'read', { path: 'x.ts' }),
+      call('e1', 'bash', { command: `false # ${hugeArg}` })
+    ),
+    result('r1', 'read', dupBody, 4),
+    Object.assign(result('e1', 'bash', 'exit 1', 5), { isError: true }),
+    assistant(call('t1', 'bash', { command: 'echo a' })),
+    result('t1', 'bash', 'a', 6),
+    assistant(call('t2', 'bash', { command: 'echo b' })),
+    result('t2', 'bash', 'b', 7),
+    assistant(call('r2', 'read', { path: 'x.ts' })),
+    result('r2', 'read', dupBody, 8),
+    assistant(call('f1', 'fold', { since: 't2', until: 't3', note: 'Ep1.' }))
+  ]);
+
+  const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2, { until: 3 });
+  manager.appendMessage(
+    Object.assign(result('f1', 'fold', `[fold ${plan.handle}]\nEp1.`, 9), {
+      details: {
+        kind: 'fold',
+        handle: plan.handle,
+        since: 't2',
+        until: 't3',
+        firstEntryId: plan.firstEntryId,
+        lastEntryId: plan.lastEntryId,
+        messages: plan.omitted.length,
+        tokens: 10,
+        headline: 'Ep1.',
+        keptUserTurns: [],
+        files: []
+      }
+    })
+  );
+  const branch0 = manager.getBranch();
+  const tail = planFoldTailPruning({
+    branch: branch0,
+    editOwners: attributeEpisodesEdits(branch0),
+    afterEntryId: plan.lastEntryId,
+    beforeEntryId: ids[14]!,
+    cwd: '/repo'
+  });
+  const planTargets = new Set(plan.edits.map((edit) => edit.targetId));
+  const fullBatch = [
+    ...[...tail.assistantReplacements.entries()]
+      .filter(([targetId]) => !planTargets.has(targetId))
+      .map(([targetId, content]) => ({
+        type: 'context_edit' as const,
+        targetId,
+        replacement: { content }
+      })),
+    ...plan.edits.map((edit) =>
+      tail.assistantReplacements.has(edit.targetId)
+        ? {
+            type: 'context_edit' as const,
+            targetId: edit.targetId,
+            replacement: { content: tail.assistantReplacements.get(edit.targetId)! }
+          }
+        : edit
+    ),
+    ...tail.readEdits
+  ];
+
+  // Crash 1: FOLD_STARTED_TYPE written, then crash before any context_edit!
+  manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+    handle: plan.handle,
+    edits: fullBatch,
+    readDeps: tail.readDeps
+  });
+
+  // Resumed Turn A: user/assistant messages + an external edit IDENTICAL to planned removal (ids[2] -> null, ids[1] -> null),
+  // PLUS an external replacement on t1 result!
+  manager.appendMessage(user('resumed 1', 10));
+  manager.appendMessage(assistant('ack 1'));
+  manager.appendContextEdit(ids[1]!, null);
+  manager.appendContextEdit(ids[2]!, null);
+  manager.appendContextEdit(ids[9]!, {
+    content: withStamp([{ type: 'text', text: '[external note on t6]' }], 6)
+  });
+  // Recovery runs and persists all entries EXCEPT the final FOLD_APPLIED_TYPE (Crash 2 right before completion marker!).
+  const rec1 = completeCutShortFolds(manager.getBranch());
+  assert.equal(rec1[0]?.type, 'custom');
+  assert.equal((rec1[0] as { customType?: string }).customType, 'episodes-fold-recovery-started');
+  for (const item of rec1.slice(0, -1)) {
+    if (item.type === 'context_edit') manager.appendContextEdit(item.targetId, item.replacement);
+    else manager.appendCustomEntry(item.customType, item.data);
+  }
+
+  // Resumed Turn B: another conversation turn, then recovery finishes FOLD_APPLIED_TYPE!
+  manager.appendMessage(user('resumed 2', 11));
+  manager.appendMessage(assistant('ack 2'));
+  for (const item of completeCutShortFolds(manager.getBranch())) {
+    if (item.type === 'context_edit') manager.appendContextEdit(item.targetId, item.replacement);
+    else manager.appendCustomEntry(item.customType, item.data);
+  }
+
+  const foldedMsgs = manager.buildSessionProjection().messages;
+  assert.ok(foldedMsgs.some((m) => text(m).includes('[duplicate read of x.ts')));
+  assert.equal(JSON.stringify(foldedMsgs).includes(hugeArg), false);
+
+  // Unfold ep-1: episodes-owned span (s2 at ids[3..4]) & tail edits ARE restored,
+  // while external identical removals (ids[1..2] -> null) and external replacement on ids[9] stand!
+  manager.appendMessage(assistant(call('u1', 'unfold', { handle: plan.handle })));
+  const unfoldPlan = planUnfold(
+    manager.getBranch(),
+    manager.buildSessionProjection().entries,
+    plan.handle,
+    { callerId: 'u1' }
+  );
+  for (const edit of unfoldPlan.edits) {
+    manager.appendContextEdit(edit.targetId, edit.replacement);
+  }
+  const unfoldedProj = manager.buildSessionProjection();
+  const unfoldedById = new Map(unfoldedProj.entries.map((e) => [e.sourceEntry.id, e]));
+  assert.equal(unfoldedById.get(ids[1]!)!.messages.length, 0);
+  assert.equal(unfoldedById.get(ids[2]!)!.messages.length, 0);
+  assert.equal(unfoldedById.get(ids[3]!)!.messages.length, 1);
+  assert.equal(unfoldedById.get(ids[4]!)!.messages.length, 1);
+  const unfoldedMsgs = unfoldedProj.messages;
+  assert.equal(
+    unfoldedMsgs.some((m) => text(m).includes('[duplicate read of x.ts')),
+    false
+  );
+  assert.equal(JSON.stringify(unfoldedMsgs).includes(hugeArg), true);
+  assert.ok(unfoldedMsgs.some((m) => text(m).includes('[external note on t6]')));
+});
+
+test('recovery retires signed intervening resumed assistants before removals and never claims external edits before an empty completion marker', () => {
+  // 1. Signed intervening resumed assistant Turn A must be retired BEFORE recovery removes earlier history.
+  {
+    const { manager } = session([
+      user('start', 1),
+      assistant(call('s1', 'bash', { command: 'echo 1' })),
+      result('s1', 'bash', '1', 2),
+      assistant(call('f1', 'fold', { since: 't2', note: 'Ep1.' }))
+    ]);
+    const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2);
+    manager.appendMessage(
+      Object.assign(result('f1', 'fold', `[fold ${plan.handle}]\nEp1.`, 3), {
+        details: {
+          kind: 'fold',
+          handle: plan.handle,
+          since: 't2',
+          firstEntryId: plan.firstEntryId,
+          lastEntryId: plan.lastEntryId,
+          messages: plan.omitted.length,
+          tokens: 10,
+          headline: 'Ep1.',
+          keptUserTurns: [],
+          files: []
+        }
+      })
+    );
+    // Crash 1 right after FOLD_STARTED_TYPE.
+    manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
+    // Resumed Turn A persists a SIGNED assistant response, then crashes again before recovery!
+    manager.appendMessage(user('resumed A', 4));
+    const signedTurnA: AssistantMessage = {
+      ...assistant('reply A'),
+      content: [
+        { type: 'thinking', thinking: 'reasoning A', thinkingSignature: 'sig-turn-A' },
+        { type: 'text', text: 'reply A', textSignature: 'txt-sig-A' }
+      ]
+    };
+    const turnAId = manager.appendMessage(signedTurnA);
+    // Resumed Turn B completes recovery.
+    manager.appendMessage(user('resumed B', 5));
+    const rec = completeCutShortFolds(manager.getBranch());
+    const editTargets = rec.flatMap((d) => (d.type === 'context_edit' ? [d.targetId] : []));
+    // Turn A must be retired BEFORE any history removal in plan.edits!
+    assert.equal(editTargets[0], turnAId);
+    for (const item of rec) {
+      if (item.type === 'context_edit') manager.appendContextEdit(item.targetId, item.replacement);
+      else manager.appendCustomEntry(item.customType, item.data);
+    }
+    const projStr = JSON.stringify(manager.buildSessionProjection().messages);
+    assert.equal(projStr.includes('sig-turn-A'), false);
+    assert.equal(projStr.includes('txt-sig-A'), false);
+  }
+
+  // 2. Empty recovery (`rest.length === 0`) immediately following external identical `targetId -> null` edits
+  //    must NOT claim those external edits.
+  {
+    const { manager, ids } = session([
+      user('start', 1),
+      assistant(call('s1', 'bash', { command: 'echo 1' })),
+      result('s1', 'bash', '1', 2),
+      assistant(call('s2', 'bash', { command: 'echo 2' })),
+      result('s2', 'bash', '2', 3),
+      assistant(call('f1', 'fold', { since: 't2', note: 'Ep1.' }))
+    ]);
+    const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2);
+    manager.appendMessage(
+      Object.assign(result('f1', 'fold', `[fold ${plan.handle}]\nEp1.`, 4), {
+        details: {
+          kind: 'fold',
+          handle: plan.handle,
+          since: 't2',
+          firstEntryId: plan.firstEntryId,
+          lastEntryId: plan.lastEntryId,
+          messages: plan.omitted.length,
+          tokens: 10,
+          headline: 'Ep1.',
+          keptUserTurns: [],
+          files: []
+        }
+      })
+    );
+    manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
+    // Persist all edits EXCEPT the last two (`ids[1]`, `ids[2]`), then crash.
+    const remaining = new Set([ids[1]!, ids[2]!]);
+    for (const edit of plan.edits) {
+      if (!remaining.has(edit.targetId)) manager.appendContextEdit(edit.targetId, edit.replacement);
+    }
+    manager.appendMessage(user('resumed', 5));
+    // External handler writes `ids[1] -> null` and `ids[2] -> null` IMMEDIATELY before empty recovery!
+    manager.appendContextEdit(ids[1]!, null);
+    manager.appendContextEdit(ids[2]!, null);
+    const emptyRec = completeCutShortFolds(manager.getBranch());
+    assert.equal(emptyRec.length, 1);
+    for (const item of emptyRec) {
+      if (item.type === 'context_edit') manager.appendContextEdit(item.targetId, item.replacement);
+      else manager.appendCustomEntry(item.customType, item.data);
+    }
+    manager.appendMessage(assistant(call('u1', 'unfold', { handle: plan.handle })));
+    const uPlan = planUnfold(
+      manager.getBranch(),
+      manager.buildSessionProjection().entries,
+      plan.handle,
+      { callerId: 'u1' }
+    );
+    for (const edit of uPlan.edits) manager.appendContextEdit(edit.targetId, edit.replacement);
+    const byId = new Map(
+      manager.buildSessionProjection().entries.map((e) => [e.sourceEntry.id, e])
+    );
+    // External removals on ids[1..2] must remain omitted, while episodes-owned ids[3..4] are restored!
+    assert.equal(byId.get(ids[1]!)!.messages.length, 0);
+    assert.equal(byId.get(ids[2]!)!.messages.length, 0);
+    assert.equal(byId.get(ids[3]!)!.messages.length, 1);
+    assert.equal(byId.get(ids[4]!)!.messages.length, 1);
+  }
+});
+
+test('synthetic projection chains multiple pending and repairDrafts entries without losing earlier edits', () => {
+  const dupBody = 'export const item = 99;\n'.repeat(30);
+  const hugeBad = 'SYNTHETIC_CHAIN_ERR_'.repeat(40);
+  const { manager, ids } = session([
+    user('go', 1),
+    assistant(call('s1', 'bash', { command: 'echo 1' })),
+    result('s1', 'bash', '1', 2),
+    assistant(call('bad', 'bash', { command: `false # ${hugeBad}` })),
+    Object.assign(result('bad', 'bash', 'err', 3), { isError: true }),
+    assistant(call('r1', 'read', { path: 'a.ts' })),
+    result('r1', 'read', dupBody, 4),
+    assistant(call('t2', 'bash', { command: 'echo 2' })),
+    result('t2', 'bash', '2', 5),
+    assistant(call('r2', 'read', { path: 'a.ts' })),
+    result('r2', 'read', dupBody, 6),
+    assistant(call('f1', 'fold', { since: 't2', until: 't2', note: 'Done.' }))
+  ]);
+
+  const branch = manager.getBranch();
+  // 1. Multiple pending edits: first removes r2 (ids[10]), second edits t2 result (ids[8]).
+  //    Without chaining parentIds, the second pending edit orphans the first!
+  const withTwoPending = planFoldTailPruning({
+    branch,
+    pending: [
+      { type: 'context_edit', targetId: ids[10]!, replacement: null },
+      {
+        type: 'context_edit',
+        targetId: ids[8]!,
+        replacement: { content: withStamp([{ type: 'text', text: 'patched' }], 5) }
+      }
+    ],
+    editOwners: attributeEpisodesEdits(branch),
+    afterEntryId: ids[2]!,
+    beforeEntryId: ids[11]!,
+    cwd: '/repo'
+  });
+  assert.deepEqual(withTwoPending.readEdits, []);
+
+  // 2. Multiple repairDrafts: first omits assistant t2 (ids[7]) and result (ids[8]), dropping surviving
+  //    assistant turns after 'bad' (ids[3]) from 3 down to 2 -> 'bad' must NOT be error-pruned!
+  const withTwoRepairs = planFoldTailPruning({
+    branch,
+    repairDrafts: [
+      { type: 'context_edit', targetId: ids[7]!, replacement: null },
+      { type: 'context_edit', targetId: ids[8]!, replacement: null }
+    ],
+    editOwners: attributeEpisodesEdits(branch),
+    afterEntryId: ids[2]!,
+    beforeEntryId: ids[11]!,
+    cwd: '/repo'
+  });
+  assert.equal(withTwoRepairs.assistantReplacements.has(ids[3]!), false);
+});
+
+test('payload coverage rejects smaller capped preview with longer archive path, handles @path, and skips duplicate toolCallIds', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-ep-cov-'));
+  const shortDir = join(base, 's');
+  const longDir = join(
+    base,
+    ...Array.from({ length: 8 }, () => 'very-long-archive-directory-segment')
+  );
+  await mkdir(shortDir, { recursive: true });
+  await mkdir(longDir, { recursive: true });
+  try {
+    const fullText = Array.from(
+      { length: 160 },
+      (_, i) => `row ${String(i).padStart(3, '0')} content`
+    ).join('\n');
+    const cutMoreShortPath = await capOutput(
+      [{ type: 'text', text: fullText }],
+      shortDir,
+      500,
+      320
+    );
+    const cutLessLongPath = await capOutput([{ type: 'text', text: fullText }], longDir, 500, 180);
+    assert.ok(cutMoreShortPath && cutLessLongPath);
+    // Confirm the longer archive path makes the smaller-payload preview string LONGER overall!
+    assert.ok(
+      (cutLessLongPath.content[0] as TextContent).text.length >
+        (cutMoreShortPath.content[0] as TextContent).text.length
+    );
+
+    // 1. Older has MORE payload (320 keep) in shortDir; newer has LESS payload (180 keep) in longDir -> MUST NOT stub!
+    {
+      const { manager, ids } = session([
+        user('go', 1),
+        assistant(call('s1', 'bash', { command: 'echo 1' })),
+        result('s1', 'bash', '1', 2),
+        assistant(call('r1', 'read', { path: 'file.ts' })),
+        {
+          role: 'toolResult' as const,
+          toolCallId: 'r1',
+          toolName: 'read',
+          content: withStamp(cutMoreShortPath.content, 3),
+          details: { [CAPPED_KEY]: { ...cutMoreShortPath.capped } },
+          isError: false,
+          timestamp: 0
+        },
+        assistant(call('r2', 'read', { path: 'file.ts' })),
+        {
+          role: 'toolResult' as const,
+          toolCallId: 'r2',
+          toolName: 'read',
+          content: withStamp(cutLessLongPath.content, 4),
+          details: { [CAPPED_KEY]: { ...cutLessLongPath.capped } },
+          isError: false,
+          timestamp: 0
+        },
+        assistant(call('f1', 'fold', { since: 't2', until: 't2', note: 'Done.' }))
+      ]);
+      const branch = manager.getBranch();
+      const plan = planFoldTailPruning({
+        branch,
+        editOwners: attributeEpisodesEdits(branch),
+        afterEntryId: ids[2]!,
+        beforeEntryId: ids.at(-1)!,
+        cwd: base
+      });
+      assert.deepEqual(plan.readEdits, []);
+    }
+
+    // 2. Reverse order: older has LESS payload (180 keep, longDir) and newer has MORE payload (320 keep, shortDir) -> IS stubbed!
+    //    Also verifies @path normalization and skipping repeated toolCallIds.
+    {
+      const hugeBad = 'REPEATED_ID_PAYLOAD_'.repeat(40);
+      const { manager, ids } = session([
+        user('go', 1),
+        assistant(call('s1', 'bash', { command: 'echo 1' })),
+        result('s1', 'bash', '1', 2),
+        assistant(
+          {
+            type: 'toolCall',
+            id: 'r_old',
+            name: 'read',
+            arguments: { path: '@file.ts', offset: 1 }
+          },
+          call('dup', 'bash', { command: `echo ok # ${hugeBad}` })
+        ),
+        {
+          role: 'toolResult' as const,
+          toolCallId: 'r_old',
+          toolName: 'read',
+          content: withStamp(cutLessLongPath.content, 3),
+          details: { [CAPPED_KEY]: { ...cutLessLongPath.capped } },
+          isError: false,
+          timestamp: 0
+        },
+        result('dup', 'bash', 'ok', 4),
+        assistant(call('dup', 'bash', { command: 'false' })),
+        Object.assign(result('dup', 'bash', 'err', 5), { isError: true }),
+        assistant(call('t2', 'bash', { command: 'echo 2' })),
+        result('t2', 'bash', '2', 6),
+        assistant(call('t3', 'bash', { command: 'echo 3' })),
+        result('t3', 'bash', '3', 7),
+        assistant(call('r_new', 'read', { path: 'file.ts' })),
+        {
+          role: 'toolResult' as const,
+          toolCallId: 'r_new',
+          toolName: 'read',
+          content: withStamp(cutMoreShortPath.content, 8),
+          details: { [CAPPED_KEY]: { ...cutMoreShortPath.capped } },
+          isError: false,
+          timestamp: 0
+        },
+        assistant(call('f1', 'fold', { since: 't2', until: 't2', note: 'Done.' }))
+      ]);
+      const branch = manager.getBranch();
+      const plan = planFoldTailPruning({
+        branch,
+        editOwners: attributeEpisodesEdits(branch),
+        afterEntryId: ids[2]!,
+        beforeEntryId: ids.at(-1)!,
+        cwd: base
+      });
+      assert.deepEqual(
+        plan.readEdits.map((e) => e.targetId),
+        [ids[4]]
+      );
+      assert.equal(plan.assistantReplacements.has(ids[3]!), false);
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('later fold removing only newer read preserves prefix bytes and advertises recall handle+turn that retrieves original file after disk change', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-ep-redirect-'));
+  try {
+    const originalFile = Array.from({ length: 40 }, (_, i) => `orig_cfg_${i} = "v1";`).join('\n');
+    await writeFile(join(dir, 'config.ts'), `${originalFile}\n`);
+
+    let advertisedHandle = '';
+    let advertisedTurn = '';
+    const faux = fauxProvider({ models: [{ id: 'faux-redir', reasoning: true }] });
+    faux.setResponses([
+      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo phase1' })),
+      () => fauxAssistantMessage(fauxToolCall('read', { path: 'config.ts' })),
+      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo mid' })),
+      () => fauxAssistantMessage(fauxToolCall('read', { path: 'config.ts' })),
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', { since: 't2', until: 't2', note: 'Closed phase1.' })
+        ),
+      async () => {
+        await writeFile(join(dir, 'config.ts'), 'CHANGED_ON_DISK = true;\n');
+        return fauxAssistantMessage(
+          fauxToolCall('fold', { since: 't4', note: 'Folded mid and second read.' })
+        );
+      },
+      (context) => {
+        const noteText = text(context.messages.at(-1)!);
+        const match = /recall\(\{ handle: "(ep-[0-9a-f]{8})", turn: "(t\d+)" \}\)/.exec(noteText);
+        assert.ok(match, `expected redirect locator in fold note, got: ${noteText}`);
+        advertisedHandle = match[1]!;
+        advertisedTurn = match[2]!;
+        return fauxAssistantMessage(
+          fauxToolCall('recall', { handle: advertisedHandle, turn: advertisedTurn })
+        );
+      },
+      (context) => {
+        const recalled = text(context.messages.at(-1)!);
+        assert.match(recalled, /orig_cfg_25 = "v1";/);
+        assert.doesNotMatch(recalled, /CHANGED_ON_DISK/);
+        return fauxAssistantMessage('verified');
+      }
+    ]);
+
+    const sessionDir = join(dir, 'sessions');
+    await mkdir(sessionDir, { recursive: true });
+    const manager = SessionManager.create(dir, sessionDir);
+    const settings = SettingsManager.inMemory();
+    const loader = new DefaultResourceLoader({
+      cwd: dir,
+      agentDir: dir,
+      noSkills: true,
+      settingsManager: settings,
+      extensionFactories: [(pi) => pi.registerProvider(faux.provider), episodes]
+    });
+    await loader.reload();
+    const created = await createAgentSession({
+      cwd: dir,
+      agentDir: dir,
+      model: faux.getModel(),
+      thinkingLevel: 'off',
+      modelRuntime: await ModelRuntime.create({
+        modelsPath: null,
+        authPath: join(dir, 'auth.json')
+      }),
+      resourceLoader: loader,
+      tools: ['bash', 'read', 'write', 'fold', 'unfold', 'recall', 'ask', 'fork'],
+      sessionManager: manager,
+      settingsManager: settings
+    });
+    try {
+      await created.session.prompt('run');
+      const branch = manager.getBranch();
+      const olderReadEntry = branch.find(
+        (e) =>
+          e.type === 'message' && e.message.role === 'toolResult' && e.message.toolName === 'read'
+      )!;
+      const editsOnOlder = branch.filter(
+        (e) => e.type === 'context_edit' && e.targetId === olderReadEntry.id
+      );
+      assert.equal(editsOnOlder.length, 1);
+    } finally {
+      await created.session.dispose();
     }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('same-batch laterRemovals + episodeStats replay across omit, unfold restore, re-prune, and recovery rollback', () => {
+  const fileText = 'const entry = 12345;\n'.repeat(40);
+  const { manager, ids } = session([
+    user('go', 1),
+    assistant(call('s1', 'bash', { command: 'echo 1' })),
+    result('s1', 'bash', '1', 2),
+    assistant(call('r1', 'read', { path: 'lib.ts' })),
+    result('r1', 'read', fileText, 3),
+    assistant(call('r2', 'read', { path: 'lib.ts' })),
+    result('r2', 'read', fileText, 4),
+    assistant(call('f1', 'fold', { since: 't2', until: 't3', note: 'FoldA.' }))
+  ]);
+
+  // 1. Fold A omits r1 (ids[4] -> replacement: null), then Unfold A restores r1 ({ content }).
+  const planA = planFold(manager.buildSessionProjection().entries, 'f1', 2, { until: 3 });
+  manager.appendMessage(
+    Object.assign(result('f1', 'fold', `[fold ${planA.handle}]\nFoldA.`, 5), {
+      details: {
+        kind: 'fold',
+        handle: planA.handle,
+        since: 't2',
+        until: 't3',
+        firstEntryId: planA.firstEntryId,
+        lastEntryId: planA.lastEntryId,
+        messages: planA.omitted.length,
+        tokens: 220,
+        noteTokens: 4,
+        keptTokens: 0,
+        headline: 'FoldA.',
+        keptUserTurns: [],
+        files: []
+      }
+    })
+  );
+  manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: planA.handle, edits: planA.edits });
+  for (const edit of planA.edits) manager.appendContextEdit(edit.targetId, edit.replacement);
+  manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: planA.handle });
+
+  manager.appendMessage(assistant(call('uA', 'unfold', { handle: planA.handle })));
+  const uPlanA = planUnfold(
+    manager.getBranch(),
+    manager.buildSessionProjection().entries,
+    planA.handle,
+    { callerId: 'uA' }
+  );
+  manager.appendMessage(result('uA', 'unfold', '[unfolded]', 6));
+  manager.appendCustomEntry(FOLD_UNFOLD_STARTED_TYPE, {
+    handle: planA.handle,
+    edits: uPlanA.edits
+  });
+  for (const edit of uPlanA.edits) manager.appendContextEdit(edit.targetId, edit.replacement);
+  manager.appendCustomEntry(FOLD_UNFOLDED_TYPE, { handle: planA.handle });
+
+  // 2. Fold B folds only t2 (since: 't2', until: 't2'), tail-pruning the restored r1 (ids[4]) against r2 (ids[6])!
+  manager.appendMessage(
+    assistant(call('f2', 'fold', { since: 't2', until: 't2', note: 'FoldB.' }))
+  );
+  const f2CallerId = manager.getBranch().at(-1)!.id;
+  const planB = planFold(manager.buildSessionProjection().entries, 'f2', 2, { until: 2 });
+  manager.appendMessage(
+    Object.assign(result('f2', 'fold', `[fold ${planB.handle}]\nFoldB.`, 7), {
+      details: {
+        kind: 'fold',
+        handle: planB.handle,
+        since: 't2',
+        until: 't2',
+        firstEntryId: planB.firstEntryId,
+        lastEntryId: planB.lastEntryId,
+        messages: planB.omitted.length,
+        tokens: 8,
+        noteTokens: 4,
+        keptTokens: 0,
+        headline: 'FoldB.',
+        keptUserTurns: [],
+        files: []
+      }
+    })
+  );
+  const branchB = manager.getBranch();
+  const tailB = planFoldTailPruning({
+    branch: branchB,
+    editOwners: attributeEpisodesEdits(branchB),
+    afterEntryId: planB.lastEntryId,
+    beforeEntryId: f2CallerId,
+    cwd: '/repo'
+  });
+  assert.equal(tailB.readEdits.length, 1);
+
+  // Verify same-batch laterRemovals skips stubbing r1 when r2 (ids[6]) is removed.
+  manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+    handle: planB.handle,
+    edits: [...planB.edits, ...tailB.readEdits],
+    readDeps: tailB.readDeps
+  });
+  const skipped = completeCutShortFolds(manager.getBranch(), [], new Set([ids[6]!]));
+  assert.equal(
+    skipped.some((item) => item.type === 'context_edit' && item.targetId === ids[4]),
+    false
+  );
+
+  // Apply Fold B + tail stub: because r1 was previously null then restored by Unfold A,
+  // episodeStats must reconstruct r1 properly and credit Fold B with ~170+ tail tokens!
+  for (const edit of [...planB.edits, ...tailB.readEdits]) {
+    manager.appendContextEdit(edit.targetId, edit.replacement);
+  }
+  manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: planB.handle });
+  const req = assistant('next response');
+  req.usage = {
+    input: 500,
+    output: 20,
+    cacheRead: 1000,
+    cacheWrite: 0,
+    totalTokens: 1520,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+  };
+  manager.appendMessage(req);
+  const statsB = episodeStats(manager.getBranch(), '/repo');
+  assert.ok(
+    statsB.folds.each[1]!.net > 100,
+    `expected Fold B net > 100 after omit->unfold->prune, got ${statsB.folds.each[1]!.net}`
+  );
+
+  // 3. Recovery rollback nets tail savings back to 0 without double counting.
+  const { manager: mRoll, ids: idsRoll } = session([
+    user('go', 1),
+    assistant(call('s1', 'bash', { command: 'echo 1' })),
+    result('s1', 'bash', '1', 2),
+    assistant(call('r1', 'read', { path: 'lib.ts' })),
+    result('r1', 'read', fileText, 3),
+    assistant(call('r2', 'read', { path: 'lib.ts' })),
+    result('r2', 'read', fileText, 4),
+    assistant(call('f1', 'fold', { since: 't2', until: 't2', note: 'Roll.' }))
+  ]);
+  const pRoll = planFold(mRoll.buildSessionProjection().entries, 'f1', 2, { until: 2 });
+  mRoll.appendMessage(
+    Object.assign(result('f1', 'fold', `[fold ${pRoll.handle}]\nRoll.`, 5), {
+      details: {
+        kind: 'fold',
+        handle: pRoll.handle,
+        since: 't2',
+        until: 't2',
+        firstEntryId: pRoll.firstEntryId,
+        lastEntryId: pRoll.lastEntryId,
+        messages: pRoll.omitted.length,
+        tokens: 8,
+        noteTokens: 4,
+        keptTokens: 0,
+        headline: 'Roll.',
+        keptUserTurns: [],
+        files: []
+      }
+    })
+  );
+  const bRoll = mRoll.getBranch();
+  const tRoll = planFoldTailPruning({
+    branch: bRoll,
+    editOwners: attributeEpisodesEdits(bRoll),
+    afterEntryId: pRoll.lastEntryId,
+    beforeEntryId: idsRoll[7]!,
+    cwd: '/repo'
+  });
+  const batchRoll = [...pRoll.edits, ...tRoll.readEdits];
+  mRoll.appendCustomEntry(FOLD_STARTED_TYPE, {
+    handle: pRoll.handle,
+    edits: batchRoll,
+    readDeps: tRoll.readDeps
+  });
+  for (const edit of batchRoll) mRoll.appendContextEdit(edit.targetId, edit.replacement);
+  // External hook removes r2 before completion -> recovery rolls back r1 stub!
+  mRoll.appendContextEdit(idsRoll[6]!, null);
+  for (const item of completeCutShortFolds(mRoll.getBranch())) {
+    if (item.type === 'context_edit') mRoll.appendContextEdit(item.targetId, item.replacement);
+    else mRoll.appendCustomEntry(item.customType, item.data);
+  }
+  mRoll.appendMessage(req);
+  const statsRoll = episodeStats(mRoll.getBranch(), '/repo');
+  assert.equal(statsRoll.folds.each[0]!.net, 4);
 });

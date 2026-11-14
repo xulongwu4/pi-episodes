@@ -41,6 +41,8 @@ export const FOLD_STARTED_TYPE = 'episodes-fold-started';
 export const FOLD_UNFOLDED_TYPE = 'episodes-fold-unfolded';
 /** Written first in an unfold's batch, with the fold's handle and the edits that follow. */
 export const FOLD_UNFOLD_STARTED_TYPE = 'episodes-fold-unfold-started';
+/** Written before a resumed recovery segment's edits when completing a cut-short fold or unfold. */
+export const FOLD_RECOVERY_STARTED_TYPE = 'episodes-fold-recovery-started';
 /**
  * Key under which a fold called from a codemode script stores its FoldDetails on the script's
  * tool result. That result stays in context as the fold's note, as a fold result does for a
