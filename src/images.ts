@@ -389,7 +389,7 @@ function openReadFlags(options?: ArchiveReadOptions): { flags: number; hasNoFoll
   };
 }
 
-function isUnlinkedLeafSync(resolvedPath: string): boolean {
+function leafIsNotSymlinkSync(resolvedPath: string): boolean {
   try {
     const parentReal = realpathSync(dirname(resolvedPath));
     const targetReal = realpathSync(resolvedPath);
@@ -399,7 +399,7 @@ function isUnlinkedLeafSync(resolvedPath: string): boolean {
   }
 }
 
-async function isUnlinkedLeaf(resolvedPath: string): Promise<boolean> {
+async function leafIsNotSymlink(resolvedPath: string): Promise<boolean> {
   try {
     const [parentReal, targetReal] = await Promise.all([
       realpath(dirname(resolvedPath)),
@@ -411,6 +411,69 @@ async function isUnlinkedLeaf(resolvedPath: string): Promise<boolean> {
   }
 }
 
+type SafeReadResult =
+  | { ok: true; bytes: Buffer }
+  | { ok: false; reason: 'missing' }
+  | { ok: false; reason: 'not_regular' }
+  | { ok: false; reason: 'size_mismatch'; actualSize: number }
+  | { ok: false; reason: 'io_error'; message: string };
+
+/** Opens and reads a regular file without following leaf symlinks or blocking on writerless FIFOs. */
+async function readRegularFileNoFollow(
+  resolvedPath: string,
+  expectedBytes: number,
+  options?: ArchiveReadOptions
+): Promise<SafeReadResult> {
+  let lst: Awaited<ReturnType<typeof lstat>>;
+  try {
+    lst = await lstat(resolvedPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === 'ENOENT') return { ok: false, reason: 'missing' };
+    return {
+      ok: false,
+      reason: 'io_error',
+      message: error instanceof Error ? error.message : String(error)
+    };
+  }
+  if (!lst.isFile()) return { ok: false, reason: 'not_regular' };
+  if (lst.size !== expectedBytes) {
+    return { ok: false, reason: 'size_mismatch', actualSize: lst.size };
+  }
+  const { flags, hasNoFollow } = openReadFlags(options);
+  let fh: Awaited<ReturnType<typeof open>>;
+  try {
+    fh = await open(resolvedPath, flags);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === 'ENOENT') return { ok: false, reason: 'missing' };
+    if (code === 'ELOOP' || code === 'EMLINK' || code === 'ENXIO') {
+      return { ok: false, reason: 'not_regular' };
+    }
+    return {
+      ok: false,
+      reason: 'io_error',
+      message: error instanceof Error ? error.message : String(error)
+    };
+  }
+  try {
+    const st = await fh.stat();
+    if (!st.isFile()) return { ok: false, reason: 'not_regular' };
+    if (!hasNoFollow) {
+      const sameInode = lst.ino === 0 || (st.dev === lst.dev && st.ino === lst.ino);
+      if (!sameInode || !(await leafIsNotSymlink(resolvedPath))) {
+        return { ok: false, reason: 'not_regular' };
+      }
+    }
+    if (st.size !== expectedBytes) {
+      return { ok: false, reason: 'size_mismatch', actualSize: st.size };
+    }
+    return { ok: true, bytes: await fh.readFile() };
+  } finally {
+    await fh.close().catch(() => undefined);
+  }
+}
+
 /** Returns `'same'` if `path` already holds `digest`, `'missing'` if absent, or `'conflict'` otherwise. */
 async function checkExistingArchiveFile(
   path: string,
@@ -418,32 +481,19 @@ async function checkExistingArchiveFile(
   expectedSha256: string,
   options?: ArchiveReadOptions
 ): Promise<'same' | 'missing' | 'conflict'> {
-  let fh: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    const lst = await lstat(path);
-    if (!lst.isFile() || lst.size !== expectedBytes) return 'conflict';
-    const { flags, hasNoFollow } = openReadFlags(options);
-    fh = await open(path, flags);
-    const st = await fh.stat();
-    if (!st.isFile() || st.size !== expectedBytes) return 'conflict';
-    if (!hasNoFollow) {
-      if (lst.ino !== 0 && (st.dev !== lst.dev || st.ino !== lst.ino)) return 'conflict';
-      if (!(await isUnlinkedLeaf(path))) return 'conflict';
-    }
-    const existing = await fh.readFile();
-    if (existing.length !== expectedBytes) return 'conflict';
-    return createHash('sha256').update(existing).digest('hex') === expectedSha256
-      ? 'same'
-      : 'conflict';
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException | undefined)?.code;
-    return code === 'ENOENT' ? 'missing' : 'conflict';
-  } finally {
-    await fh?.close().catch(() => undefined);
-  }
+  const read = await readRegularFileNoFollow(path, expectedBytes, options);
+  if (!read.ok) return read.reason === 'missing' ? 'missing' : 'conflict';
+  if (read.bytes.length !== expectedBytes) return 'conflict';
+  return createHash('sha256').update(read.bytes).digest('hex') === expectedSha256
+    ? 'same'
+    : 'conflict';
 }
 
-/** Publishes `temporary` to `path` without ever replacing an existing entry. */
+/**
+ * Publishes `temporary` to `path` without replacing an existing entry. Uses atomic `link()` where
+ * supported; on filesystems without hard links, falls back to `COPYFILE_EXCL` (if a hard kill leaves
+ * a truncated target on such a filesystem, SHA-256 verification rejects it and falls back inline).
+ */
 async function publishArchiveFileNoReplace(temporary: string, path: string): Promise<void> {
   try {
     await link(temporary, path);
@@ -523,8 +573,7 @@ function expectedImageBasename(ref: ArchivedImage): string | undefined {
 type PathResolution =
   | { ok: true; path: string }
   | { ok: false; reason: 'outside' }
-  | { ok: false; reason: 'session_mismatch'; recordedDir: string; expectedDir: string };
-
+  | { ok: false; reason: 'session_mismatch'; recordedDir: string; expectedDirs: string[] };
 function normalizeAllowedDirs(allowedDirs?: string | readonly string[]): string[] {
   if (!allowedDirs) return [];
   const list = typeof allowedDirs === 'string' ? [allowedDirs] : allowedDirs;
@@ -554,11 +603,12 @@ function classifyArchivedImagePath(
   const matched = resolvedDirs.find((dir) => basename(dir) === recordedDir);
   if (!matched) {
     if (recordedDir.endsWith('.episodes')) {
+      const expectedDirs = [...new Set(resolvedDirs.map((dir) => basename(dir)))];
       return {
         ok: false,
         reason: 'session_mismatch',
         recordedDir,
-        expectedDir: basename(resolvedDirs[0]!)
+        expectedDirs
       };
     }
     return { ok: false, reason: 'outside' };
@@ -597,7 +647,7 @@ export function verifyArchivedImageSync(
     if (!st.isFile() || st.size !== ref.bytes) return false;
     if (!hasNoFollow) {
       if (lst.ino !== 0 && (st.dev !== lst.dev || st.ino !== lst.ino)) return false;
-      if (!isUnlinkedLeafSync(resolvedPath)) return false;
+      if (!leafIsNotSymlinkSync(resolvedPath)) return false;
     }
     const bytes = readFileSync(fd);
     if (bytes.length !== ref.bytes) return false;
@@ -625,8 +675,9 @@ export async function readArchivedImage(
   const classified = classifyArchivedImagePath(ref, allowedDirs);
   if (!classified.ok) {
     if (classified.reason === 'session_mismatch') {
+      const formatted = classified.expectedDirs.map((dir) => `"${dir}"`).join(', ');
       throw new Error(
-        `Archived image #${ref.index} of ${ref.handle} was archived under "${classified.recordedDir}", outside the session archive directory "${classified.expectedDir}".`
+        `Archived image #${ref.index} of ${ref.handle} was archived under "${classified.recordedDir}", outside the session archive directory ${formatted}.`
       );
     }
     throw new Error(
@@ -634,75 +685,28 @@ export async function readArchivedImage(
     );
   }
   const resolvedPath = classified.path;
-  let lst: Awaited<ReturnType<typeof lstat>>;
-  try {
-    lst = await lstat(resolvedPath);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException | undefined)?.code;
-    if (code === 'ENOENT') {
+  const opened = await readRegularFileNoFollow(resolvedPath, ref.bytes, options);
+  if (!opened.ok) {
+    if (opened.reason === 'missing') {
       throw new Error(
         `Archived image #${ref.index} of ${ref.handle} is missing at ${resolvedPath}.`
       );
     }
-    throw new Error(
-      `Archived image #${ref.index} of ${ref.handle} could not be read at ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
-  if (!lst.isFile()) {
-    throw new Error(
-      `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} is not a regular file.`
-    );
-  }
-  if (lst.size !== ref.bytes) {
-    throw new Error(
-      `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} failed size verification (expected ${ref.bytes} bytes, got ${lst.size}).`
-    );
-  }
-  const { flags, hasNoFollow } = openReadFlags(options);
-  let fh: Awaited<ReturnType<typeof open>>;
-  try {
-    fh = await open(resolvedPath, flags);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException | undefined)?.code;
-    if (code === 'ENOENT') {
-      throw new Error(
-        `Archived image #${ref.index} of ${ref.handle} is missing at ${resolvedPath}.`
-      );
-    }
-    if (code === 'ELOOP' || code === 'EMLINK' || code === 'ENXIO') {
+    if (opened.reason === 'not_regular') {
       throw new Error(
         `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} is not a regular file.`
       );
     }
+    if (opened.reason === 'size_mismatch') {
+      throw new Error(
+        `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} failed size verification (expected ${ref.bytes} bytes, got ${opened.actualSize}).`
+      );
+    }
     throw new Error(
-      `Archived image #${ref.index} of ${ref.handle} could not be read at ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`
+      `Archived image #${ref.index} of ${ref.handle} could not be read at ${resolvedPath}: ${opened.message}`
     );
   }
-  let bytes: Buffer;
-  try {
-    const st = await fh.stat();
-    if (!st.isFile()) {
-      throw new Error(
-        `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} is not a regular file.`
-      );
-    }
-    if (!hasNoFollow) {
-      const sameInode = lst.ino === 0 || (st.dev === lst.dev && st.ino === lst.ino);
-      if (!sameInode || !(await isUnlinkedLeaf(resolvedPath))) {
-        throw new Error(
-          `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} is not a regular file.`
-        );
-      }
-    }
-    if (st.size !== ref.bytes) {
-      throw new Error(
-        `Archived image #${ref.index} of ${ref.handle} at ${resolvedPath} failed size verification (expected ${ref.bytes} bytes, got ${st.size}).`
-      );
-    }
-    bytes = await fh.readFile();
-  } finally {
-    await fh.close().catch(() => undefined);
-  }
+  const { bytes } = opened;
   const actualSha = createHash('sha256').update(bytes).digest('hex');
   if (
     bytes.length !== ref.bytes ||
@@ -803,7 +807,8 @@ export type CarriedMediaItem =
 export async function prepareCarriedMedia(
   archivingHandle: string,
   items: readonly CarriedMediaItem[],
-  dir: string | undefined
+  dir: string | undefined,
+  signal?: AbortSignal
 ): Promise<CarriedMediaItem[]> {
   const prepared: CarriedMediaItem[] = [];
   let nextIndex = 1;
@@ -813,6 +818,7 @@ export async function prepareCarriedMedia(
     }
   }
   for (const item of items) {
+    if (signal?.aborted) return prepared;
     if (item.kind === 'ref') {
       prepared.push({ kind: 'ref', ref: { ...item.ref } });
       continue;

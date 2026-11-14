@@ -193,7 +193,7 @@ export class ForkFolds {
 
     // Archive covered-note media before mutating any ForkFolds state so errors or cancellation
     // leave omitted/retired/applied/folds untouched.
-    const prepared = await prepareCarriedMedia(plan.handle, plan.media, this.archiveDir);
+    const prepared = await prepareCarriedMedia(plan.handle, plan.media, this.archiveDir, signal);
     if (signal?.aborted) throw new Error('Fold aborted.');
 
     const ownMessages = messages.slice(this.prefixLength);

@@ -1425,13 +1425,7 @@ function unfoldedNoteContent(
           }
         }
       } else if (typeof details.written?.sha256 === 'string') {
-        const imageIndices: number[] = [];
-        for (let i = 0; i < rawBody.length; i++) {
-          if (rawBody[i]?.type === 'image') imageIndices.push(i);
-        }
-        if (imageIndices.length === carriedCount) {
-          for (const idx of imageIndices) dropIndices.add(idx);
-        }
+        // Recorded written.sha256 failed: inline image ownership is uncertain, so preserve all.
       } else if (details.written?.blocks !== undefined) {
         for (
           let i = details.written.blocks;
@@ -2050,7 +2044,8 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       const media = await prepareCarriedMedia(
         plan.handle,
         plan.media,
-        archiveDir(ctx.sessionManager)
+        archiveDir(ctx.sessionManager),
+        signal
       );
       // Snapshots and image archiving take time; a run aborted meanwhile, or already settled, must not get edits.
       if (signal?.aborted || run !== state.run) throw new Error('The fold was cancelled.');

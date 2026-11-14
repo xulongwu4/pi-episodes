@@ -1329,14 +1329,14 @@ test('multiple images, branch/unfold/refold immutable identities, interrupted re
     const midAbortSignal = {
       get aborted() {
         abortChecks++;
-        return abortChecks >= 2;
+        return abortChecks >= 3;
       }
     } as AbortSignal;
     await assert.rejects(
       () => fTool.execute('cf_mid_abort', { since: 't11', note: 'mid abort' }, midAbortSignal),
       /Fold aborted/
     );
-    assert.equal(abortChecks, 2);
+    assert.equal(abortChecks, 3);
     assert.equal(forkFolds.folds.length, 1);
     assert.equal(forkFolds.view(childMsgs).length, viewLenBeforeMidAbort);
   } finally {
@@ -1925,7 +1925,7 @@ test('readArchivedImage and verifyArchivedImageSync confine paths to archiveDir,
     await assert.rejects(() => readArchivedImage(sizeRef, sizeArchiveDir), /size verification/);
 
     // 5) When written.sha256 WAS recorded on a codemode script result and a hook prepended a block
-    // (breaking written.sha256), unfold drops carriedImg from the end rather than deleting scriptImg at stale written.blocks.
+    // (breaking written.sha256), unfold preserves inline images conservatively so scriptImg is never lost.
     const scriptImg: ImageContent = {
       type: 'image',
       mimeType: 'image/png',
@@ -2054,6 +2054,63 @@ test('readArchivedImage and verifyArchivedImageSync confine paths to archiveDir,
     assert.ok(
       reordMsg.content.some((b) => b.type === 'image' && b.data === scriptImg.data),
       'scriptImg MUST be preserved when a hook reordered [note, carriedImg, scriptImg]'
+    );
+
+    // 7) Later context edit modifies the prefix AND strips carriedImg, leaving [editedNote, scriptImg]:
+    // imageIndices.length === 1 === carriedImages, yet scriptImg MUST still be preserved!
+    const sStripped = session([
+      user('start', 1),
+      assistant(call('b1', 'bash', { command: 'echo ok' })),
+      result('b1', 'bash', 'ok', 2),
+      assistant(call('cm_strip', 'codemode', { code: 'fold()' }))
+    ]);
+    const pStrip = planFold(sStripped.manager.buildSessionProjection().entries, 'cm_strip', 2);
+    const stripDetails: FoldDetails = {
+      ...brkDetails,
+      handle: 'ep-cmstrip',
+      firstEntryId: pStrip.firstEntryId,
+      lastEntryId: pStrip.lastEntryId,
+      renderedNote: '[fold ep-cmstrip: t2 (2 messages, ~10 tokens)]\n\nBroken prefix note.',
+      written: writtenMark([
+        {
+          type: 'text',
+          text: 'SCRIPT_OUT\n[fold ep-cmstrip: t2 (2 messages, ~10 tokens)]\n\nBroken prefix note.'
+        },
+        scriptImg
+      ])
+    };
+    sStripped.manager.appendMessage(
+      Object.assign({
+        role: 'toolResult' as const,
+        toolCallId: 'cm_strip',
+        toolName: 'codemode',
+        content: [
+          {
+            type: 'text' as const,
+            text: 'EDITED_SCRIPT_OUT\n[fold ep-cmstrip: t2 (2 messages, ~10 tokens)]\n\nBroken prefix note.'
+          },
+          scriptImg,
+          { type: 'text' as const, text: '[t3]' }
+        ],
+        details: { [FOLD_DETAILS_KEY]: stripDetails },
+        isError: false,
+        timestamp: 0
+      })
+    );
+    for (const ed of pStrip.edits) sStripped.manager.appendContextEdit(ed.targetId, ed.replacement);
+    sStripped.manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: 'ep-cmstrip' });
+    const unfStrip = planUnfold(
+      sStripped.manager.getBranch(),
+      sStripped.manager.buildSessionProjection().entries,
+      'ep-cmstrip'
+    );
+    for (const ed of unfStrip.edits)
+      sStripped.manager.appendContextEdit(ed.targetId, ed.replacement);
+    const stripMsg = sStripped.manager.buildSessionProjection().messages.at(-1)!;
+    assert.equal(stripMsg.role, 'toolResult');
+    assert.ok(
+      stripMsg.content.some((b) => b.type === 'image' && b.data === scriptImg.data),
+      'scriptImg MUST be preserved when carriedImg was stripped and written.sha256 failed'
     );
   } finally {
     await rm(outerDir, { recursive: true, force: true });
@@ -2581,5 +2638,217 @@ test('Pi /fork (createBranchedSession) and --fork (SessionManager.forkFrom) reca
     await sA.cleanup();
     await rm(crossForkDir, { recursive: true, force: true });
     await rm(relocatedDir, { recursive: true, force: true });
+  }
+});
+
+test('archiveDirs handles >8KiB UTF-8 headers, short reads, hop-local relocation, sibling .episodes without .jsonl, relative paths, cycles, hop cap, FIFOs, and prepareCarriedMedia respects AbortSignal', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-episodes-archivedirs-edges-'));
+  try {
+    const viewFor = (sessionFile: string, parentSession?: string) =>
+      ({
+        getSessionFile: () => sessionFile,
+        getHeader: () => (parentSession ? { parentSession } : undefined)
+      }) as unknown as Parameters<typeof archiveDirs>[0];
+
+    // 1) >8KiB UTF-8 header + 7-byte short reads splitting multi-byte sequences
+    const utfDir = join(root, 'utf8');
+    await mkdir(utfDir, { recursive: true });
+    const grandFile = join(utfDir, 'grand.jsonl');
+    const midFile = join(utfDir, 'mid.jsonl');
+    const liveFile = join(utfDir, 'live.jsonl');
+    await writeFile(
+      grandFile,
+      `${JSON.stringify({ type: 'session', version: 3, id: 'g', cwd: '/tmp' })}\n`
+    );
+    const hugeUtf8Cwd = `/tmp/${'日本語🚀'.repeat(2200)}`; // >22 KiB of multi-byte UTF-8
+    await writeFile(
+      midFile,
+      `${JSON.stringify({ type: 'session', version: 3, id: 'm', cwd: hugeUtf8Cwd, parentSession: grandFile })}\n`
+    );
+    await writeFile(
+      liveFile,
+      `${JSON.stringify({ type: 'session', version: 3, id: 'l', cwd: '/tmp', parentSession: midFile })}\n`
+    );
+    const utfDirs = await archiveDirs(viewFor(liveFile, midFile), { readChunkSize: 7 });
+    assert.deepEqual(utfDirs, [
+      join(utfDir, 'live.episodes'),
+      join(utfDir, 'mid.episodes'),
+      join(utfDir, 'grand.episodes')
+    ]);
+
+    // 2) Hop-local relocation: A and B moved from /old to dirY; C forked from dirY/B into dirX
+    const dirX = join(root, 'dirX');
+    const dirY = join(root, 'dirY');
+    await mkdir(dirX, { recursive: true });
+    await mkdir(dirY, { recursive: true });
+    const movedA = join(dirY, 'a.jsonl');
+    const movedB = join(dirY, 'b.jsonl');
+    const forkedC = join(dirX, 'c.jsonl');
+    await writeFile(movedA, `${JSON.stringify({ type: 'session', id: 'a' })}\n`);
+    await mkdir(join(dirY, 'a.episodes'), { recursive: true });
+    await writeFile(
+      movedB,
+      `${JSON.stringify({ type: 'session', id: 'b', parentSession: join(root, 'vanished-old', 'a.jsonl') })}\n`
+    );
+    await writeFile(
+      forkedC,
+      `${JSON.stringify({ type: 'session', id: 'c', parentSession: movedB })}\n`
+    );
+    const hopRelocDirs = await archiveDirs(viewFor(forkedC, movedB));
+    assert.deepEqual(hopRelocDirs, [
+      join(dirX, 'c.episodes'),
+      join(dirY, 'b.episodes'),
+      join(dirY, 'a.episodes')
+    ]);
+
+    // 3) Sibling .episodes in live dir while parent .jsonl remains at recordedParent
+    const origDir = join(root, 'orig');
+    const sibLiveDir = join(root, 'sibLive');
+    await mkdir(origDir, { recursive: true });
+    await mkdir(join(sibLiveDir, 'parent.episodes'), { recursive: true });
+    const origGrand = join(origDir, 'ancestor.jsonl');
+    const origParent = join(origDir, 'parent.jsonl');
+    const sibChild = join(sibLiveDir, 'child.jsonl');
+    await writeFile(origGrand, `${JSON.stringify({ type: 'session', id: 'anc' })}\n`);
+    await writeFile(
+      origParent,
+      `${JSON.stringify({ type: 'session', id: 'par', parentSession: origGrand })}\n`
+    );
+    await writeFile(
+      sibChild,
+      `${JSON.stringify({ type: 'session', id: 'ch', parentSession: origParent })}\n`
+    );
+    const sibDirs = await archiveDirs(viewFor(sibChild, origParent));
+    assert.deepEqual(sibDirs, [
+      join(sibLiveDir, 'child.episodes'),
+      join(sibLiveDir, 'parent.episodes'),
+      join(origDir, 'ancestor.episodes')
+    ]);
+
+    // 4) Relative parentSession resolved against dirname(sessionFile), not process.cwd()
+    const relSub = join(root, 'rel', 'nested');
+    const relAncDir = join(root, 'rel', 'anc');
+    await mkdir(relSub, { recursive: true });
+    await mkdir(relAncDir, { recursive: true });
+    const relAnc = join(relAncDir, 'rel-a.jsonl');
+    const relMid = join(relSub, 'rel-b.jsonl');
+    const relLeaf = join(relSub, 'rel-c.jsonl');
+    await writeFile(relAnc, `${JSON.stringify({ type: 'session', id: 'ra' })}\n`);
+    await writeFile(
+      relMid,
+      `${JSON.stringify({ type: 'session', id: 'rb', parentSession: '../anc/rel-a.jsonl' })}\n`
+    );
+    await writeFile(
+      relLeaf,
+      `${JSON.stringify({ type: 'session', id: 'rc', parentSession: './rel-b.jsonl' })}\n`
+    );
+    const relDirs = await archiveDirs(viewFor(relLeaf, './rel-b.jsonl'));
+    assert.deepEqual(relDirs, [
+      join(relSub, 'rel-c.episodes'),
+      join(relSub, 'rel-b.episodes'),
+      join(relAncDir, 'rel-a.episodes')
+    ]);
+
+    // 5) Cycle (p1 <-> p2) and >64 hop cap terminate cleanly
+    const cycDir = join(root, 'cycle');
+    await mkdir(cycDir, { recursive: true });
+    const cyc1 = join(cycDir, 'c1.jsonl');
+    const cyc2 = join(cycDir, 'c2.jsonl');
+    await writeFile(cyc1, `${JSON.stringify({ type: 'session', parentSession: cyc2 })}\n`);
+    await writeFile(cyc2, `${JSON.stringify({ type: 'session', parentSession: cyc1 })}\n`);
+    const cycDirs = await archiveDirs(viewFor(cyc1, cyc2));
+    assert.deepEqual(cycDirs, [join(cycDir, 'c1.episodes'), join(cycDir, 'c2.episodes')]);
+
+    const capDir = join(root, 'cap');
+    await mkdir(capDir, { recursive: true });
+    for (let i = 0; i <= 70; i++) {
+      const f = join(capDir, `h${i}.jsonl`);
+      const next = i < 70 ? join(capDir, `h${i + 1}.jsonl`) : undefined;
+      await writeFile(
+        f,
+        `${JSON.stringify({ type: 'session', ...(next ? { parentSession: next } : {}) })}\n`
+      );
+    }
+    const capDirs = await archiveDirs(viewFor(join(capDir, 'h0.jsonl'), join(capDir, 'h1.jsonl')));
+    assert.equal(capDirs.length, 65);
+
+    // 6) FIFO parentSession returns promptly without blocking
+    if (process.platform !== 'win32') {
+      const fifoParent = join(root, 'fifo-parent.jsonl');
+      execFileSync('mkfifo', [fifoParent]);
+      const fifoLeaf = join(root, 'fifo-leaf.jsonl');
+      await writeFile(
+        fifoLeaf,
+        `${JSON.stringify({ type: 'session', parentSession: fifoParent })}\n`
+      );
+      const fifoDirs = await archiveDirs(viewFor(fifoLeaf, fifoParent));
+      assert.deepEqual(fifoDirs, [
+        join(root, 'fifo-leaf.episodes'),
+        join(root, 'fifo-parent.episodes')
+      ]);
+    }
+
+    // 7) prepareCarriedMedia stops archiving remaining images when AbortSignal aborts before or mid-batch
+    const abortArchive = join(root, 'abort.episodes');
+    const abortCtrl = new AbortController();
+    abortCtrl.abort();
+    const pngBlock1: ImageContent = {
+      type: 'image',
+      data: makePng(3, 3, [10, 20, 30]).toString('base64'),
+      mimeType: 'image/png'
+    };
+    const pngBlock2: ImageContent = {
+      type: 'image',
+      data: makePng(4, 3, [40, 50, 60]).toString('base64'),
+      mimeType: 'image/png'
+    };
+    await prepareCarriedMedia(
+      'ep-abort01',
+      [{ kind: 'image', image: pngBlock1 }],
+      abortArchive,
+      abortCtrl.signal
+    );
+    await assert.rejects(() => readFile(abortArchive));
+    let batchChecks = 0;
+    const midBatchSignal = {
+      get aborted() {
+        batchChecks++;
+        return batchChecks >= 2;
+      }
+    } as AbortSignal;
+    const midPrepared = await prepareCarriedMedia(
+      'ep-abort02',
+      [
+        { kind: 'image', image: pngBlock1 },
+        { kind: 'image', image: pngBlock2 }
+      ],
+      abortArchive,
+      midBatchSignal
+    );
+    assert.equal(midPrepared.length, 1);
+    assert.equal(midPrepared[0]?.kind, 'ref');
+
+    // 8) session_mismatch lists all allowed directory basenames while matching /outside the session archive directory/
+    const mismatchRef = {
+      handle: 'ep-mis001',
+      index: 1,
+      path: `/tmp/other.episodes/image-${'b'.repeat(16)}.png`,
+      sha256: 'b'.repeat(64),
+      mimeType: 'image/png' as const,
+      bytes: 16
+    };
+    await assert.rejects(
+      () =>
+        readArchivedImage(mismatchRef, [
+          join(root, 'child.episodes'),
+          join(root, 'parent.episodes')
+        ]),
+      (err: Error) =>
+        /outside the session archive directory/.test(err.message) &&
+        err.message.includes('child.episodes') &&
+        err.message.includes('parent.episodes')
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

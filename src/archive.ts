@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { constants as fsConstants } from 'node:fs';
-import { lstat, mkdir, open, readFile, rename, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, realpath, rename, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { Usage } from '@earendil-works/pi-ai';
@@ -409,23 +409,57 @@ async function pathExistsOnDisk(path: string): Promise<boolean> {
   }
 }
 
-async function readParentSessionFromHeader(sessionFile: string): Promise<string | undefined> {
+const MAX_SESSION_HEADER_BYTES = 256 * 1024;
+const MAX_ANCESTOR_HOPS = 64;
+
+async function isRegularFileOnDisk(path: string): Promise<boolean> {
+  try {
+    return (await lstat(path)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function readParentSessionFromHeader(
+  sessionFile: string,
+  readChunkSize = 8192
+): Promise<string | undefined> {
   let fh: Awaited<ReturnType<typeof open>> | undefined;
   try {
     const lst = await lstat(sessionFile);
     if (!lst.isFile()) return undefined;
-    fh = await open(
-      sessionFile,
-      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0)
-    );
+    const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+    fh = await open(sessionFile, fsConstants.O_RDONLY | noFollow | (fsConstants.O_NONBLOCK ?? 0));
     const st = await fh.stat();
     if (!st.isFile()) return undefined;
-    const buf = Buffer.alloc(8192);
-    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
-    if (bytesRead <= 0) return undefined;
-    const text = buf.subarray(0, bytesRead).toString('utf8');
-    const newline = text.indexOf('\n');
-    const firstLine = (newline >= 0 ? text.slice(0, newline) : text).trim();
+    if (noFollow === 0) {
+      if (lst.ino !== 0 && (st.dev !== lst.dev || st.ino !== lst.ino)) return undefined;
+      const [parentReal, targetReal] = await Promise.all([
+        realpath(dirname(sessionFile)),
+        realpath(sessionFile)
+      ]);
+      if (targetReal !== join(parentReal, basename(sessionFile))) return undefined;
+    }
+    const chunkLen = Math.max(1, Math.min(readChunkSize, 65536));
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (total < MAX_SESSION_HEADER_BYTES) {
+      const buf = Buffer.allocUnsafe(Math.min(chunkLen, MAX_SESSION_HEADER_BYTES - total));
+      const { bytesRead } = await fh.read(buf, 0, buf.length, total);
+      if (bytesRead <= 0) break;
+      const slice = buf.subarray(0, bytesRead);
+      const newline = slice.indexOf(0x0a);
+      if (newline >= 0) {
+        chunks.push(Buffer.from(slice.subarray(0, newline)));
+        total += newline;
+        break;
+      }
+      chunks.push(Buffer.from(slice));
+      total += bytesRead;
+      if (total >= MAX_SESSION_HEADER_BYTES) return undefined;
+    }
+    if (chunks.length === 0) return undefined;
+    const firstLine = Buffer.concat(chunks).toString('utf8').trim();
     if (!firstLine) return undefined;
     const parsed = JSON.parse(firstLine) as { type?: unknown; parentSession?: unknown };
     return parsed?.type === 'session' && typeof parsed.parentSession === 'string'
@@ -442,7 +476,10 @@ async function readParentSessionFromHeader(sessionFile: string): Promise<string 
  * The session's own `.episodes` directory followed by any ancestor `.episodes` directories
  * reachable through Pi's `parentSession` header chain (`/fork` and `--fork`).
  */
-export async function archiveDirs(sessions: SessionView): Promise<string[]> {
+export async function archiveDirs(
+  sessions: SessionView,
+  options?: { readChunkSize?: number }
+): Promise<string[]> {
   const liveFile = sessions.getSessionFile();
   if (!liveFile) return [];
   const resolvedLive = resolve(liveFile);
@@ -450,30 +487,46 @@ export async function archiveDirs(sessions: SessionView): Promise<string[]> {
   const dirs: string[] = [archiveDirForSessionFile(resolvedLive)];
   const seenDirs = new Set<string>(dirs);
   const seenFiles = new Set<string>([resolvedLive]);
+  let currentDir = liveSessionDir;
+  let hops = 0;
   let nextParent =
     typeof sessions.getHeader === 'function' ? sessions.getHeader()?.parentSession : undefined;
   while (
     typeof nextParent === 'string' &&
     nextParent.length > 0 &&
     !nextParent.includes('\0') &&
-    seenFiles.size < 64
+    hops < MAX_ANCESTOR_HOPS
   ) {
-    const recordedParent = resolve(nextParent);
-    const siblingParent = join(liveSessionDir, basename(nextParent));
-    const siblingDir = archiveDirForSessionFile(siblingParent);
-    const recordedDir = archiveDirForSessionFile(recordedParent);
-    const useSibling =
-      siblingParent !== recordedParent &&
-      ((await pathExistsOnDisk(siblingParent)) || (await pathExistsOnDisk(siblingDir)));
-    const chosenSessionFile = useSibling ? siblingParent : recordedParent;
-    const chosenDir = useSibling ? siblingDir : recordedDir;
+    hops++;
+    const recordedParent = resolve(currentDir, nextParent);
+    const parentBase = basename(recordedParent);
+    const candidates: string[] = [];
+    for (const candidate of [
+      join(liveSessionDir, parentBase),
+      join(currentDir, parentBase),
+      recordedParent
+    ]) {
+      if (!candidates.includes(candidate)) candidates.push(candidate);
+    }
+
+    let dirOwner: string | undefined;
+    let headerFile: string | undefined;
+    for (const candidate of candidates) {
+      const hasFile = await isRegularFileOnDisk(candidate);
+      if (hasFile && !headerFile) headerFile = candidate;
+      if (!dirOwner && (hasFile || (await pathExistsOnDisk(archiveDirForSessionFile(candidate))))) {
+        dirOwner = candidate;
+      }
+    }
+    const chosenDir = archiveDirForSessionFile(dirOwner ?? recordedParent);
     if (!seenDirs.has(chosenDir)) {
       seenDirs.add(chosenDir);
       dirs.push(chosenDir);
     }
-    if (seenFiles.has(chosenSessionFile)) break;
-    seenFiles.add(chosenSessionFile);
-    nextParent = await readParentSessionFromHeader(chosenSessionFile);
+    if (!headerFile || seenFiles.has(headerFile)) break;
+    seenFiles.add(headerFile);
+    currentDir = dirname(headerFile);
+    nextParent = await readParentSessionFromHeader(headerFile, options?.readChunkSize);
   }
   return dirs;
 }
