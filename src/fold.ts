@@ -1622,7 +1622,12 @@ export function planFoldBatch(
     archivedReadTurns,
     covers,
     media,
-    edits: [...retireEdits, ...selectedSpanEdits]
+    edits: (() => {
+      const entryIndexById = new Map(entries.map((entry, idx) => [entry.sourceEntry.id, idx]));
+      return [...retireEdits, ...selectedSpanEdits].sort(
+        (a, b) => (entryIndexById.get(b.targetId) ?? -1) - (entryIndexById.get(a.targetId) ?? -1)
+      );
+    })()
   };
 }
 
@@ -2897,51 +2902,38 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         if (!edited.has(edit.targetId)) spanEdits.push(edit);
       }
 
-      const lastFoldIndex =
-        fold.lastEntryId !== undefined ? (branchIndexById.get(fold.lastEntryId) ?? -1) : -1;
       const sortedAssistantIds = [
         ...new Set([...foldAssistantMap.keys(), ...tailPrune.assistantReplacements.keys()])
       ]
         .filter((id) => !currentIds.has(id))
         .sort((a, b) => (branchIndexById.get(b) ?? -1) - (branchIndexById.get(a) ?? -1));
 
-      const preSpanAssistantEdits: ContextEditEntryDraft[] = [];
-      const gapPruneAssistantEdits: ContextEditEntryDraft[] = [];
+      const assistantEdits: ContextEditEntryDraft[] = [];
       for (const targetId of sortedAssistantIds) {
         const reconciled = reconcileAssistantPending(targetId);
         if (reconciled !== undefined) {
-          if (reconciled) preSpanAssistantEdits.push(reconciled);
+          if (reconciled) assistantEdits.push(reconciled);
           continue;
         }
         const composed = tailPrune.assistantReplacements.get(targetId);
         if (composed) {
-          const draft: ContextEditEntryDraft = {
+          assistantEdits.push({
             type: 'context_edit',
             targetId,
             replacement: { content: composed }
-          };
-          const targetIdx = branchIndexById.get(targetId) ?? -1;
-          if (lastFoldIndex >= 0 && targetIdx >= 0 && targetIdx < lastFoldIndex) {
-            gapPruneAssistantEdits.push(draft);
-          } else {
-            preSpanAssistantEdits.push(draft);
-          }
+          });
           continue;
         }
         const existing = foldAssistantMap.get(targetId);
-        if (existing) preSpanAssistantEdits.push(existing);
+        if (existing) assistantEdits.push(existing);
       }
 
-      // Order interior-gap failed-arg trims strictly by reverse branch index alongside spanEdits
-      // so later spans (e.g. Span 1) are omitted before an interior-gap assistant's args change,
-      // while that assistant's signature is still retired before earlier spans (e.g. Span 0).
-      const orderedSpanAndGapEdits =
-        gapPruneAssistantEdits.length === 0
-          ? spanEdits
-          : [...spanEdits, ...gapPruneAssistantEdits].sort(
-              (a, b) =>
-                (branchIndexById.get(b.targetId) ?? -1) - (branchIndexById.get(a.targetId) ?? -1)
-            );
+      // Order all surviving assistant edits (signature retirements + failed-arg trims) and span
+      // removals/caps strictly newest -> oldest by branch index so no crash prefix ever mutates an
+      // earlier entry while a later entry still carries an unretired signature or unpaired toolResult.
+      const orderedEdits = [...assistantEdits, ...spanEdits].sort(
+        (a, b) => (branchIndexById.get(b.targetId) ?? -1) - (branchIndexById.get(a.targetId) ?? -1)
+      );
 
       const readEdits = tailPrune.readEdits.filter(
         (edit) => !currentIds.has(edit.targetId) && !edited.has(edit.targetId)
@@ -2949,7 +2941,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       const keptReadIds = new Set(readEdits.map((edit) => edit.targetId));
       const readDeps = tailPrune.readDeps.filter((dep) => keptReadIds.has(dep.targetId));
       return {
-        edits: [...current, ...preSpanAssistantEdits, ...orderedSpanAndGapEdits, ...readEdits],
+        edits: [...current, ...orderedEdits, ...readEdits],
         readDeps
       };
     };

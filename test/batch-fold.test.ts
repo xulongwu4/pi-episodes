@@ -9,6 +9,7 @@ import {
   type AssistantMessage,
   fauxAssistantMessage,
   fauxProvider,
+  fauxThinking,
   fauxToolCall,
   type ImageContent,
   type Message,
@@ -1917,64 +1918,169 @@ test('R2-3 (staleness on parallel backward expansion & coalesced adjacent spans)
     }
   ]);
   try {
-    test('R2-5 (interior-gap failed-arg trim ordering & spilled staleness): Span 1 removes before gap arg-trim; spilled hits past limit check staleness', async () => {
-      // Live session with > limit matches where Span 0 match appears AFTER limit (spilled) and Span 0 file changed in gap:
-      let spillHandle = '';
-      const h = await createLiveSession(
-        [
-          // t2..t3 (Span 0): write SPILL_TOK to early_spill.txt and read it
-          () =>
-            fauxAssistantMessage([
-              fauxToolCall('bash', { command: 'echo SPILL_TOK_ALPHA > early_spill.txt' }),
-              fauxToolCall('read', { path: 'early_spill.txt' })
-            ]),
-          // t4 (Gap): overwrite early_spill.txt AND create late_spill.txt with many SPILL_TOK_ALPHA lines so BM25 ranks Span 1 higher!
-          () =>
-            fauxAssistantMessage(
-              fauxToolCall('bash', {
-                command:
-                  'echo CHANGED > early_spill.txt && printf "SPILL_TOK_ALPHA\n%.0s" 1 2 3 4 5 > late_spill.txt'
-              })
-            ),
-          // t5..t7 (Span 1): 3 separate reads/outputs with SPILL_TOK_ALPHA so limit: 1 only shows Span 1 while Span 0 spills!
-          () => fauxAssistantMessage(fauxToolCall('read', { path: 'late_spill.txt' })),
-          () =>
-            fauxAssistantMessage(
-              fauxToolCall('fold', {
-                spans: [
-                  { since: 't2', until: 't3', note: 'Early spill span.' },
-                  { since: 't5', note: 'Late spill span.' }
-                ]
-              }),
-              { stopReason: 'toolUse' }
-            ),
-          (ctx) => {
-            spillHandle = /\[fold (ep-[0-9a-f]{8}):/.exec(ctx.messages.map(text).join('\n'))![1]!;
-            return fauxAssistantMessage(
-              fauxToolCall('recall', { handle: spillHandle, query: 'SPILL_TOK_ALPHA', limit: 1 }),
-              { stopReason: 'toolUse' }
-            );
-          },
-          (after) => {
-            const out = text(after.messages.at(-1)!);
-            // Even with limit: 1 (Span 1 ranked #1, Span 0 spilled to file), staleness must warn early_spill.txt changed!
-            assert.match(out, /predates changes to: .*early_spill\.txt/);
-            return fauxAssistantMessage('Verified spilled staleness.');
-          }
-        ],
-        { git: true }
-      );
-      try {
-        execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: h.dir });
-        await h.session.prompt('spilled staleness');
-        if (h.failures[0]) throw h.failures[0];
-      } finally {
-        await h.cleanup();
-      }
-    });
     await h3.session.prompt('prior-folded gap isolation');
     if (h3.failures[0]) throw h3.failures[0];
   } finally {
     await h3.cleanup();
+  }
+});
+
+test('R2-5 (monotonic crash-prefix edit ordering & spilled staleness): newest-to-oldest across gap assistants/spans, plus spilled staleness', async () => {
+  // Part A: Spilled match past limit still triggers per-span staleness warning
+  let spillHandle = '';
+  const hSpill = await createLiveSession(
+    [
+      () =>
+        fauxAssistantMessage([
+          fauxToolCall('bash', { command: 'echo SPILL_TOK_ALPHA > early_spill.txt' }),
+          fauxToolCall('read', { path: 'early_spill.txt' })
+        ]),
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('bash', {
+            command:
+              'echo CHANGED > early_spill.txt && printf "SPILL_TOK_ALPHA\n%.0s" 1 2 3 4 5 > late_spill.txt'
+          })
+        ),
+      () => fauxAssistantMessage(fauxToolCall('read', { path: 'late_spill.txt' })),
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', {
+            spans: [
+              { since: 't2', until: 't3', note: 'Early spill span.' },
+              { since: 't5', note: 'Late spill span.' }
+            ]
+          }),
+          { stopReason: 'toolUse' }
+        ),
+      (ctx) => {
+        spillHandle = /\[fold (ep-[0-9a-f]{8}):/.exec(ctx.messages.map(text).join('\n'))![1]!;
+        return fauxAssistantMessage(
+          fauxToolCall('recall', { handle: spillHandle, query: 'SPILL_TOK_ALPHA', limit: 1 }),
+          { stopReason: 'toolUse' }
+        );
+      },
+      (after) => {
+        const out = text(after.messages.at(-1)!);
+        assert.match(out, /predates changes to: .*early_spill\.txt/);
+        return fauxAssistantMessage('Verified spilled staleness.');
+      }
+    ],
+    { git: true }
+  );
+  try {
+    execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: hSpill.dir });
+    await hSpill.session.prompt('spilled staleness');
+    if (hSpill.failures[0]) throw hSpill.failures[0];
+  } finally {
+    await hSpill.cleanup();
+  }
+
+  // Part B: Interior gap with BOTH an earlier signed assistant (no failed-arg trim) AND a later
+  // Part B: Interior gap with BOTH an earlier signed assistant (no failed-arg trim) AND a later
+  // signed assistant WITH aged failed-arg trim (>= 512 chars + >= 3 later surviving turns), plus
+  // a >= 512-char duplicate read inside the gap, followed by Span 1 signed assistant:
+  // FOLD_STARTED_TYPE edits must order all non-readEdits strictly newest -> oldest, then readEdits!
+  const longBadCmd = `exit 1 # ${'X'.repeat(600)}`;
+  const longDupBody = 'D'.repeat(700);
+  const hOrder = await createLiveSession([
+    // t2: create >= 512-char file for duplicate-read pruning
+    () =>
+      fauxAssistantMessage([
+        { ...fauxThinking('prep'), thinkingSignature: 'sig_t2' },
+        fauxToolCall('bash', { command: `printf '%s\n' '${longDupBody}' > dup_ord.txt` })
+      ]),
+    // t3 (Span 0): signed assistant + bash
+    () =>
+      fauxAssistantMessage([
+        { ...fauxThinking('span0 work'), thinkingSignature: 'sig_span0' },
+        fauxToolCall('bash', { command: 'echo span0' })
+      ]),
+    // t4 (Interior Gap — earlier signed assistant WITHOUT failed-arg trim, redacted thinking + first read of dup_ord.txt)
+    () =>
+      fauxAssistantMessage([
+        { type: 'thinking', thinking: '', thinkingSignature: 'sig_gap_early', redacted: true },
+        fauxToolCall('read', { path: 'dup_ord.txt' })
+      ]),
+    // t5 (Interior Gap — later signed assistant WITH failed >= 512-char bash arg)
+    () =>
+      fauxAssistantMessage([
+        { ...fauxThinking('gap late fail'), thinkingSignature: 'sig_gap_late' },
+        fauxToolCall('bash', { command: longBadCmd })
+      ]),
+    // t6..t8 (Interior Gap — 3 surviving turns + witness read so t5 failed-arg & t4 dup-read both prune!)
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo surv1' })),
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo surv2' })),
+    () => fauxAssistantMessage(fauxToolCall('read', { path: 'dup_ord.txt' })),
+    // t9 (Span 1): signed assistant + bash
+    () =>
+      fauxAssistantMessage([
+        { ...fauxThinking('span1 work'), thinkingSignature: 'sig_span1' },
+        fauxToolCall('bash', { command: 'echo span1' })
+      ]),
+    // t10: batch fold Span 0 (t3..t3) and Span 1 (t9..t9)
+    () =>
+      fauxAssistantMessage(
+        [
+          { ...fauxThinking('folding'), thinkingSignature: 'sig_fold_caller' },
+          fauxToolCall('fold', {
+            spans: [
+              { since: 't3', until: 't3', note: 'Folded span 0.' },
+              { since: 't9', until: 't9', note: 'Folded span 1.' }
+            ]
+          })
+        ],
+        { stopReason: 'toolUse' }
+      ),
+    () => fauxAssistantMessage('Done.')
+  ]);
+  try {
+    await hOrder.session.prompt('monotonic edit order');
+    if (hOrder.failures[0]) throw hOrder.failures[0];
+
+    const branch = hOrder.session.sessionManager.getBranch();
+    const indexById = new Map(branch.map((e, i) => [e.id, i]));
+    const started = branch.find(
+      (e): e is Extract<typeof e, { type: 'custom' }> =>
+        e.type === 'custom' && e.customType === 'episodes-fold-started'
+    );
+    assert.ok(started, 'expected episodes-fold-started entry');
+    const startedData = started.data as {
+      edits: { targetId: string; replacement: { content: unknown[] } | null }[];
+      readDeps?: { targetId: string }[];
+    };
+    const readDeps = startedData.readDeps ?? [];
+    assert.ok(readDeps.length >= 1, 'expected at least 1 duplicate-read edit');
+    const readIds = new Set(readDeps.map((d) => d.targetId));
+
+    // Split edits into non-read prefix and read suffix:
+    const firstReadPos = startedData.edits.findIndex((e) => readIds.has(e.targetId));
+    assert.ok(firstReadPos > 0, 'readEdits must follow non-read edits');
+    const nonReadEdits = startedData.edits.slice(0, firstReadPos);
+    const readSuffix = startedData.edits.slice(firstReadPos);
+    assert.ok(
+      readSuffix.every((e) => readIds.has(e.targetId)),
+      'all readEdits must appear at the very end'
+    );
+
+    // Verify both interior-gap assistants (sig_gap_early removal + sig_gap_late failed-arg trim) are in nonReadEdits
+    // AND every consecutive pair in nonReadEdits has strictly decreasing branchIndex!
+    const indices = nonReadEdits.map((e) => indexById.get(e.targetId) ?? -1);
+    for (let i = 1; i < indices.length; i++) {
+      assert.ok(
+        indices[i - 1]! > indices[i]!,
+        `expected strict descending branch index in non-read edits, got [${indices.join(', ')}]`
+      );
+    }
+
+    // Verify failed-arg trim actually happened on t5 alongside redacted thinking removal on t4:
+    const trimmedGapLate = nonReadEdits.some(
+      (e) =>
+        e.replacement !== null &&
+        JSON.stringify(e.replacement.content).includes('characters omitted from failed bash call')
+    );
+    assert.equal(trimmedGapLate, true, 'expected interior-gap failed-arg trim edit');
+  } finally {
+    await hOrder.cleanup();
   }
 });
