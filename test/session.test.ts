@@ -127,9 +127,15 @@ test('fold, recall, ask and fork in a live session', async () => {
     (context) => {
       // The next request already runs on the folded view.
       const roles = conversation(context).map((message) => message.role);
-      assert.deepEqual(roles, ['user', 'assistant', 'toolResult']);
-      const note = text(conversation(context)[2]!);
+      assert.deepEqual(roles, ['user', 'assistant', 'assistant', 'toolResult']);
+      const note = text(conversation(context)[3]!);
       assert.match(note, /^\[fold ep-[0-9a-f]{8}: 4 messages, t1-t3,/);
+      // Where the build loop was, a line says that the agent ran it and where its note is.
+      const handleOf = /ep-[0-9a-f]{8}/.exec(note)![0];
+      assert.equal(
+        text(conversation(context)[1]!),
+        `[${handleOf}: earlier responses of mine stood here, with the tool calls I made (t1-t3) and the outputs they returned. I read those outputs, and then I folded all of it out of this conversation: that is why no call and no output is shown here. The note in the result of the fold call below is my own record of what the outputs showed, written with them in view; recall with this handle reads them back.]`
+      );
       assert.match(note, /Build passes after regenerating the client\./);
       assert.doesNotMatch(note, /TS2322/);
       handle = /ep-[0-9a-f]{8}/.exec(note)![0];
@@ -314,9 +320,9 @@ test('/fold asks for a fold and ends the run on it', async () => {
       return fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'It builds.' }));
     },
     (context) => {
-      // The request message and the folded response are gone; only the note follows t1.
+      // The request message and the folded responses are gone; the marker and the note follow t1.
       const roles = conversation(context).map((message) => message.role);
-      assert.deepEqual(roles, ['user', 'assistant', 'toolResult', 'user']);
+      assert.deepEqual(roles, ['user', 'assistant', 'assistant', 'toolResult', 'user']);
       return fauxAssistantMessage('Next.');
     }
   ]);
@@ -1487,7 +1493,12 @@ test('stats read the session: folds, rejections, cues followed, and the drop aft
       stats.folds.each.map((fold) => fold.uncachedAfter),
       stats.folds.uncachedAfter
     );
-    assert.ok(stats.folds.each.every((fold) => fold.net > 0));
+    // The second fold removed one small read and a recall: less than its note and the line
+    // it left in their place, so it saves nothing.
+    assert.deepEqual(
+      stats.folds.each.map((fold) => fold.net > 0),
+      [true, false]
+    );
     // Every request's uncached input is put down to one cause; a fold's is its first request.
     const split = stats.uncached;
     assert.equal(
@@ -1505,7 +1516,7 @@ test('stats read the session: folds, rejections, cues followed, and the drop aft
     assert.ok(lines.includes('fold errors 1, next fold succeeded after 1'));
     assert.ok(
       lines.some((line) =>
-        /^fold cost break-even after median \d+ request\(s\), [0-2]\/2 folds past it \(cached input counted at 10%\)$/.test(
+        /^fold cost never breaks even for half the folds or more, [01]\/2 folds past break-even \(cached input counted at 10%\)$/.test(
           line
         )
       )

@@ -108,6 +108,10 @@ export interface FoldPlan {
   /** Covered-note media items (already-archived references and inline images) in block order. */
   media: CarriedMediaItem[];
   edits: ContextEditEntryDraft[];
+  /** Ids of the entries where the edits leave the fold's line, one for each span that has one. */
+  lines: string[];
+  /** Ids of the lines of covered folds that the edits remove, inside the span or before it. */
+  linesRemoved: string[];
 }
 
 /** The note of an earlier fold, as a later fold that covers it keeps it. */
@@ -414,6 +418,42 @@ export interface FoldableTurn {
 const PREVIEW_WIDTH = 72;
 
 /**
+ * What a fold leaves in place of the first response of its span, in the agent's voice.
+ * With the span removed whole, nothing in context showed that the agent had done the work
+ * its note describes, and one model then told the user that it had never run the commands
+ * and that its own note was made up. The line says why nothing is shown, because the fold
+ * call can come right after it, and a line that only claimed the work read as the opening
+ * of that same response, with no call behind it. MEASUREMENTS.md, section 15, has the
+ * wordings and the other forms tried. A span without a tool call gets a line that claims
+ * none.
+ */
+export function foldMarker(handle: string, turns: string, calls = true): string {
+  return calls
+    ? `[${handle}: earlier responses of mine stood here, with the tool calls I made (${turns}) and the outputs they returned. I read those outputs, and then I folded all of it out of this conversation: that is why no call and no output is shown here. The note in the result of the fold call below is my own record of what the outputs showed, written with them in view; recall with this handle reads them back.]`
+    : `[${handle}: earlier responses of mine stood here (${turns}). I folded them out of this conversation: that is why they are not shown here. The note in the result of the fold call below is my own record of them, written with them in view; recall with this handle reads them back.]`;
+}
+
+/**
+ * Where the lines of the folds in effect stand: the id of the entry to the handle of the fold.
+ * Read from the plan a fold writes before its edits, not from what the entry shows: another
+ * extension can edit a line afterwards, and a response can quote one. Where a later fold put
+ * its line in place of an earlier one, the entry is the later fold's while that is in effect.
+ */
+export function foldLines(
+  entries: readonly ProjectedSessionEntry[],
+  applied: ReadonlySet<string>
+): Map<string, string> {
+  const lines = new Map<string, string>();
+  for (const { sourceEntry: source } of entries) {
+    if (source.type !== 'custom' || source.customType !== FOLD_STARTED_TYPE) continue;
+    const { handle, lines: ids } = (source.data ?? {}) as { handle?: unknown; lines?: unknown };
+    if (typeof handle !== 'string' || !applied.has(handle) || !Array.isArray(ids)) continue;
+    for (const id of ids) if (typeof id === 'string') lines.set(id, handle);
+  }
+  return lines;
+}
+
+/**
  * Index of the latest compaction, or with `notes` of the latest applied fold note too. No fold
  * reaches back past a compaction; one that reaches back to a note covers it and keeps it under
  * its own, which the nudge asks for only when what stands around the notes takes up room.
@@ -500,7 +540,9 @@ function* stampedStarts(
  * latest note that a fold removes or cuts, which is the earliest note unless work was left
  * before it. A fold from an earlier stamp removes no more, since user messages stay; and one
  * model, asked to fold from the first stamp of a long session, would not, where it did fold
- * from a stamp further on. Undefined when no note stands after the latest compaction.
+ * from a stamp further on. The marker of a fold is not a thing to start at: the one before
+ * the earliest note goes with the fold that covers that note, and one further back marks
+ * turns the agent kept. Undefined when no note stands after the latest compaction.
  */
 export function mergeStart(
   entries: readonly ProjectedSessionEntry[]
@@ -508,12 +550,15 @@ export function mergeStart(
   const floor = foldBoundary(entries, false);
   const boundary = foldBoundary(entries);
   const starts = [...stampedStarts(entries, floor)];
+  const applied = appliedFolds(entries.map((entry) => entry.sourceEntry));
+  const lines = foldLines(entries, applied);
   for (let index = floor + 1; index <= boundary; index++) {
     const shown = entries[index]!.messages[0];
     const folds =
-      shown?.role === 'assistant' ||
-      shown?.role === 'toolResult' ||
-      (shown?.role === 'user' && capUserContent(shown.content, '') !== undefined);
+      lines.get(entries[index]!.sourceEntry.id) === undefined &&
+      (shown?.role === 'assistant' ||
+        shown?.role === 'toolResult' ||
+        (shown?.role === 'user' && capUserContent(shown.content, '') !== undefined));
     if (!folds) continue;
     // The latest span start that holds this entry; of the results of one response, the first.
     // No start holds what stands before the first stamp, such as the end of a turn that a
@@ -532,7 +577,7 @@ export function mergeStart(
  * put in, such as a reminder, goes with the work it stands in and starts none: a fold from
  * the stamp before it would cover notes for the sake of a few lines. What stands between a
  * note and the next stamp, such as the reply that followed a fold, is left out: only a fold
- * that covers that note reaches it. `keptAt` is the index of the latest note of a fold that
+ * that covers that note reaches it. The marker of a fold is no work. `keptAt` is the index of the latest note of a fold that
  * stopped at `until`, where the agent chose to keep turns, or -1: a later fold that covered
  * that note did not undo the choice.
  */
@@ -543,6 +588,7 @@ export function unfoldedBehindNote(
   const floor = foldBoundary(entries, false);
   const boundary = foldBoundary(entries);
   const starts = [...stampedStarts(entries, floor)];
+  const lines = foldLines(entries, applied);
   const calls = new Set<string>();
   for (const entry of entries.slice(floor + 1, boundary + 1)) {
     const message = entryMessage(entry);
@@ -561,6 +607,7 @@ export function unfoldedBehindNote(
     if (entry.messages.length === 0 || next >= starts.length || starts[next]!.index > index) {
       continue;
     }
+    if (lines.get(entry.sourceEntry.id) !== undefined) continue;
     if (entry.sourceEntry.type === 'custom_message') {
       if (start) work.push(entry);
       continue;
@@ -594,15 +641,16 @@ export function unfoldedBehindNote(
  * and what of it is still in context. Work is told from folding itself: a note and the
  * response that called its fold are neither, so a fold that only merges notes removes no work
  * and adds none, however long its note. A tool result or a response counts as folded only
- * when an applied fold recorded its removal in the plan it writes before its edits: another
- * extension can remove one too, also inside the span of a fold. A session from before folds
- * wrote that plan shows none.
+ * when an applied fold recorded its removal in the plan it writes before its edits, or left
+ * its marker in place of it: another extension can remove one too, also inside the span of a
+ * fold. A session from before folds wrote that plan shows none.
  */
 export function workSince(
   entries: readonly ProjectedSessionEntry[],
   after: number
 ): { folded: boolean; left: ProjectedSessionEntry[] } {
   const applied = appliedFolds(entries.map((entry) => entry.sourceEntry));
+  const lines = foldLines(entries, applied);
   const removed = new Set<string>();
   const calls = new Set<string>();
   for (const entry of entries) {
@@ -633,7 +681,8 @@ export function workSince(
     ) {
       continue;
     }
-    if (entry.messages.length > 0) left.push(entry);
+    if (lines.get(entry.sourceEntry.id) !== undefined) folded = true;
+    else if (entry.messages.length > 0) left.push(entry);
     else if (message?.role === 'toolResult' || message?.role === 'assistant') {
       folded ||= removed.has(entry.sourceEntry.id);
     }
@@ -670,8 +719,9 @@ export function foldableTurns(entries: readonly ProjectedSessionEntry[]): Foldab
 
 /**
  * What a fold does to one entry of its span: a user message keeps its first USER_TEXT_CAP
- * characters, a response, tool result or extension message is removed. System messages,
- * compaction checkpoints and `!` commands are not editable and stay.
+ * characters, a response, tool result or extension message is removed; `planFold` then
+ * puts the marker in place of the first response. System messages, compaction checkpoints
+ * and `!` commands are not editable and stay.
  */
 function entryEdit(
   entry: ProjectedSessionEntry,
@@ -747,6 +797,7 @@ function unfinishedBatches(branch: readonly SessionEntry[]): {
   kind: 'fold' | 'unfold';
   handle: string;
   edits: ContextEditEntryDraft[];
+  lines: string[];
   readDeps: ReadPruneDependency[];
 }[] {
   const open = new Map<
@@ -756,12 +807,18 @@ function unfinishedBatches(branch: readonly SessionEntry[]): {
       kind: 'fold' | 'unfold';
       handle: string;
       edits: ContextEditEntryDraft[];
+      lines: string[];
       readDeps: ReadPruneDependency[];
     }
   >();
   branch.forEach((entry, index) => {
     if (entry.type !== 'custom') return;
-    const data = (entry.data ?? {}) as { handle?: unknown; edits?: unknown; readDeps?: unknown };
+    const data = (entry.data ?? {}) as {
+      handle?: unknown;
+      edits?: unknown;
+      lines?: unknown;
+      readDeps?: unknown;
+    };
     if (typeof data.handle !== 'string') return;
     if (entry.customType === FOLD_STARTED_TYPE && Array.isArray(data.edits)) {
       open.set(`fold:${data.handle}`, {
@@ -769,6 +826,7 @@ function unfinishedBatches(branch: readonly SessionEntry[]): {
         kind: 'fold',
         handle: data.handle,
         edits: data.edits as ContextEditEntryDraft[],
+        lines: Array.isArray(data.lines) ? (data.lines as string[]) : [],
         readDeps: Array.isArray(data.readDeps) ? (data.readDeps as ReadPruneDependency[]) : []
       });
     } else if (entry.customType === FOLD_APPLIED_TYPE) {
@@ -779,6 +837,7 @@ function unfinishedBatches(branch: readonly SessionEntry[]): {
         kind: 'unfold',
         handle: data.handle,
         edits: data.edits as ContextEditEntryDraft[],
+        lines: [],
         readDeps: []
       });
     } else if (entry.customType === FOLD_UNFOLDED_TYPE) {
@@ -820,7 +879,7 @@ export function completeCutShortFolds(
     }
     return state;
   };
-  return unfinishedBatches(branch).flatMap(({ index, kind, handle, edits, readDeps }) => {
+  return unfinishedBatches(branch).flatMap(({ index, kind, handle, edits, lines, readDeps }) => {
     const depByTarget = new Map(readDeps.map((dep) => [dep.targetId, dep]));
     const latestRaw = new Map<string, unknown>();
     for (const entry of [...branch.slice(index + 1), ...pending]) {
@@ -876,7 +935,10 @@ export function completeCutShortFolds(
       const newer = latestRaw.get(edit.targetId);
       if (JSON.stringify(newer) === JSON.stringify(edit.replacement)) return [];
       const source = branchById.get(edit.targetId);
-      if (kind === 'fold') return edit.replacement === null ? [edit] : [];
+      // A fold's line is written like a removal: what it replaces left with the span.
+      if (kind === 'fold') {
+        return edit.replacement === null || lines.includes(edit.targetId) ? [edit] : [];
+      }
       const noteRecord = source?.type === 'message' ? foldNoteDetails(source.message) : undefined;
       if (noteRecord?.handle === handle) {
         const pendingNote = editedContent(edit.targetId, branch, pending);
@@ -925,6 +987,10 @@ export interface FoldOptions {
   callerId?: string;
   /** The last turn inside the span; later turns stay. Without it the span runs up to the call. */
   until?: number;
+  /** Where the lines of folds in effect stand, when no session entries record them (see foldLines). */
+  lines?: ReadonlyMap<string, string>;
+  /** Handles of the folds whose notes the whole call covers, when it folds more than this span. */
+  covered?: ReadonlySet<string>;
 }
 
 /** A fold the tool refused, with why, so rejections can be counted by cause. */
@@ -975,6 +1041,7 @@ export function planFold(
   // Nothing before the compaction summary can be folded: it stands for everything it
   // replaced. An earlier note can: the new note covers it, and its span stays archived.
   const applied = options.applied ?? appliedFolds(entries.map((entry) => entry.sourceEntry));
+  const lines = options.lines ?? foldLines(entries, applied);
   const compaction = entries.findLastIndex(
     (entry, index) => index < foldIndex && entry.sourceEntry.type === 'compaction'
   );
@@ -1057,10 +1124,17 @@ export function planFold(
       throw new FoldError('not-before-call', `${stampLabel(until)} is not before this fold call.`);
     }
     const next = turnAfter(entries, untilIndex, foldIndex);
-    if (next) {
-      endIndex = next.index;
-      keptFrom = next.stamp;
-    }
+    // The marker of another fold stands for turns after these, which that fold removed: the
+    // span stops before it, as it would before those turns.
+    const marker = entries.findIndex(
+      (entry, index) =>
+        index > untilIndex &&
+        index < (next?.index ?? foldIndex) &&
+        lines.get(entry.sourceEntry.id) !== undefined
+    );
+    if (marker >= 0) endIndex = marker;
+    else if (next) endIndex = next.index;
+    keptFrom = next?.stamp;
   }
 
   const span = entries.slice(startIndex, endIndex);
@@ -1068,9 +1142,12 @@ export function planFold(
     options.until === undefined
       ? `from ${stampLabel(since)}`
       : `from ${stampLabel(since)} to ${stampLabel(options.until)}`;
-  if (
-    !span.some((entry) => entry.messages.length > 0 && entryMessage(entry)?.role === 'assistant')
-  ) {
+  // The line of an earlier fold stands for responses that fold removed: it is none itself.
+  const responds = (entry: ProjectedSessionEntry) =>
+    entry.messages.length > 0 &&
+    entryMessage(entry)?.role === 'assistant' &&
+    lines.get(entry.sourceEntry.id) === undefined;
+  if (!span.some(responds)) {
     // The usual slip: since names the message being answered, to fold the request before it.
     const note = entries.findLastIndex(
       (entry, index) => index < startIndex && isFoldNote(entry, applied)
@@ -1079,11 +1156,7 @@ export function planFold(
       options.until === undefined
         ? stampedStarts(entries, Math.max(boundary, note)).next().value
         : undefined;
-    const pending =
-      before !== undefined &&
-      entries
-        .slice(before.index, startIndex)
-        .some((entry) => entry.messages.length > 0 && entryMessage(entry)?.role === 'assistant');
+    const pending = before !== undefined && entries.slice(before.index, startIndex).some(responds);
     throw new FoldError(
       'nothing-to-fold',
       `Nothing to fold ${range}: the span holds no responses.${pending ? ` To fold the work before it, use since "${stampLabel(before.stamp)}": that is where the work not yet folded starts.` : ''}`
@@ -1100,18 +1173,62 @@ export function planFold(
   const keptUserTurns: string[] = [];
   const laterStamps: number[] = [];
   let reachedResponse = false;
+  const lined: string[] = [];
+  const linesRemoved: string[] = [];
+  const covers = coveredNotes(entries, span, applied);
+  const covered = options.covered ?? new Set(covers.map((note) => note.handle));
+  // Only a span that holds a tool call gets a line that speaks of calls and outputs.
+  const calls = span.some((entry) =>
+    entry.messages.some(
+      (shown) =>
+        shown.role === 'assistant' && shown.content.some((block) => block.type === 'toolCall')
+    )
+  );
+  // The turns the marker names: from since to the last stamp in the span, as the note does.
+  const lastStamp = span
+    .flatMap((entry) => entry.messages.map(readStamp))
+    .findLast((stamp) => stamp !== undefined);
+  const turns =
+    lastStamp === undefined || lastStamp === since
+      ? stampLabel(since)
+      : `${stampLabel(since)}-${stampLabel(lastStamp)}`;
 
   for (const entry of span) {
     if (entry.messages.length === 0) continue;
+    const owner = lines.get(entry.sourceEntry.id);
+    if (owner !== undefined) {
+      // The line of an earlier fold goes with a fold that covers its note. Under a span that
+      // ends before that note it stays: the fold it stands for is still in effect.
+      if (covered.has(owner)) {
+        edits.push({ type: 'context_edit', targetId: entry.sourceEntry.id, replacement: null });
+        linesRemoved.push(entry.sourceEntry.id);
+      }
+      continue;
+    }
     const message = entryMessage(entry);
     const projected = entry.messages[0]!;
+    let edit = entryEdit(entry, handle);
+    // The line goes where the first response stood that is sent again: pi leaves a response
+    // that ended in an error or was aborted out of every request, and the line with it.
+    if (
+      message?.role === 'assistant' &&
+      message.stopReason !== 'error' &&
+      message.stopReason !== 'aborted' &&
+      lined.length === 0 &&
+      edit
+    ) {
+      edit = {
+        ...edit,
+        replacement: { content: [{ type: 'text', text: foldMarker(handle, turns, calls) }] }
+      };
+      lined.push(edit.targetId);
+    }
     if (message?.role === 'assistant') reachedResponse = true;
     if (!reachedResponse) {
       const stamp = readStamp(projected);
       if (stamp !== undefined) laterStamps.push(stamp);
     }
 
-    const edit = entryEdit(entry, handle);
     if (edit) edits.push(edit);
     if (message?.role === 'user' && projected.role === 'user') {
       const stamp = readStamp(projected);
@@ -1124,6 +1241,20 @@ export function planFold(
   // Pi writes these edits one entry at a time, so a crash can apply only some of them.
   // Removing the span from its end keeps every intermediate prefix valid.
   edits.reverse();
+
+  // A fold that starts at the note of the fold before it stands behind that fold's line, with
+  // at most the user messages that fold kept between them. Its own line says the same for
+  // both from now on, so the older one goes: a chain of such folds would otherwise leave a
+  // row of them. A line with a response between it and this span stays where it is.
+  for (let index = startIndex - 1; index > boundary; index--) {
+    const entry = entries[index]!;
+    if (entry.messages.length === 0) continue;
+    const owner = lines.get(entry.sourceEntry.id);
+    if (owner !== undefined && covered.has(owner)) {
+      edits.push({ type: 'context_edit', targetId: entry.sourceEntry.id, replacement: null });
+      linesRemoved.push(entry.sourceEntry.id);
+    } else if (entry.messages[0]!.role !== 'user') break;
+  }
 
   let anchorStamp: number | undefined;
   for (let index = startIndex - 1; index >= 0 && anchorStamp === undefined; index--) {
@@ -1165,9 +1296,11 @@ export function planFold(
     sent: entries.slice(0, foldIndex).flatMap((entry) => entry.messages),
     keptUserTurns,
     archivedReadTurns,
-    covers: coveredNotes(entries, span, applied),
+    covers,
     media,
-    edits
+    edits,
+    lines: lined,
+    linesRemoved
   };
 }
 
@@ -1215,6 +1348,10 @@ export interface FoldBatchPlan {
   covers: CoveredNote[];
   media: CarriedMediaItem[];
   edits: ContextEditEntryDraft[];
+  /** Ids of the entries where the edits leave the fold's line, one for each span that has one. */
+  lines: string[];
+  /** Estimated tokens the fold's lines add, less those of the covered folds' lines it removes. */
+  lineTokens: number;
 }
 
 function parseSingleFoldSpan(raw: Record<string, unknown>): NormalizedFoldSpan {
@@ -1331,11 +1468,20 @@ export function planFoldBatch(
   }
   const entryIndexById = new Map(entries.map((entry, idx) => [entry.sourceEntry.id, idx]));
 
-  const resolved = spans.map((item) => {
-    const plan = planFold(entries, foldCallId, item.since, {
+  const planned = (item: NormalizedFoldSpan, covered?: ReadonlySet<string>) =>
+    planFold(entries, foldCallId, item.since, {
       ...options,
-      ...(item.until === undefined ? {} : { until: item.until })
+      ...(item.until === undefined ? {} : { until: item.until }),
+      ...(covered ? { covered } : {})
     });
+  // The line of a covered fold can stand in or before another span than the one that holds
+  // its note, so each span is planned knowing what all of them cover.
+  const coveredByAll =
+    spans.length > 1
+      ? new Set(spans.flatMap((item) => planned(item).covers.map((note) => note.handle)))
+      : undefined;
+  const resolved = spans.map((item) => {
+    const plan = planned(item, coveredByAll);
     const startIndex = entryIndexById.get(plan.firstEntryId) ?? -1;
     const lastIndex = entryIndexById.get(plan.lastEntryId) ?? -1;
     return {
@@ -1386,7 +1532,28 @@ export function planFoldBatch(
         .map((entry) => entry.sourceEntry.id)
     );
     for (const edit of resolved[i]!.plan.edits) {
-      if (spanIds.has(edit.targetId)) selectedSpanEdits.push(edit);
+      // An older marker that a span removes with it stands before the span; one that another
+      // span of this call holds is that span's to edit.
+      const index = entryIndexById.get(edit.targetId) ?? -1;
+      if (spanIds.has(edit.targetId) || !selectedIndices.has(index)) selectedSpanEdits.push(edit);
+    }
+  }
+
+  // What the fold's lines add to the context: those it writes, less the lines of covered
+  // folds it removes.
+  const lines = resolved.flatMap((entry) => entry.plan.lines);
+  const linesRemoved = new Set(resolved.flatMap((entry) => entry.plan.linesRemoved));
+  let lineTokens = 0;
+  for (const edit of selectedSpanEdits) {
+    const index = entryIndexById.get(edit.targetId) ?? -1;
+    const shown = entries[index]?.messages[0];
+    if (!shown) continue;
+    if (edit.replacement === null) {
+      if (linesRemoved.has(edit.targetId)) lineTokens -= estimateTokens([shown]);
+    } else if (lines.includes(edit.targetId)) {
+      lineTokens += estimateTokens([
+        { ...shown, content: edit.replacement.content } as AgentMessage
+      ]);
     }
   }
 
@@ -1541,12 +1708,11 @@ export function planFoldBatch(
     archivedReadTurns,
     covers,
     media,
-    edits: (() => {
-      const entryIndexById = new Map(entries.map((entry, idx) => [entry.sourceEntry.id, idx]));
-      return selectedSpanEdits.sort(
-        (a, b) => (entryIndexById.get(b.targetId) ?? -1) - (entryIndexById.get(a.targetId) ?? -1)
-      );
-    })()
+    edits: selectedSpanEdits.sort(
+      (a, b) => (entryIndexById.get(b.targetId) ?? -1) - (entryIndexById.get(a.targetId) ?? -1)
+    ),
+    lines,
+    lineTokens
   };
 }
 
@@ -1977,7 +2143,6 @@ export function planUnfold(
   if (!ownIntervals || ownIntervals.length === 0) {
     throw new Error(`Cannot find the start of ${trimmed} on this branch.`);
   }
-  const firstBranchIndex = ownIntervals[0]![0];
 
   for (let index = noteIndex + 1; index < branch.length; index++) {
     const later = branch[index]!;
@@ -2050,12 +2215,12 @@ export function planUnfold(
   }
   const spanSlice = ownIntervals.flatMap(([first, last]) => branch.slice(first, last + 1));
   const spanIds = new Set(spanSlice.map((entry) => entry.id));
-  const postSpanOwned = branch
-    .slice(firstBranchIndex + 1)
-    .filter(
-      (entry) =>
-        !spanIds.has(entry.id) && ownEditedTargetIds.has(entry.id) && entry.id !== noteEntry.id
-    );
+  // What the fold edited outside its span: an older marker right before it, which it removed,
+  // and entries after it that it pruned.
+  const postSpanOwned = branch.filter(
+    (entry) =>
+      !spanIds.has(entry.id) && ownEditedTargetIds.has(entry.id) && entry.id !== noteEntry.id
+  );
   const byId = new Map(projection.map((entry) => [entry.sourceEntry.id, entry]));
   const restoreEdits: ContextEditEntryDraft[] = [];
   const tailRestoreEdits: ContextEditEntryDraft[] = [];
@@ -2363,6 +2528,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       // The notes it covers stay in context under it: the agent did not write them again, and
       // the fold did not free them.
       if (batch.covers.length > 0) details.keptTokens = coveredTokens(batch.covers);
+      if (batch.lineTokens !== 0) details.lineTokens = batch.lineTokens;
       if (manual) details.manual = manual;
       const gapTokens = anchorGapTokens(
         batch.sent,
@@ -2410,6 +2576,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         messages: batch.omitted.length,
         tokens,
         edits: batch.edits,
+        lines: batch.lines,
         lastEntryId: batch.lastEntryId,
         pruneAfterEntryId: batch.spans[0]!.lastEntryId,
         ...(caller ? { callerEntryId: caller.sourceEntry.id } : {}),
@@ -2681,8 +2848,13 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         draft.type === 'context_edit' && draft.targetId !== undefined ? [draft.targetId] : []
       )
     );
+    const standingLines =
+      applied.length > 0
+        ? foldLines(ctx.sessionManager.buildSessionProjection().entries, appliedFolds(branch))
+        : new Map<string, string>();
     const editsOf = (fold: {
       edits: readonly ContextEditEntryDraft[];
+      lines?: readonly string[];
       lastEntryId?: string;
       pruneAfterEntryId?: string;
       callerEntryId?: string;
@@ -2699,7 +2871,8 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
               editOwners,
               afterEntryId: pruneAfter,
               beforeEntryId,
-              cwd: state.cwd
+              cwd: state.cwd,
+              lines: new Set([...standingLines.keys(), ...(fold.lines ?? [])])
             })
           : {
               assistantReplacements: new Map<string, AssistantMessage['content']>(),
@@ -2728,8 +2901,10 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
 
       const assistantEdits: ContextEditEntryDraft[] = [];
       for (const targetId of sortedAssistantIds) {
-        // An edit an earlier handler queued for the response stands, as for a user message.
-        if (edited.has(targetId)) continue;
+        // An edit an earlier handler queued for a response stands, as for a user message. The
+        // fold's line does not give way: the response it replaces leaves with its span, as a
+        // removal would have it, and left standing it would hold calls without results.
+        if (edited.has(targetId) && !fold.lines?.includes(targetId)) continue;
         const composed = tailPrune.assistantReplacements.get(targetId);
         if (composed) {
           assistantEdits.push({
@@ -2809,6 +2984,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         // stuck behind a note no fold can reach past.
         ...applied.flatMap((fold) => {
           const { edits, readDeps } = editsOf(fold);
+          const lines = fold.lines ?? [];
           return [
             {
               type: 'custom' as const,
@@ -2816,6 +2992,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
               data: {
                 handle: fold.handle,
                 edits,
+                ...(lines.length > 0 ? { lines } : {}),
                 ...(readDeps.length > 0 ? { readDeps } : {})
               }
             },

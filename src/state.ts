@@ -20,6 +20,8 @@ export interface PendingFold {
   messages: number;
   tokens: number;
   edits: ContextEditEntryDraft[];
+  /** Ids of the entries where the edits leave the fold's line. */
+  lines?: string[];
   /** Last session entry inside the folded span, where any surviving `until` tail begins. */
   lastEntryId?: string;
   /** Last entry of the earliest span in a batch, where surviving gap/tail pruning begins. */

@@ -40,6 +40,10 @@ export class ForkFolds {
   private readonly siblings: number;
   private readonly archiveDir: string | undefined;
   private readonly omitted = new Set<AgentMessage>();
+  /** Responses that show the marker of a fold in effect, with its text. */
+  private readonly marked = new Map<AgentMessage, string>();
+  /** The same by entry id, to the handle of the fold: what planFold tells a line by. */
+  private readonly lines = new Map<string, string>();
   private readonly replaced = new Map<AgentMessage, (TextContent | ImageContent)[]>();
   private readonly applied = new Set<string>();
 
@@ -73,15 +77,21 @@ export class ForkFolds {
   view(messages: readonly AgentMessage[]): AgentMessage[] {
     const out: AgentMessage[] = [];
     for (const message of messages) {
-      if (this.omitted.has(message)) continue;
-      const noteReplacement = this.replaced.get(message);
-      out.push(
-        noteReplacement && message.role === 'toolResult'
-          ? { ...message, content: noteReplacement }
-          : message
-      );
+      if (!this.omitted.has(message)) out.push(this.shown(message));
     }
     return out;
+  }
+
+  /** A message as the child sees it: a marker or an unfolded note's stub in place of what it held. */
+  private shown(message: AgentMessage): AgentMessage {
+    const marker = this.marked.get(message);
+    if (marker !== undefined && message.role === 'assistant') {
+      return { ...message, content: [{ type: 'text', text: marker }] };
+    }
+    const noteReplacement = this.replaced.get(message);
+    return noteReplacement && message.role === 'toolResult'
+      ? { ...message, content: noteReplacement }
+      : message;
   }
 
   /** Stamps a child tool result in place, before the loop sends it. */
@@ -107,11 +117,7 @@ export class ForkFolds {
       const sibling = index < this.siblings;
       const ownIndex = index - this.siblings;
       const id = sibling ? `${this.forkHandle}/s${index}` : `${this.forkHandle}/${ownIndex}`;
-      const noteReplacement = this.replaced.get(message);
-      const projected: AgentMessage =
-        noteReplacement && message.role === 'toolResult'
-          ? { ...message, content: noteReplacement }
-          : message;
+      const projected = this.shown(message);
       const sourceEntry = {
         type: 'message',
         id,
@@ -139,7 +145,8 @@ export class ForkFolds {
     const batch = planFoldBatch(entries, toolCallId, normalizedSpans, {
       latestStamp: this.state.nextStamp - 1,
       floorIndex: this.parentEntries.length + this.siblings,
-      applied: this.applied
+      applied: this.applied,
+      lines: this.lines
     });
 
     // Archive covered-note media once for the combined batch before mutating any ForkFolds
@@ -150,14 +157,22 @@ export class ForkFolds {
     const ownMessages = messages.slice(this.prefixLength);
     const index = (id: string) => Number(id.slice(this.forkHandle.length + 1));
     const omit: number[] = [];
+    const marked: { index: number; text: string }[] = [];
     for (const edit of batch.edits) {
-      // Children have no user messages, so a fold only omits span entries.
-      if (edit.replacement !== null) continue;
+      // Children have no user messages, so a fold omits span entries or leaves its marker.
       const ownIndex = index(edit.targetId);
       const message = ownMessages[ownIndex];
       if (!message) continue;
-      this.omitted.add(message);
-      omit.push(ownIndex);
+      if (edit.replacement === null) {
+        this.omitted.add(message);
+        omit.push(ownIndex);
+        continue;
+      }
+      const block = (edit.replacement.content as TextContent[])[0];
+      if (message.role !== 'assistant' || block?.type !== 'text') continue;
+      this.marked.set(message, block.text);
+      this.lines.set(edit.targetId, batch.handle);
+      marked.push({ index: ownIndex, text: block.text });
     }
     const firstIndex = index(batch.firstEntryId);
     const lastIndex = index(batch.lastEntryId);
@@ -213,6 +228,7 @@ export class ForkFolds {
     record.note = batch.note;
     record.noteTokens = Math.ceil(batch.note.length / 4);
     if (batch.covers.length > 0) record.keptTokens = coveredTokens(batch.covers);
+    if (batch.lineTokens !== 0) record.lineTokens = batch.lineTokens;
     const carried = renderCovered(batch.covers);
     const keptFrom = batch.keptFrom;
     if (keptFrom) record.keptFrom = keptFrom;
@@ -223,6 +239,7 @@ export class ForkFolds {
       last: lastIndex,
       ...(childSpans.length > 1 ? { spans: childSpans } : {}),
       omit,
+      ...(marked.length > 0 ? { marked } : {}),
       createdAt: ownMessages.length
     });
 
@@ -308,6 +325,18 @@ export class ForkFolds {
     for (const idx of stillOmitted) {
       const msg = ownMessages[idx];
       if (msg) this.omitted.add(msg);
+    }
+    // The markers of the folds still in effect, the later one where two marked one response.
+    this.marked.clear();
+    this.lines.clear();
+    for (const fold of this.folds) {
+      if (fold.unfolded) continue;
+      for (const mark of fold.marked ?? []) {
+        const msg = ownMessages[mark.index];
+        if (!msg) continue;
+        this.marked.set(msg, mark.text);
+        this.lines.set(`${this.forkHandle}/${mark.index}`, fold.record.handle);
+      }
     }
 
     const noteMsg = ownMessages.find((msg) => foldNoteDetails(msg)?.handle === handle);

@@ -2227,7 +2227,9 @@ test('relocated session directories resolve archived images, recall rejects quer
           );
         },
         (context) => {
-          const ep2Msg = conversation(context).find((m) => text(m).includes(ep2))!;
+          const ep2Msg = conversation(context).find(
+            (m) => m.role === 'toolResult' && text(m).includes(ep2)
+          )!;
           const ep2Stamp = /\[(t\d+)\]\s*$/.exec(text(ep2Msg))![1]!;
           return fauxAssistantMessage(
             fauxToolCall('fold', {

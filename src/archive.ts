@@ -120,6 +120,8 @@ export interface FoldDetails {
   noteTokens?: number;
   /** Estimated tokens of the earlier notes kept under it, which the fold did not free. */
   keptTokens?: number;
+  /** Estimated tokens of the lines the fold left where its spans began, less those of the covered folds' lines it removed. */
+  lineTokens?: number;
   /**
    * The fold's result as the fold left it: the number of its blocks, their hash (absent when
    * a hook had changed the note before), and the length and hash of the notes kept under
@@ -223,6 +225,8 @@ export interface NestedFold {
   spans?: { first: number; last: number }[];
   /** Messages the fold hid from the child's view. */
   omit: number[];
+  /** Responses the fold left its marker in place of, with the marker's text. */
+  marked?: { index: number; text: string }[];
   unfolded?: boolean;
   /** Child message count when this fold was created. */
   createdAt?: number;
@@ -299,18 +303,23 @@ export function replayForkMessages(
   const relevant = folds.filter((fold) => (fold.createdAt ?? 0) <= stateAt);
   const omitted = new Set<number>();
   const unfoldedHandles = new Set<string>();
+  const marked = new Map<number, string>();
   for (const fold of relevant) {
     if (isNestedFoldUnfoldedAt(fold, stateAt)) {
       unfoldedHandles.add(fold.record.handle);
     } else {
       for (const idx of fold.omit) omitted.add(idx);
+      for (const mark of fold.marked ?? []) marked.set(mark.index, mark.text);
     }
   }
   const out: AgentMessage[] = [];
   for (let index = 0; index < limit; index++) {
     if (omitted.has(index)) continue;
     let current = messages[index]!;
-    if (current.role === 'toolResult') {
+    const marker = marked.get(index);
+    if (marker !== undefined && current.role === 'assistant') {
+      current = { ...current, content: [{ type: 'text', text: marker }] };
+    } else if (current.role === 'toolResult') {
       const details = foldNoteDetails(current);
       if (details && unfoldedHandles.has(details.handle)) {
         const stamp = readStamp(current);
@@ -864,7 +873,7 @@ export class ThreadIndex {
         folds
           .slice(0, order)
           .filter((other) => !isNestedFoldUnfoldedAt(other, snapAt))
-          .flatMap((other) => other.omit)
+          .flatMap((other) => [...other.omit, ...(other.marked ?? []).map((mark) => mark.index)])
       );
       const snapReplay = () =>
         replayForkMessages(archive.messages, folds.slice(0, order), {

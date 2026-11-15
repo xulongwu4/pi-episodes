@@ -36,6 +36,11 @@ export interface FoldTailPruneOptions {
   afterEntryId: string;
   beforeEntryId: string;
   cwd: string;
+  /**
+   * Entries that hold the line of a fold, this one's or an earlier one's. A line stands for
+   * responses that are gone: it is no turn that followed a failed call.
+   */
+  lines?: ReadonlySet<string>;
 }
 
 export interface ReadPruneDependency {
@@ -158,7 +163,8 @@ export function planFoldTailPruning(options: FoldTailPruneOptions): FoldTailPrun
     editOwners,
     afterEntryId,
     beforeEntryId,
-    cwd
+    cwd,
+    lines
   } = options;
   const assistantReplacements = new Map<string, AssistantMessage['content']>();
   const readEdits: ContextEditEntryDraft[] = [];
@@ -243,7 +249,7 @@ export function planFoldTailPruning(options: FoldTailPruneOptions): FoldTailPrun
 
   for (let idx = afterIndex + 1; idx < beforeIndex; idx++) {
     const source = branch[idx]!;
-    if (source.type !== 'message') continue;
+    if (source.type !== 'message' || lines?.has(source.id)) continue;
     const projEntry = projectedById.get(source.id);
     if (!projEntry || projEntry.messages.length === 0) continue;
     const externallyEdited = externallyEditedIds.has(source.id);

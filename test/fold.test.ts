@@ -23,10 +23,13 @@ import {
   coveredTokens,
   cutShortFold,
   foldableTurns,
+  foldMarker,
   headline,
   mergeStart,
   openItems,
   planFold,
+  planFoldBatch,
+  planUnfold,
   renderCovered,
   renderNote,
   USER_TEXT_CAP,
@@ -35,7 +38,7 @@ import {
   writtenMark
 } from '../src/fold.js';
 import { carriedMediaBlocks, holdsCarriedMedia } from '../src/images.js';
-import { skillPaths, touchedPaths } from '../src/messages.js';
+import { messageText, skillPaths, touchedPaths } from '../src/messages.js';
 import { nudgeGrowth, tokensBehindNote } from '../src/nudge.js';
 import { readStamp } from '../src/stamps.js';
 import { assistant, call, result, session, user } from './helpers.js';
@@ -87,9 +90,16 @@ test('folds from the response behind since and keeps user messages from the span
   assert.equal(plan.lastEntryId, ids[7]);
   assert.deepEqual(plan.keptUserTurns, ['t4']);
   assert.equal(plan.omitted.length, 4);
+  // The span goes from its end; the first response of it stays as the marker of the fold.
+  const marker = { content: [{ type: 'text', text: foldMarker(plan.handle, 't3-t5') }] };
   assert.deepEqual(
     plan.edits.map((edit) => [edit.targetId, edit.replacement]),
-    [ids[7], ids[6], ids[4], ids[3]].map((id) => [id, null])
+    [
+      [ids[7], null],
+      [ids[6], null],
+      [ids[4], null],
+      [ids[3], marker]
+    ]
   );
 
   apply(manager, plan.edits);
@@ -100,10 +110,12 @@ test('folds from the response behind since and keeps user messages from the span
     'user',
     'assistant',
     'toolResult',
+    'assistant',
     'user',
     'assistant',
     'toolResult'
   ]);
+  assert.deepEqual((view[3] as Message).content, marker.content);
   assert.equal(readStamp(view.filter((message) => message.role === 'user')[1]!), 4);
   assertPaired(view);
 });
@@ -146,7 +158,11 @@ test('the rest of a fold cut short after any of its edits completes it', () => {
     });
     made.manager.appendMessage(note);
     if (started) {
-      made.manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
+      made.manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+        handle: plan.handle,
+        edits: plan.edits,
+        lines: plan.lines
+      });
     }
     return { ...made, plan };
   };
@@ -191,7 +207,11 @@ test('a cut-short fold is completed over edits that other extensions made to its
       }
     })
   );
-  manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
+  manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+    handle: plan.handle,
+    edits: plan.edits,
+    lines: plan.lines
+  });
   apply(manager, plan.edits.slice(0, 2));
   // Another extension restores the first removed entry, shortens the next planned one, and
   // rewrites the note without hiding it.
@@ -215,45 +235,57 @@ test('a cut-short fold is completed over edits that other extensions made to its
   assert.equal(completeCutShortFolds(manager.getBranch()).length, 0);
 });
 
-test('a cut-short fold does not write its cut of a user message over a later edit of it', () => {
+test('a cut-short fold does not write its cut of a user message over a later edit, and writes its line like a removal', () => {
   const pasted = [...buildLoop];
   pasted[5] = user('x'.repeat(USER_TEXT_CAP * 2), 4);
+  // The edit of the fold that is no removal: the cut of the pasted message, or the line in
+  // place of the first response.
+  let which: 'cut' | 'marker' = 'cut';
   const build = () => {
     const { manager, ids } = session(pasted);
     const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2);
-    manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
-    const cut = plan.edits.findIndex((edit) => edit.targetId === ids[5]);
+    manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+      handle: plan.handle,
+      edits: plan.edits,
+      lines: plan.lines
+    });
+    const target = which === 'cut' ? ids[5]! : ids[1]!;
+    const cut = plan.edits.findIndex((edit) => edit.targetId === target);
     assert.ok(cut > 0 && plan.edits[cut]!.replacement !== null);
-    return { manager, plan, cut, paste: ids[5]! };
+    return { manager, plan, cut, paste: target };
   };
   const targets = (rest: ReturnType<typeof completeCutShortFolds>) =>
     rest.flatMap((draft) => (draft.type === 'context_edit' ? [draft.targetId] : []));
   const redacted = { content: [{ type: 'text' as const, text: 'redacted' }] };
 
-  // Left alone, the cut is completed like the removals.
-  const plain = build();
-  apply(plain.manager, plain.plan.edits.slice(0, 1));
-  assert.ok(targets(completeCutShortFolds(plain.manager.getBranch())).includes(plain.paste));
+  for (which of ['cut', 'marker'] as const) {
+    // Left alone, the cut or the marker is completed like the removals.
+    const plain = build();
+    apply(plain.manager, plain.plan.edits.slice(0, 1));
+    assert.ok(targets(completeCutShortFolds(plain.manager.getBranch())).includes(plain.paste));
 
-  // Another extension rewrote or removed the message, on the branch or in a draft queued at
-  // this boundary, whether the crash came before the cut or after it.
-  for (const later of [redacted, null]) {
-    for (const where of ['branch', 'queued'] as const) {
-      for (const crash of ['before the cut', 'after the cut'] as const) {
-        const { manager, plan, cut, paste } = build();
-        const landed = crash === 'before the cut' ? 1 : cut + 1;
-        apply(manager, plan.edits.slice(0, landed));
-        const edit = { type: 'context_edit' as const, targetId: paste, replacement: later };
-        if (where === 'branch') manager.appendContextEdit(paste, later);
-        const rest = completeCutShortFolds(manager.getBranch(), where === 'queued' ? [edit] : []);
-        assert.deepEqual(
-          targets(rest),
-          plan.edits
-            .slice(landed)
-            .map((edit) => edit.targetId)
-            .filter((id) => id !== paste),
-          [JSON.stringify(later), where, crash].join(', ')
-        );
+    // Another extension rewrote or removed the message, on the branch or in a draft queued at
+    // this boundary, whether the crash came before the edit of the fold or after it. The cut
+    // would put old text back over that, so it gives way. The line holds nothing of the
+    // response: it is written again, as a removal is, since the response left with its span.
+    for (const later of [redacted, null]) {
+      for (const where of ['branch', 'queued'] as const) {
+        for (const crash of ['before the cut', 'after the cut'] as const) {
+          const { manager, plan, cut, paste } = build();
+          const landed = crash === 'before the cut' ? 1 : cut + 1;
+          apply(manager, plan.edits.slice(0, landed));
+          const edit = { type: 'context_edit' as const, targetId: paste, replacement: later };
+          if (where === 'branch') manager.appendContextEdit(paste, later);
+          const rest = completeCutShortFolds(manager.getBranch(), where === 'queued' ? [edit] : []);
+          const open = plan.edits.slice(landed).map((edit) => edit.targetId);
+          assert.deepEqual(
+            targets(rest),
+            which === 'cut'
+              ? open.filter((id) => id !== paste)
+              : [...(crash === 'after the cut' ? [paste] : []), ...open],
+            [which, JSON.stringify(later), where, crash].join(', ')
+          );
+        }
       }
     }
   }
@@ -262,7 +294,11 @@ test('a cut-short fold does not write its cut of a user message over a later edi
 test('a cut-short fold counts the edits earlier handlers queued at the same boundary', () => {
   const { manager } = session(buildLoop);
   const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2);
-  manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
+  manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+    handle: plan.handle,
+    edits: plan.edits,
+    lines: plan.lines
+  });
   apply(manager, plan.edits.slice(0, 1));
   const restored = plan.edits[0]!.targetId;
   const pending = [
@@ -294,7 +330,11 @@ test('a cut-short fold whose note an edit removed is completed like any other', 
       })
     );
     if (where === 'before') manager.appendContextEdit(noteId, null);
-    manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
+    manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+      handle: plan.handle,
+      edits: plan.edits,
+      lines: plan.lines
+    });
     apply(manager, plan.edits.slice(0, 1));
     if (where === 'after') manager.appendContextEdit(noteId, null);
     const pending =
@@ -383,13 +423,17 @@ test('a fold with until removes the turns up to it and leaves the later ones', (
   const view = manager.buildSessionProjection().messages;
   assert.deepEqual(roles(view), [
     'user',
+    'assistant',
     'user',
     'assistant',
     'toolResult',
     'assistant',
     'toolResult'
   ]);
-  assert.deepEqual(view.map(readStamp), [1, 4, undefined, 5, undefined, 6]);
+  assert.deepEqual((view[1] as Message).content, [
+    { type: 'text', text: foldMarker(plan.handle, 't2-t3') }
+  ]);
+  assert.deepEqual(view.map(readStamp), [1, undefined, 4, undefined, 5, undefined, 6]);
   assertPaired(view);
 });
 
@@ -517,6 +561,11 @@ test('work behind the latest note that no fold removed is found, with the stamp 
 
   // A fold with until keeps the second command; its note lands after it.
   const plan = planFold(entries(), 'f', 2, { until: 2 });
+  manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+    handle: plan.handle,
+    edits: plan.edits,
+    lines: plan.lines
+  });
   apply(manager, plan.edits);
   manager.appendMessage({
     ...result('f', 'fold', 'note', 4),
@@ -540,6 +589,11 @@ test('work behind the latest note that no fold removed is found, with the stamp 
     merged.covers.map((fold) => fold.handle),
     [plan.handle]
   );
+  manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+    handle: merged.handle,
+    edits: merged.edits,
+    lines: merged.lines
+  });
   apply(manager, merged.edits);
   manager.appendMessage({
     ...result('g', 'fold', 'both', 5),
@@ -552,6 +606,11 @@ test('a fold that merges the notes starts at the earliest thing a fold removes b
   const fold = (manager: SessionManager, id: string, since: number, stamp: number) => {
     manager.appendMessage(assistant(call(id, 'fold')));
     const plan = planFold(manager.buildSessionProjection().entries, id, since);
+    manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+      handle: plan.handle,
+      edits: plan.edits,
+      lines: plan.lines
+    });
     apply(manager, plan.edits);
     manager.appendMessage({
       ...result(id, 'fold', 'note', stamp),
@@ -604,6 +663,11 @@ test('growth counts the work after a note and what was written after its fold, a
   const near = (tokens: number, expected: number) =>
     assert.ok(tokens >= expected && tokens < expected + 20, `${tokens} for ${expected}`);
   const plan = planFold(entries(), 'f', 1);
+  manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+    handle: plan.handle,
+    edits: plan.edits,
+    lines: plan.lines
+  });
   apply(manager, plan.edits);
   manager.appendMessage({
     ...result('f', 'fold', 'n'.repeat(8000), 3),
@@ -633,6 +697,11 @@ test('work behind a note starts at the stamp a fold of it needs, whatever stands
   const fold = (manager: SessionManager, id: string, since: number, stamp: number) => {
     manager.appendMessage(assistant(call(id, 'fold')));
     const plan = planFold(manager.buildSessionProjection().entries, id, since);
+    manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+      handle: plan.handle,
+      edits: plan.edits,
+      lines: plan.lines
+    });
     apply(manager, plan.edits);
     manager.appendMessage({
       ...result(id, 'fold', 'note', stamp),
@@ -728,7 +797,11 @@ test('work since an entry is told from folding itself and from what other extens
     manager.appendMessage(assistant(call(id, 'fold')));
     const plan = planFold(entries(), id, since, until === undefined ? {} : { until });
     if (land) {
-      manager.appendCustomEntry(FOLD_STARTED_TYPE, { handle: plan.handle, edits: plan.edits });
+      manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+        handle: plan.handle,
+        edits: plan.edits,
+        lines: plan.lines
+      });
       apply(manager, plan.edits);
     }
     const details = {
@@ -790,6 +863,438 @@ function earlierFold(applied: boolean) {
   }
   return manager.buildSessionProjection().entries;
 }
+
+/** A fold from `since`, recorded and applied as a session writes it, with its note at `stamp`. */
+function applyFold(
+  manager: SessionManager,
+  id: string,
+  since: number,
+  stamp: number,
+  until?: number,
+  /** Planned as the one span of a fold with spans, which is how the tool plans every fold. */
+  batch = false
+): Pick<
+  ReturnType<typeof planFold>,
+  | 'handle'
+  | 'edits'
+  | 'firstEntryId'
+  | 'lastEntryId'
+  | 'omitted'
+  | 'keptUserTurns'
+  | 'covers'
+  | 'keptFrom'
+> {
+  manager.appendMessage(assistant(call(id, 'fold')));
+  const entries = manager.buildSessionProjection().entries;
+  const single = planFold(entries, id, since, until === undefined ? {} : { until });
+  const plan = batch
+    ? {
+        ...planFoldBatch(entries, id, [
+          { since, note: 'note', ...(until === undefined ? {} : { until }) }
+        ]),
+        keptFrom: single.keptFrom
+      }
+    : single;
+  manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+    handle: plan.handle,
+    edits: plan.edits,
+    lines: plan.lines
+  });
+  apply(manager, plan.edits);
+  manager.appendMessage({
+    ...result(id, 'fold', `note of ${id}`, stamp),
+    details: {
+      kind: 'fold',
+      handle: plan.handle,
+      since: `t${since}`,
+      firstEntryId: plan.firstEntryId,
+      lastEntryId: plan.lastEntryId,
+      messages: plan.omitted.length,
+      tokens: 10,
+      headline: 'note',
+      keptUserTurns: plan.keptUserTurns,
+      files: [],
+      ...(plan.covers.length > 0 ? { covers: plan.covers.map((fold) => fold.handle) } : {})
+    } satisfies FoldDetails as never
+  } as Message);
+  manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
+  return plan;
+}
+
+/** The fold markers in context, in order. */
+function markersIn(manager: SessionManager): string[] {
+  return manager.buildSessionProjection().messages.flatMap((message) => {
+    const block = message.role === 'assistant' ? message.content[0] : undefined;
+    return block?.type === 'text' && block.text.startsWith('[ep-') ? [block.text] : [];
+  });
+}
+
+for (const batch of [false, true]) {
+  test(`a fold that starts at the note before it takes the marker of that fold with it${batch ? ', also as one of spans' : ''}`, () => {
+    const { manager, ids } = session([
+      user('first', 1),
+      assistant(call('a', 'bash')),
+      result('a', 'bash', 'one', 2)
+    ]);
+    const first = applyFold(manager, 'f1', 2, 3);
+    assert.deepEqual(markersIn(manager), [foldMarker(first.handle, 't2')]);
+
+    manager.appendMessage(assistant(call('b', 'bash')));
+    manager.appendMessage(result('b', 'bash', 'two', 4));
+    // From the stamp of the first note: the span starts at the response that called that fold,
+    // right behind its marker.
+    const second = applyFold(manager, 'f2', 3, 5, undefined, batch);
+    assert.deepEqual(
+      second.covers.map((fold) => fold.handle),
+      [first.handle]
+    );
+    assert.deepEqual(second.edits.at(-1), {
+      type: 'context_edit',
+      targetId: ids[1],
+      replacement: null
+    });
+    assert.equal(second.omitted.length, 4, 'the older marker is no part of the span');
+    assert.deepEqual(markersIn(manager), [foldMarker(second.handle, 't3-t4')]);
+    assertPaired(manager.buildSessionProjection().messages);
+
+    // Unfolding it puts the first fold back as it stood, marker included.
+    const unfold = planUnfold(
+      manager.getBranch(),
+      manager.buildSessionProjection().entries,
+      second.handle
+    );
+    apply(manager, unfold.edits);
+    assert.deepEqual(markersIn(manager), [foldMarker(first.handle, 't2')]);
+    assertPaired(manager.buildSessionProjection().messages);
+  });
+}
+
+test('a fold leaves the marker of a fold it does not cover, and a span stops before one', () => {
+  const work = [
+    user('first', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'one', 2),
+    assistant(call('b', 'bash')),
+    result('b', 'bash', 'two', 3),
+    assistant(call('c', 'bash')),
+    result('c', 'bash', 'three', 4)
+  ];
+
+  // The marker of a fold with until stands right before the next turn. A fold of that turn
+  // does not cover the note, which comes later, and both markers stay.
+  const before = session(work);
+  const early = applyFold(before.manager, 'f1', 2, 5, 2);
+  const next = applyFold(before.manager, 'f2', 3, 6, 3);
+  assert.deepEqual(next.covers, []);
+  assert.equal(next.firstEntryId, before.ids[3]);
+  assert.deepEqual(markersIn(before.manager), [
+    foldMarker(early.handle, 't2'),
+    foldMarker(next.handle, 't3')
+  ]);
+
+  // The other way round: the marker of the later turn stands after the span. The span ends
+  // before it, as it did before the turn it stands for, so the two folds do not overlap.
+  const after = session(work);
+  const late = applyFold(after.manager, 'f1', 3, 5, 3);
+  const prior = applyFold(after.manager, 'f2', 2, 6, 2);
+  assert.equal(prior.lastEntryId, after.ids[2]);
+  assert.equal(prior.omitted.length, 2);
+  assert.equal(prior.keptFrom, 4);
+  assert.deepEqual(markersIn(after.manager), [
+    foldMarker(prior.handle, 't2'),
+    foldMarker(late.handle, 't3')
+  ]);
+  const entries = after.manager.buildSessionProjection().entries;
+  for (const handle of [late.handle, prior.handle]) {
+    assert.doesNotThrow(() => planUnfold(after.manager.getBranch(), entries, handle));
+  }
+});
+
+test('the line of a fold is known by the record of the fold, not by what a response shows', () => {
+  const { manager, ids } = session([
+    user('first', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'one', 2)
+  ]);
+  const fold = applyFold(manager, 'f1', 2, 3);
+  const note = manager.getBranch().findLastIndex((entry) => entry.type === 'message');
+  const since = () => workSince(manager.buildSessionProjection().entries, note);
+  const line = foldMarker(fold.handle, 't2');
+
+  // Another extension adds to the line. Behind the note it is still neither work that a fold
+  // left behind nor a place to merge from.
+  manager.appendContextEdit(ids[1]!, { content: [{ type: 'text', text: `${line} [checked]` }] });
+  assert.deepEqual(markersIn(manager), [`${line} [checked]`]);
+  const entries = manager.buildSessionProjection().entries;
+  assert.equal(unfoldedBehindNote(entries), undefined);
+  assert.equal(mergeStart(entries)?.stamp, 3);
+
+  // A reply that quotes the line to the letter is a reply: work, and no sign of a fold.
+  manager.appendMessage(assistant(line));
+  assert.equal(since().folded, false);
+  assert.deepEqual(
+    since().left.map((entry) => messageText(entry.messages[0] as Message)),
+    [line]
+  );
+});
+
+test('a span with until stops before the line of another fold, also one that was edited since', () => {
+  const { manager, ids } = session([
+    user('first', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'one', 2),
+    assistant(call('b', 'bash')),
+    result('b', 'bash', 'two', 3),
+    assistant(call('c', 'bash')),
+    result('c', 'bash', 'three', 4)
+  ]);
+  const late = applyFold(manager, 'f1', 3, 5, 3);
+  const line = `${foldMarker(late.handle, 't3')} [checked]`;
+  manager.appendContextEdit(ids[3]!, { content: [{ type: 'text', text: line }] });
+  const prior = applyFold(manager, 'f2', 2, 6, 2);
+  assert.equal(prior.lastEntryId, ids[2]);
+  assert.deepEqual(markersIn(manager), [foldMarker(prior.handle, 't2'), line]);
+  const entries = manager.buildSessionProjection().entries;
+  for (const handle of [late.handle, prior.handle]) {
+    assert.doesNotThrow(() => planUnfold(manager.getBranch(), entries, handle));
+  }
+});
+
+test('a fold takes the line of a fold it covers from behind the user messages that fold kept', () => {
+  const { manager } = session([
+    user('first', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'one', 2),
+    user('a correction', 3),
+    assistant(call('b', 'bash')),
+    result('b', 'bash', 'two', 4)
+  ]);
+  const first = applyFold(manager, 'f1', 2, 5);
+  assert.deepEqual(markersIn(manager), [foldMarker(first.handle, 't2-t4')]);
+  manager.appendMessage(assistant(call('c', 'bash')));
+  manager.appendMessage(result('c', 'bash', 'three', 6));
+  manager.appendMessage(assistant(call('f2', 'fold')));
+  // What the lines cost: one line for the first fold, and next to nothing for a fold that
+  // takes that line away and leaves its own.
+  const one = planFoldBatch(manager.buildSessionProjection().entries, 'f2', [
+    { since: 6, note: 'note' }
+  ]);
+  assert.equal(one.lines.length, 1);
+  assert.ok(one.lineTokens > 90 && one.lineTokens < 120, `${one.lineTokens}`);
+  const both = planFoldBatch(manager.buildSessionProjection().entries, 'f2', [
+    { since: 5, note: 'note' }
+  ]);
+  assert.ok(Math.abs(both.lineTokens) < 5, `${both.lineTokens}`);
+  manager.appendMessage(result('f2', 'fold', 'cancelled', 7));
+
+  // From the stamp of the first note. The first fold's line stands before the correction
+  // that fold kept, with no response between: it goes, and the correction stays.
+  const second = applyFold(manager, 'f3', 5, 8);
+  assert.deepEqual(
+    second.covers.map((covered) => covered.handle),
+    [first.handle]
+  );
+  assert.deepEqual(markersIn(manager), [foldMarker(second.handle, 't5-t7')]);
+  assert.ok(
+    manager
+      .buildSessionProjection()
+      .messages.some(
+        (message) => message.role === 'user' && messageText(message).startsWith('a correction')
+      )
+  );
+  assertPaired(manager.buildSessionProjection().messages);
+
+  const unfold = planUnfold(
+    manager.getBranch(),
+    manager.buildSessionProjection().entries,
+    second.handle
+  );
+  apply(manager, unfold.edits);
+  assert.deepEqual(markersIn(manager), [foldMarker(first.handle, 't2-t4')]);
+});
+
+test('the line of an earlier fold is no response: a span of nothing else is refused, and a span around it leaves it', () => {
+  const work = [
+    user('first', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'one', 2),
+    user('second', 3),
+    assistant(call('b', 'bash')),
+    result('b', 'bash', 'two', 4),
+    assistant(call('c', 'bash')),
+    result('c', 'bash', 'three', 5)
+  ];
+  const { manager, ids } = session(work);
+  const first = applyFold(manager, 'f1', 2, 6, 2);
+  const line = foldMarker(first.handle, 't2');
+  manager.appendMessage(assistant(call('f2', 'fold')));
+  const entries = manager.buildSessionProjection().entries;
+
+  // From the first message to the second: only the line and a user message stand there.
+  assert.throws(
+    () => planFold(entries, 'f2', 1, { until: 3 }),
+    /Nothing to fold from t1 to t3: the span holds no responses\.$/
+  );
+
+  // Up to t4, before the note of the first fold: the span takes the second command and
+  // leaves the line, which still stands for a fold in effect.
+  const around = planFold(entries, 'f2', 1, { until: 4 });
+  assert.deepEqual(around.covers, []);
+  assert.deepEqual(around.lines, [ids[4]]);
+  assert.deepEqual(around.linesRemoved, []);
+  assert.deepEqual(
+    around.edits.map((edit) => edit.targetId),
+    [ids[5], ids[4]]
+  );
+  assert.equal(around.omitted.length, 2);
+  manager.appendMessage(result('f2', 'fold', 'cancelled', 7));
+  applyFold(manager, 'f3', 1, 8, 4);
+  assert.equal(markersIn(manager)[0], line);
+  assertPaired(manager.buildSessionProjection().messages);
+});
+
+test('the refusal of an empty span names no earlier stamp when only the line of a fold stands there', () => {
+  const { manager } = session([user('first', 1), assistant('An answer.')]);
+  applyFold(manager, 'f1', 1, 2);
+  // Another extension takes the fold's call and note out of context: its line is all that is left.
+  for (const entry of manager.getBranch()) {
+    if (entry.type !== 'message') continue;
+    const { message } = entry;
+    const called =
+      message.role === 'assistant' &&
+      message.content.some((block) => block.type === 'toolCall' && block.id === 'f1');
+    if (called || message.role === 'toolResult') manager.appendContextEdit(entry.id, null);
+  }
+  manager.appendMessage(user('next', 3));
+  manager.appendMessage(assistant(call('f2', 'fold')));
+  assert.throws(
+    () => planFold(manager.buildSessionProjection().entries, 'f2', 3),
+    /^Error: Nothing to fold from t3: the span holds no responses\.$/
+  );
+});
+
+test('a line inside the span of a fold that covers its note goes, and is no message of the span', () => {
+  const { manager, ids } = session([
+    user('first', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'one', 2),
+    assistant(call('b', 'bash')),
+    result('b', 'bash', 'two', 3)
+  ]);
+  const first = applyFold(manager, 'f1', 2, 4, 2);
+  manager.appendMessage(assistant(call('f2', 'fold')));
+  // From the first message on: the line, the second command, the first fold and its note.
+  const plan = planFold(manager.buildSessionProjection().entries, 'f2', 1);
+  assert.deepEqual(
+    plan.covers.map((covered) => covered.handle),
+    [first.handle]
+  );
+  assert.deepEqual(plan.linesRemoved, [ids[1]]);
+  assert.deepEqual(plan.lines, [ids[3]]);
+  // The second command and its result, the first fold's call and its note.
+  assert.equal(plan.omitted.length, 4);
+});
+
+test('with spans, the line of a fold that one span covers goes from before another span', () => {
+  const { manager, ids } = session([
+    user('first', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'one', 2),
+    assistant(call('b', 'bash')),
+    result('b', 'bash', 'two', 3),
+    assistant(call('c', 'bash')),
+    result('c', 'bash', 'three', 4)
+  ]);
+  // The first fold takes t2 and keeps t3 and t4; its note comes after them.
+  const first = applyFold(manager, 'f1', 2, 5, 2);
+  manager.appendMessage(assistant(call('f2', 'fold')));
+  const entries = manager.buildSessionProjection().entries;
+  // One span takes t3, right behind the first fold's line; the other covers its note.
+  const batch = planFoldBatch(entries, 'f2', [
+    { since: 3, until: 3, note: 'one' },
+    { since: 5, note: 'two' }
+  ]);
+  assert.deepEqual(
+    batch.covers.map((covered) => covered.handle),
+    [first.handle]
+  );
+  assert.ok(batch.edits.some((edit) => edit.targetId === ids[1] && edit.replacement === null));
+  // Alone, the span of t3 covers no note and leaves the line.
+  const alone = planFoldBatch(entries, 'f2', [{ since: 3, until: 3, note: 'one' }]);
+  assert.ok(alone.edits.every((edit) => edit.targetId !== ids[1]));
+});
+
+test('a line with a response between it and the fold that covers its note stays', () => {
+  const { manager } = session([
+    user('first', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'one', 2),
+    assistant(call('b', 'bash')),
+    result('b', 'bash', 'two', 3)
+  ]);
+  // The first fold stops at until and keeps the second command, which stands after its line.
+  const first = applyFold(manager, 'f1', 2, 4, 2);
+  const second = applyFold(manager, 'f2', 4, 5);
+  assert.deepEqual(
+    second.covers.map((covered) => covered.handle),
+    [first.handle]
+  );
+  assert.deepEqual(markersIn(manager), [
+    foldMarker(first.handle, 't2'),
+    foldMarker(second.handle, 't4')
+  ]);
+});
+
+test('the line goes where the first response stood that is sent again, and claims no calls a span did not make', () => {
+  const failed = { ...assistant('partial'), stopReason: 'error' } as Message;
+  // Pi leaves a response that ended in an error, or that was aborted, out of every request: a
+  // line there is never sent.
+  for (const stopReason of ['error', 'aborted'] as const) {
+    const { manager, ids } = session([
+      user('first', 1),
+      { ...assistant('partial'), stopReason } as Message,
+      assistant(call('a', 'bash')),
+      result('a', 'bash', 'one', 2),
+      assistant(call('f1', 'fold'))
+    ]);
+    const plan = planFold(manager.buildSessionProjection().entries, 'f1', 1);
+    assert.deepEqual(plan.lines, [ids[2]], stopReason);
+    assert.deepEqual(
+      plan.edits.map((edit) => [edit.targetId, edit.replacement === null]),
+      [
+        [ids[3], true],
+        [ids[2], false],
+        [ids[1], true]
+      ]
+    );
+    assert.deepEqual(plan.edits[1]!.replacement, {
+      content: [{ type: 'text', text: foldMarker(plan.handle, 't1-t2') }]
+    });
+  }
+
+  // No response that is sent again: nothing to put a line in place of.
+  const none = session([user('first', 1), failed, assistant(call('f1', 'fold'))]);
+  const empty = planFold(none.manager.buildSessionProjection().entries, 'f1', 1);
+  assert.deepEqual(empty.lines, []);
+  assert.deepEqual(
+    empty.edits.map((edit) => edit.replacement),
+    [null]
+  );
+
+  // An answer in words only: the line says that responses stood here, and nothing of calls.
+  const words = session([user('first', 1), assistant('An answer.'), assistant(call('f1', 'fold'))]);
+  const said = planFold(words.manager.buildSessionProjection().entries, 'f1', 1);
+  const line = foldMarker(said.handle, 't1', false);
+  assert.doesNotMatch(line, /tool calls|outputs/);
+  assert.match(line, /^\[ep-[0-9a-f]{8}: earlier responses of mine stood here \(t1\)\. /);
+  assert.deepEqual(said.edits, [
+    {
+      type: 'context_edit',
+      targetId: words.ids[1],
+      replacement: { content: [{ type: 'text', text: line }] }
+    }
+  ]);
+});
 
 test('a fold reaching behind an earlier fold note covers it', () => {
   const entries = earlierFold(true);
@@ -1614,9 +2119,16 @@ test('a fold inside a fork that covers an earlier one holds only what it removed
     task: 't',
     parentEntryId: 'p',
     messages,
+    // The first fold left its marker in place of its first response; the second removed it.
     folds: [
-      { record: fold('ep-a'), first: 0, last: 1, omit: [0, 1] },
-      { record: fold('ep-b', ['ep-a']), first: 0, last: 5, omit: [2, 3, 4, 5] }
+      {
+        record: fold('ep-a'),
+        first: 0,
+        last: 1,
+        omit: [1],
+        marked: [{ index: 0, text: foldMarker('ep-a', 't2') }]
+      },
+      { record: fold('ep-b', ['ep-a']), first: 0, last: 5, omit: [0, 2, 3, 4, 5] }
     ]
   } as ForkArchive;
   const { manager } = session([
@@ -1640,4 +2152,9 @@ test('a fold inside a fork that covers an earlier one holds only what it removed
       .messages.flatMap((message) => (message.role === 'toolResult' ? [readStamp(message)] : []));
   assert.deepEqual(texts('ep-a'), [2]);
   assert.deepEqual(texts('ep-b'), [3, 4]);
+  // The response the first fold marked is archived under that fold, as it was, and not again
+  // under the second.
+  const held = (handle: string) => threads.find((thread) => thread.handle === handle)!.messages;
+  assert.deepEqual(held('ep-a'), messages.slice(0, 2));
+  assert.deepEqual(held('ep-b'), messages.slice(2, 6));
 });

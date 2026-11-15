@@ -711,7 +711,14 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       const tailSavedTokens = tokensOf(Math.max(0, tailSavedCharsByHandle.get(fold.handle) ?? 0));
       foldNet.set(
         fold.handle,
-        Math.max(0, fold.tokens + tailSavedTokens - (fold.noteTokens ?? 0) - (fold.keptTokens ?? 0))
+        Math.max(
+          0,
+          fold.tokens +
+            tailSavedTokens -
+            (fold.noteTokens ?? 0) -
+            (fold.keptTokens ?? 0) -
+            (fold.lineTokens ?? 0)
+        )
       );
       foldNote.set(fold.handle, fold.noteTokens ?? 0);
       if (fold.anchor?.placed !== undefined) {

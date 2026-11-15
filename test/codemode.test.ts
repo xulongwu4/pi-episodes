@@ -193,11 +193,16 @@ test('a fold from a codemode script folds the span and leaves the script result 
       ),
     (context) => {
       const messages = conversation(context);
+      // The marker of the fold stands where the script that ran the build was.
       assert.deepEqual(
         messages.map((message) => message.role),
-        ['user', 'assistant', 'toolResult']
+        ['user', 'assistant', 'assistant', 'toolResult']
       );
-      const note = text(messages[2]!);
+      assert.match(
+        text(messages[1]!),
+        /^\[ep-[0-9a-f]{8}: earlier responses of mine stood here, with the tool calls I made \(t1-t2\) and the outputs/
+      );
+      const note = text(messages[3]!);
       assert.match(note, /\[fold ep-[0-9a-f]{8}: 2 messages, t1-t2,/);
       assert.match(note, /fixed by regenerating the client/);
       // Printed by the script once; not appended a second time.
@@ -271,9 +276,9 @@ test('a script that prints the fold result as JSON leaves the note in context on
       const messages = conversation(context);
       assert.deepEqual(
         messages.map((message) => message.role),
-        ['user', 'assistant', 'toolResult']
+        ['user', 'assistant', 'assistant', 'toolResult']
       );
-      const note = text(messages[2]!);
+      const note = text(messages[3]!);
       // As the script printed it: the line breaks and quotes of the note escaped.
       assert.match(
         note,
@@ -355,12 +360,12 @@ test('a fold keeps the notes it covers under its own as written, also through a 
         ? script(`text(JSON.stringify(await tools.${tool}(${JSON.stringify(args)})));`)
         : fauxAssistantMessage(fauxToolCall(tool, args), { stopReason: 'toolUse' });
     const harness = await createSession(mode, [
-      call('bash', { command: 'echo one' }),
+      call('bash', { command: 'echo one; seq 1 400' }),
       call('fold', { since: 't2', note: first }),
-      call('bash', { command: 'echo two' }),
+      call('bash', { command: 'echo two; seq 1 400' }),
       // From the stamp of the first note, which it covers.
       call('fold', { since: 't3', note: second }),
-      call('bash', { command: 'echo three' }),
+      call('bash', { command: 'echo three; seq 1 400' }),
       call('fold', { since: 't5', note: 'Ran the last.' }),
       (context) => {
         const view = conversation(context);
@@ -396,14 +401,23 @@ test('a fold keeps the notes it covers under its own as written, also through a 
       const tokens = (words: string) => Math.ceil(words.length / 4);
       const folds = episodeStats(branch, harness.dir).folds;
       assert.equal(folds.noteTokens, tokens(first) + tokens(second) + 4, mode);
-      const spans = records as unknown as { tokens: number }[];
+      const spans = records as unknown as { tokens: number; lineTokens?: number }[];
+      // Nor is the line a fold leaves free: the first fold pays for one, and a fold that
+      // takes the line of the fold it covers and leaves its own pays next to nothing.
+      const line = spans.map((span) => span.lineTokens ?? 0);
+      assert.ok(line[0]! > 90 && line[0]! < 120, `${mode} ${line[0]}`);
+      assert.ok(Math.abs(line[1]!) < 5 && Math.abs(line[2]!) < 5, `${mode} ${line}`);
       assert.deepEqual(
         folds.each.map((fold) => [fold.note, fold.net]),
         [
-          [tokens(first), spans[0]!.tokens - tokens(first)],
-          [tokens(second), spans[1]!.tokens - tokens(second) - tokens(first)],
-          [4, spans[2]!.tokens - 4 - tokens(first) - tokens(second)]
+          [tokens(first), spans[0]!.tokens - tokens(first) - line[0]!],
+          [tokens(second), spans[1]!.tokens - tokens(second) - tokens(first) - line[1]!],
+          [4, spans[2]!.tokens - 4 - tokens(first) - tokens(second) - line[2]!]
         ],
+        mode
+      );
+      assert.ok(
+        folds.each.every((fold) => fold.net > 0),
         mode
       );
     } finally {
@@ -1292,8 +1306,8 @@ test('with codemode "on", a top-level fold still works', async () => {
       }),
     (context) => {
       const messages = conversation(context);
-      assert.equal(messages.length, 3);
-      assert.match(text(messages[2]!), /\[fold ep-[0-9a-f]{8}: 2 messages/);
+      assert.equal(messages.length, 4);
+      assert.match(text(messages[3]!), /\[fold ep-[0-9a-f]{8}: 2 messages/);
       return fauxAssistantMessage('ok');
     }
   ]);
@@ -1408,7 +1422,7 @@ test('a fold that a result hook rewrote is not added again next to what the scri
       () => script('text(await tools.fold({ since: "t1", note: "Ran one." }));'),
       (context) => {
         const note = text(conversation(context).at(-1)!);
-        assert.equal(conversation(context).length, 3);
+        assert.equal(conversation(context).length, 4);
         assert.match(note, /Ran one, checked\./);
         assert.equal(note.match(/\[fold ep-/g)?.length, 1);
         return fauxAssistantMessage('ok');
@@ -2644,8 +2658,126 @@ test('a fold leaves a user message that an earlier turn-end handler edits at its
     const started = branch.find(
       (entry) => entry.type === 'custom' && entry.customType === FOLD_STARTED_TYPE
     );
-    const planned = (started as { data: { edits: { replacement: unknown }[] } }).data.edits;
-    assert.ok(planned.length > 0 && planned.every((edit) => edit.replacement === null));
+    const pasted = branch.find(
+      (entry) => entry.type === 'message' && entry.message.role === 'user'
+    );
+    const planned = (started as { data: { edits: { targetId: string }[] } }).data.edits;
+    assert.ok(planned.length > 0 && planned.every((edit) => edit.targetId !== pasted?.id));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('the line of a fold is no turn that followed a failed call: its arguments are cut after three real ones', async () => {
+  const words = Array.from({ length: 90 }, (_, index) => `word${index}`).join(' ');
+  const bash = (command: string) => () =>
+    fauxAssistantMessage(fauxToolCall('bash', { command }), { stopReason: 'toolUse' });
+  const fold = (args: Parameters<typeof fauxToolCall>[1]) => () =>
+    fauxAssistantMessage(fauxToolCall('fold', args), { stopReason: 'toolUse' });
+  // Between the failed call and the fold of the first command stand the kept responses and a
+  // line: of the second span of the same call, or of an earlier fold, whose call is a turn too.
+  const cases = [
+    { earlier: false, kept: 2, turns: 2 },
+    { earlier: false, kept: 3, turns: 3 },
+    { earlier: true, kept: 1, turns: 2 },
+    { earlier: true, kept: 2, turns: 3 }
+  ];
+  for (const { earlier, kept, turns } of cases) {
+    const last = `t${kept + 4}`;
+    const first = { since: 't2', until: 't2', note: 'first' };
+    const harness = await createSession('off', [
+      bash('echo one'),
+      bash(`false # ${words}`),
+      ...Array.from({ length: kept }, (_, index) => bash(`echo kept ${index}`)),
+      bash('echo last'),
+      ...(earlier
+        ? [fold({ since: last, note: 'second' }), fold(first)]
+        : [fold({ spans: [first, { since: last, note: 'second' }] })]),
+      (context) => {
+        const sent = JSON.stringify(conversation(context));
+        const label = `${earlier ? 'an earlier fold' : 'a second span'}, ${kept} kept`;
+        assert.doesNotMatch(sent, /echo (one|last)/, label);
+        assert.equal(sent.includes(words), turns < 3, label);
+        assert.equal(/characters omitted from failed bash call/.test(sent), turns >= 3, label);
+        return fauxAssistantMessage('done');
+      }
+    ]);
+    try {
+      await harness.run('go');
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+test('a fold puts its line over a response that an earlier turn-end handler edits at its boundary', async () => {
+  let edited = '';
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo out' }), {
+          stopReason: 'toolUse'
+        }),
+      () =>
+        fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'n' }), {
+          stopReason: 'toolUse'
+        }),
+      (context) => {
+        // The response leaves with its span whatever the handler made of it: the line stands
+        // there, and no call is left without its result.
+        const sent = conversation(context).map(text);
+        assert.match(sent[1]!, /^\[ep-[0-9a-f]{8}: earlier responses of mine stood here/);
+        assert.doesNotMatch(sent.join('\n'), /redacted response/);
+        assert.doesNotMatch(sent.join('\n'), /^out$/m);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    [],
+    {},
+    {},
+    undefined,
+    [
+      (pi) => {
+        pi.on('turn_end', (event, ctx) => {
+          const branch = ctx.sessionManager.getBranch();
+          const folded = branch.some(
+            (entry) =>
+              entry.type === 'message' &&
+              entry.message.role === 'toolResult' &&
+              entry.message.toolName === 'fold'
+          );
+          const response = branch.find(
+            (entry) => entry.type === 'message' && entry.message.role === 'assistant'
+          );
+          if (!folded || !response) return undefined;
+          edited = response.id;
+          return {
+            entries: [
+              ...event.entries,
+              {
+                type: 'context_edit' as const,
+                targetId: response.id,
+                replacement: { content: [{ type: 'text' as const, text: 'redacted response' }] }
+              }
+            ]
+          };
+        });
+      }
+    ]
+  );
+  try {
+    await harness.run('go');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(threadRecords(branch).length, 1);
+    const started = branch.find(
+      (entry) => entry.type === 'custom' && entry.customType === FOLD_STARTED_TYPE
+    );
+    const data = (started as { data: { edits: { targetId: string }[]; lines?: string[] } }).data;
+    const planned = data.edits;
+    assert.ok(edited !== '' && planned.some((edit) => edit.targetId === edited));
+    // The start entry says where the line stands.
+    assert.deepEqual(data.lines, [edited]);
   } finally {
     await harness.cleanup();
   }

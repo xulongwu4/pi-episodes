@@ -2055,13 +2055,19 @@ test('R2-5 (monotonic crash-prefix edit ordering & spilled staleness): newest-to
       );
     }
 
-    // The failed-arg trim happened on t5 and left the rest of that response as it was; no other
-    // response outside the spans was edited.
+    // The failed-arg trim happened on t5 and left the rest of that response as it was; the other
+    // two edits that are no removals put the marker of each span in place of its response.
     const kept = nonReadEdits.filter((e) => e.replacement !== null);
-    assert.equal(kept.length, 1, 'expected the failed-arg trim as the only non-removal edit');
-    const trimmed = JSON.stringify(kept[0]!.replacement!.content);
-    assert.ok(trimmed.includes('characters omitted from failed bash call'));
-    assert.ok(trimmed.includes('sig_gap_late'));
+    const texts = kept.map((e) => JSON.stringify(e.replacement!.content));
+    const trims = texts.filter((t) => t.includes('characters omitted from failed bash call'));
+    assert.equal(trims.length, 1, 'expected one failed-arg trim');
+    assert.ok(trims[0]!.includes('sig_gap_late'));
+    assert.deepEqual(
+      texts
+        .filter((t) => !trims.includes(t))
+        .map((t) => /the tool calls I made \((t\d+)\)/.exec(t)?.[1]),
+      ['t9', 't3']
+    );
   } finally {
     await hOrder.cleanup();
   }

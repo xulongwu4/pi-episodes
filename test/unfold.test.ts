@@ -41,6 +41,7 @@ import { cacheAnchor } from '../src/cache.js';
 import {
   completeCutShortFolds,
   cutShortFold,
+  foldMarker,
   planFold,
   planUnfold,
   USER_TEXT_CAP,
@@ -604,8 +605,13 @@ test('ForkFolds folds with until and unfolds in place, and leaves the responses 
   const parentAsst = viewAfterFold[1] as AssistantMessage;
   assert.equal((parentAsst.content[0] as ThinkingContent).thinkingSignature, 'parent-sig');
 
-  // The folded turn is omitted; the child's responses that stay are the messages themselves.
+  // The folded turn is omitted, with the marker of the fold where it began; the child's
+  // responses that stay are the messages themselves.
   assert.ok(!JSON.stringify(viewAfterFold).includes('secret-one'));
+  assert.deepEqual((viewAfterFold[3] as AssistantMessage).content, [
+    { type: 'text', text: foldMarker(handle, 't11') }
+  ]);
+  assert.equal(viewAfterFold.length, messages.length - 1);
   const keptAsst = viewAfterFold.find(
     (m): m is AssistantMessage =>
       m.role === 'assistant' && m.content.some((b) => b.type === 'toolCall' && b.name === 'bash')
@@ -1044,6 +1050,9 @@ test('forkThreads replays archived fork folds, unfold stubs and historical neste
   assert.ok(forkResultText.includes(`[unfolded ${earlyHandle}]`));
   assert.ok(forkText.includes('sig1'));
   assert.ok(forkText.includes('sig_final'));
+  // The fold still in effect shows its marker; the unfolded one shows none.
+  assert.ok(forkText.includes(foldMarker(midHandle, 't12')));
+  assert.ok(!forkText.includes(`[${earlyHandle}: earlier responses`));
 
   // 3. Nested fold ep-mid's historical context() at the time ep-mid ran STILL hides early-fact
   //    and shows early note (because ep-early was unfolded AFTER ep-mid was created!).
@@ -1052,6 +1061,8 @@ test('forkThreads replays archived fork folds, unfold stubs and historical neste
   assert.ok(!midCtxText.includes('early-fact'));
   assert.ok(midCtxText.includes('early note'));
   assert.ok(midCtxText.includes('mid-fact'));
+  assert.ok(midCtxText.includes(foldMarker(earlyHandle, 't10')));
+  assert.ok(!midCtxText.includes(`[${midHandle}: earlier responses`));
 });
 
 test('ThreadIndex.find resolves fold active on Branch 1 even when unfolded on Branch 2', async () => {
@@ -1257,15 +1268,20 @@ test('a fold with until edits only its span, and a repair-only turn_end leaves t
     }
   ]);
   const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2, { until: 2 });
-  // The response that called the fold stays as it is: the edits remove the span, newest first.
-  const spanIds = manager
+  // The response that called the fold stays as it is: the edits are those of the span, newest
+  // first, the last one putting the marker in place of its first response.
+  const [first, second] = manager
     .getBranch()
     .slice(1, 3)
     .map((entry) => entry.id);
-  assert.deepEqual(
-    plan.edits,
-    spanIds.reverse().map((targetId) => ({ type: 'context_edit', targetId, replacement: null }))
-  );
+  assert.deepEqual(plan.edits, [
+    { type: 'context_edit', targetId: second, replacement: null },
+    {
+      type: 'context_edit',
+      targetId: first,
+      replacement: { content: [{ type: 'text', text: foldMarker(plan.handle, 't2') }] }
+    }
+  ]);
 
   // A turn_end that only completes a cut-short fold edits nothing but that fold's span.
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-repair-retire-'));
@@ -1839,4 +1855,68 @@ test('running fork callingFork and prefixEntryId integrate with nested unfold', 
     (await idxAfterUnfold.onBranch()).map((t) => t.handle),
     [parPlan.handle]
   );
+});
+
+test('a fold in a fork takes the line of the fold it covers, also of one that an unfold brought back', async () => {
+  const { manager } = session([user('root', 1)]);
+  manager.appendMessage(assistant(call('fk_call', 'fork', { task: 'investigate' })));
+  const state = new EpisodeState();
+  state.nextStamp = 10;
+  const prefix = manager.buildSessionProjection().messages;
+  const folds = new ForkFolds({
+    forkHandle: 'fk-line0001',
+    state,
+    parentEntries: manager.buildSessionProjection().entries,
+    prefixLength: prefix.length,
+    siblings: 0
+  });
+  const msgs: AgentMessage[] = [...prefix, result('fk_call', 'fork', 'task brief')];
+  const tool = (name: string) =>
+    folds.tool({ name, description: '', parameters: {} as never }, () => msgs);
+  const run = (id: string) => {
+    msgs.push(assistant(call(id, 'bash', { command: `echo ${id}` })));
+    const out = result(id, 'bash', id);
+    folds.stamp(out);
+    msgs.push(out);
+  };
+  const fold = async (id: string, since: string) => {
+    msgs.push(assistant(call(id, 'fold', { since, note: `note ${id}` })));
+    const done = await tool('fold').execute(id, { since, note: `note ${id}` });
+    const note = Object.assign(result(id, 'fold', (done.content[0] as TextContent).text), {
+      details: done.details
+    });
+    folds.stamp(note);
+    msgs.push(note);
+    return done.details as FoldDetails;
+  };
+  const lines = () =>
+    folds.view(msgs).flatMap((message) => {
+      const block = message.role === 'assistant' ? message.content[0] : undefined;
+      return block?.type === 'text' && block.text.startsWith('[ep-') ? [block.text] : [];
+    });
+
+  run('a'); // t10
+  const first = await fold('f1', 't10'); // note at t11
+  assert.deepEqual(lines(), [foldMarker(first.handle, 't10')]);
+
+  // From the stamp of the first note: the span starts right behind the first fold's line.
+  run('b'); // t12
+  const second = await fold('f2', 't11'); // note at t13
+  assert.deepEqual(second.covers, [first.handle]);
+  assert.deepEqual(lines(), [foldMarker(second.handle, 't11-t12')]);
+  // The second fold took one line away and left one: next to nothing.
+  assert.ok((first.lineTokens ?? 0) > 90, `${first.lineTokens}`);
+  assert.ok(Math.abs(second.lineTokens ?? 0) < 5, `${second.lineTokens}`);
+
+  // Unfolding it brings the first fold back with its line, which the next fold knows again.
+  msgs.push(assistant(call('u', 'unfold', { handle: second.handle })));
+  const undone = await tool('unfold').execute('u', { handle: second.handle });
+  const stub = result('u', 'unfold', (undone.content[0] as TextContent).text);
+  folds.stamp(stub);
+  msgs.push(stub); // t14
+  assert.deepEqual(lines(), [foldMarker(first.handle, 't10')]);
+  const third = await fold('f3', 't11');
+  assert.deepEqual(third.covers, [first.handle]);
+  assert.equal(lines().length, 1);
+  assert.match(lines()[0]!, new RegExp(`^\\[${third.handle}: `));
 });
