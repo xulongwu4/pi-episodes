@@ -44,7 +44,14 @@ import {
   prepareCarriedMedia,
   withoutTrailingStamp
 } from './images.js';
-import { estimateTokens, readOnlyPaths, skillPaths, textOf, touchedPaths } from './messages.js';
+import {
+  estimateTokens,
+  headline,
+  readOnlyPaths,
+  skillPaths,
+  textOf,
+  touchedPaths
+} from './messages.js';
 import { completeReadBlocks } from './output.js';
 import { retireAssistantContent } from './retire.js';
 
@@ -1652,11 +1659,7 @@ export function openItems(note: string): string | undefined {
   return text && !NOTHING_OPEN.test(text) ? text : undefined;
 }
 
-export function headline(note: string): string {
-  const line = note.split('\n').find((text) => text.trim()) ?? '';
-  const clean = line.replace(/^[\s#*-]+/, '').trim();
-  return clean.length > 120 ? `${clean.slice(0, 117)}...` : clean;
-}
+export { headline } from './messages.js';
 
 /** What changed on disk, from the working tree diff, or the touched files when there is none. */
 export function changeLines(

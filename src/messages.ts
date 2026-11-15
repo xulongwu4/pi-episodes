@@ -195,3 +195,9 @@ export function textOf(content: readonly (TextContent | ImageContent)[]): string
     .map((block) => block.text)
     .join('\n');
 }
+
+export function headline(note: string): string {
+  const line = note.split('\n').find((text) => text.trim()) ?? '';
+  const clean = line.replace(/^[\s#*-]+/, '').trim();
+  return clean.length > 120 ? `${clean.slice(0, 117)}...` : clean;
+}

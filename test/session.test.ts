@@ -626,6 +626,147 @@ test('after a compaction, recall finds the compacted turns and fold names what i
   }
 });
 
+test('after a compaction, the notice lists pre-compaction folds across repeated compactions', async () => {
+  let stamp = '';
+  let epHandle = '';
+  const harness = await createSession(
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo "migrated users_email_idx"' })),
+      (context) => {
+        stamp = /\[(t\d+)\]$/.exec(text(conversation(context).at(-1)!))![1]!;
+        return fauxAssistantMessage(
+          fauxToolCall('fold', {
+            since: stamp,
+            note: 'Database migration: fixed index order.'
+          })
+        );
+      },
+      (context) => {
+        const note = text(conversation(context).at(-1)!);
+        epHandle = /ep-[0-9a-f]{8}/.exec(note)![0];
+        return fauxAssistantMessage('Migration folded.');
+      },
+      () => fauxAssistantMessage('Ready for compaction.'),
+      // First compaction summarizer, once for the history and once for the split turn.
+      () => fauxAssistantMessage('## Summary\nCompleted initial tasks.'),
+      () => fauxAssistantMessage('The user asked for more work.'),
+      (context) => {
+        const notice = conversation(context).find((message) =>
+          /archived as cp-[0-9a-f]{8}/.test(text(message))
+        );
+        assert.ok(notice);
+        assert.ok(
+          text(notice).includes(`- ${epHandle}: Database migration: fixed index order.`),
+          text(notice)
+        );
+        return fauxAssistantMessage('Checked first compaction notice.');
+      },
+      // Second compaction summarizer: previous notice gets compacted away, manifest persists.
+      () => fauxAssistantMessage('## Summary 2\nCompleted follow-up tasks.'),
+      () => fauxAssistantMessage('Checked first compaction.'),
+      (context) => {
+        const notices = conversation(context).filter((message) =>
+          /archived as cp-[0-9a-f]{8}/.test(text(message))
+        );
+        assert.equal(notices.length, 1);
+        assert.ok(
+          text(notices[0]!).includes(`- ${epHandle}: Database migration: fixed index order.`),
+          text(notices[0]!)
+        );
+        return fauxAssistantMessage(
+          fauxToolCall('ask', { handle: epHandle, question: 'which index?' })
+        );
+      },
+      () => fauxAssistantMessage('users_email_idx'),
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /users_email_idx/);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    { keepRecentTokens: 1 }
+  );
+
+  try {
+    await harness.session.prompt('migrate indexes');
+    await harness.session.prompt('more work');
+    await harness.session.compact();
+    await harness.session.prompt('check after first compaction');
+    await harness.session.compact();
+    await harness.session.prompt('check after second compaction');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('after a compaction, the notice lists nested folds made inside compacted forks', async () => {
+  let forkStamp = '';
+  let nestedHandle = '';
+  let forkHandle = '';
+  const harness = await createSession(
+    [
+      () => fauxAssistantMessage(fauxToolCall('fork', { task: 'Fix failing typecheck.' })),
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo "error TS7777 in parser.ts"' })),
+      (context) => {
+        forkStamp = /\[(t\d+)\]$/.exec(text(conversation(context).at(-1)!))![1]!;
+        return fauxAssistantMessage(
+          fauxToolCall('fold', {
+            since: forkStamp,
+            note: 'Parser fix: narrowed union.'
+          })
+        );
+      },
+      (context) => {
+        nestedHandle = /ep-[0-9a-f]{8}/.exec(text(conversation(context).at(-1)!))![0];
+        return fauxAssistantMessage('Typecheck passes.\n- Open: none.');
+      },
+      (context) => {
+        forkHandle = /fk-[0-9a-f]{8}/.exec(text(conversation(context).at(-1)!))![0];
+        return fauxAssistantMessage('Fork complete.');
+      },
+      () => fauxAssistantMessage('Follow-up prompt before compaction.'),
+      // Compaction summarizer (history + split turn).
+      () => fauxAssistantMessage('## Summary\nFixed build.'),
+      () => fauxAssistantMessage('Follow-up context.'),
+      (context) => {
+        const notice = conversation(context).find((message) =>
+          /archived as cp-[0-9a-f]{8}/.test(text(message))
+        );
+        assert.ok(notice);
+        const body = text(notice);
+        assert.ok(body.includes(`- ${forkHandle}: Typecheck passes.`), body);
+        assert.ok(
+          body.includes(`- ${nestedHandle} (inside ${forkHandle}): Parser fix: narrowed union.`),
+          body
+        );
+        return fauxAssistantMessage(
+          fauxToolCall('ask', { handle: nestedHandle, question: 'which TS code?' })
+        );
+      },
+      () => fauxAssistantMessage('TS7777'),
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /TS7777/);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    { keepRecentTokens: 1 }
+  );
+
+  try {
+    await harness.session.prompt('run fork');
+    await harness.session.prompt('after fork');
+    await harness.session.compact();
+    await harness.session.prompt('verify manifest');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test('a fork folds its own work, and recall and ask reach the fold inside it', async () => {
   let stamp = '';
   let nested = '';

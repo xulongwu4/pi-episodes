@@ -449,8 +449,10 @@ export function forkRecords(entries: readonly SessionEntry[]): ForkDetails[] {
 }
 
 /** Folds, forks and compactions on these entries, in order. */
-export function threadRecords(entries: readonly SessionEntry[]): ThreadRecord[] {
-  const applied = appliedFolds(entries);
+export function threadRecords(
+  entries: readonly SessionEntry[],
+  applied: ReadonlySet<string> = appliedFolds(entries)
+): ThreadRecord[] {
   return entries.flatMap((entry): ThreadRecord[] => {
     if (entry.type === 'compaction') return [compactionRecord(entry)];
     const fold = foldEntryDetails(entry);
@@ -858,7 +860,7 @@ export class ThreadIndex {
    * saw at the end, so a span folded inside it is matched under its own handle only.
    */
   private async forkThreads(fork: ForkDetails): Promise<Thread[]> {
-    const archive = this.memory.get(fork.handle) ?? (await readArchive(fork.archive));
+    const archive = await readForkArchive(fork, this.memory, this.sessions);
     if (!archive) return [];
 
     const folds = archive.folds ?? [];
@@ -992,8 +994,34 @@ function isFoldRequest(message: AgentMessage | undefined): boolean {
 async function readArchive(file: string | undefined): Promise<ForkArchive | undefined> {
   if (!file) return undefined;
   try {
-    return JSON.parse(await readFile(file, 'utf8')) as ForkArchive;
+    const parsed = JSON.parse(await readFile(file, 'utf8')) as unknown;
+    return isRecord(parsed) && Array.isArray(parsed.messages)
+      ? (parsed as unknown as ForkArchive)
+      : undefined;
   } catch {
     return undefined;
   }
+}
+
+/** Active nested fold records inside a fork archive, in order. */
+export function activeNestedFoldRecords(archive: ForkArchive): FoldDetails[] {
+  const folds = archive.folds ?? [];
+  return folds
+    .filter((fold) => !isNestedFoldUnfoldedAt(fold, archive.messages.length))
+    .map((fold) => fold.record);
+}
+
+/** Loads a fork's archive from memory, its recorded path, or ancestor `.episodes` directories. */
+export async function readForkArchive(
+  fork: ForkDetails,
+  memory: ReadonlyMap<string, ForkArchive> = new Map(),
+  sessions?: SessionView
+): Promise<ForkArchive | undefined> {
+  const cached = memory.get(fork.handle) ?? (await readArchive(fork.archive));
+  if (cached || !sessions || !/^fk-[0-9a-z-]+$/.test(fork.handle)) return cached;
+  for (const dir of await archiveDirs(sessions)) {
+    const found = await readArchive(join(dir, `${fork.handle}.json`));
+    if (found) return found;
+  }
+  return undefined;
 }

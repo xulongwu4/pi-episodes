@@ -118,7 +118,7 @@ While a fork runs, a widget above the editor shows its turn, elapsed time and cu
 
 Pi's compaction replaces the oldest turns with a summary. With `pi-episodes`, those turns become one more archived thread, `cp-1a2b3c4d`, holding what the summary replaced as the model saw it (spans folded before stay in their own threads). `recall` searches them like folds and forks, so an exact error string the summary left out can still be found; `ask` cannot resume them, since they filled the context window. The file-touch cue covers the files pi's compaction recorded as modified.
 
-The summary is pi's text and cannot name that handle, so right after a compaction the harness adds one short message saying where the compacted turns went. Compaction has just rewritten the whole prompt, so it costs no cache. Turn it off with `{ "episodes": { "compactionNotice": false } }`.
+The summary is pi's text and cannot name that handle, so right after a compaction the harness adds one short message that names where the compacted turns went and lists any earlier folds and forks the compaction swept out of context so `recall` and `ask` still find them by handle. Compaction has just rewritten the whole prompt, so it costs no cache. Turn it off with `{ "episodes": { "compactionNotice": false } }`.
 
 <br />
 

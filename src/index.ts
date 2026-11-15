@@ -290,5 +290,5 @@ export default function episodes(pi: ExtensionAPI): void {
   registerReminder(pi);
   registerNudge(pi);
   registerStampDisplay(pi);
-  registerCompactionNotice(pi);
+  registerCompactionNotice(pi, state);
 }
