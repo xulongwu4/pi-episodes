@@ -1,6 +1,6 @@
 # Measurements
 
-What to measure before believing that folding beats compaction, and how. Only sections 12, 13 and 14 have a result so far.
+What to measure before believing that folding beats compaction, and how. Only sections 12 to 15 have a result so far.
 
 The order follows the post: try the note before asking the model to notice anything. `/fold` separates the two questions, so note quality comes before boundary detection. Cheap scripted checks come first, so a broken mechanism is not mistaken for a bad model.
 
@@ -376,6 +376,56 @@ The message came at turn 146, with 116k tokens in context, when what a fold of t
 What this adds: one merge that was asked for, made at once from the stamp named, after which nothing the notes said was missing at the end. What it does not show: how often the model follows the message, for which the replays remain the evidence, this being one try; a second merge in one session (the calls and replies that a further one would free had come to about 11k tokens by the end, by a count of characters, under the 12.5k the message needs); or a difference in cost: $1.110 here against $1.115 in the session in which every note stood. The checks passed, 769, compare with 716 to 834 in the seven other complete sessions of this task with codemode.
 
 Not measured: a session with more than one such merge, and several sessions per rule.
+
+<br />
+
+## 15. Whether the agent stands by its note
+
+**Question.** After a fold, does the model treat its note as what it saw, or does it take the missing calls and outputs as a sign that it never did the work?
+
+**Why.** A fold removes the evidence for what the note says. A model that checks its own claims against the transcript then finds a note stating a result and no call that produced it. Sections 1 to 14 were run on one model, which never did this, so none of them shows it.
+
+**Method.** Scripted sessions of a few prompts, one fold each, in a directory with a 200-line log of random tokens. The model runs `cat` on the log, folds that work with a note stating one value from it, and is later asked for that value without tools. Two shapes: *next request*, where the fold comes at a later prompt and stops at `until`, so a user message follows the folded span; and *mid-run*, where the fold call is the response right after the tool result, so the fold call follows the span directly. Read from each session, for everything after the fold: text to the user that retracts the note (made up, wrong, not based on output, the command never ran); text that only says the value cannot be checked now; calls that go back (`recall`, `ask`, or the same command again); and whether the last answer gives the value.
+
+**Report.** Per form of the fold and per shape: sessions, retractions, hedges, sessions that went back, final answers that give the value, and requests a provider rejected.
+
+**Pass.** No retraction of a correct note, and the model does not go back just to check it: a `recall` of the span brings back what the fold removed.
+
+**Result.** 2026-11-15, pi 1.5.2, thinking medium, reasoning kept, six sessions per row with claude-haiku-5-5 unless the row says otherwise. The value in the note was right in every session, and every final answer gave it. No provider rejected a request in any session.
+
+| What the fold leaves of its span | Shape | Sessions | Retracted the note | Only said it cannot check now | Went back |
+|---|---|---|---|---|---|
+| Nothing (as before this section) | next request | 12 | 12 | 0 | 4 |
+| Nothing | mid-run | 6 | 5 | 0 | 6 |
+| Nothing; the system prompt says the note is first-hand | next request | 12 | 9 | 0 | 7 |
+| Nothing; system prompt as above | mid-run | 6 | 6 | 0 | 6 |
+| A line in place of the first response: "the tool calls I made here and their outputs were folded away after I read them" | next request | 6 | 0 | 1 | 4 |
+| That line, and the system prompt | next request | 6 | 0 | 1 | 2 |
+| A line: "I ran the tool calls that stood here and read their outputs before I folded them away ... my own record ... written with them in view" | next request | 6 | 1 | 4 | 1 |
+| That line, and the system prompt | next request | 6 | 0 | 3 | 0 |
+| That line, and the system prompt | mid-run | 3 | 2 | 0 | 2 |
+| The first call of the span kept, with a line in place of its output; system prompt | next request | 6 | 1 | 0 | 5 |
+| The same | mid-run | 6 | 2 | 1 | 5 |
+| The same, the line saying "this line is not what the call returned ... shown here in full when it ran" | next request | 6 | 2 | 0 | 5 |
+| The same | mid-run | 6 | 2 | 0 | 6 |
+| **A line in place of the first response that also says why nothing is shown; system prompt** (what a fold does now) | next request | 12 | 0 | 4 | 1 |
+| **The same** | mid-run | 12 | 0 | 2 | 1 |
+
+What the retractions said, with nothing left of the span: "I never ran `cat data/build.log` for your first request", "the fold note I just wrote states an artifact value and log details that I never actually read", "Please don't rely on it." A sentence added to the fold's result, saying that the note was written with the messages in view, changed nothing (6 of 6 retracted, in an earlier set).
+
+Why the forms that failed did so, from the model's reasoning:
+
+- A line that only claims the work holds when a user message follows it. When the fold call follows it, the provider joins the two responses, and the model read the line as the opening of the response that called fold: "my earlier message went straight to fold", with no call behind the claim. It then ran the command again.
+- A kept call with a line in place of its output was read literally: "the tool result for `cat data/build.log` was only a fold placeholder, so I never actually saw that value". Saying in the line that the output had been shown in full did not change that. The model seldom retracted, and went back with `recall` in 21 of 24 sessions, which reads the folded output into context again.
+- The line that holds says why nothing is shown: "that is why no call and no output is shown here". With it the reasoning was "that note was written while I was looking at the output, so it's a reliable record", in both shapes.
+
+The same sessions with the final form, one or two each: claude-haiku-5-5 at high thinking (2, one went back), claude-sonnet-5-5 (2, one went back), gpt-6-luna (2) and gemini-3.8-flash (2, one went back and unfolded, as it does unasked): no retraction, the value given in all eight.
+
+A span in which the agent called no tool gets a shorter line that speaks of responses only ("earlier responses of mine stood here (t1-t2). I folded them out of this conversation: that is why they are not shown here."). In four sessions that folded a two-sentence answer and asked for it again, the model restated it as fact each time. After the fold came to record where its line stands, with the wording unchanged, six more sessions of the two shapes gave no retraction and one hedge.
+
+Sessions written by the version before, which stripped provider signatures from the responses a fold kept, still hold those edits. Seven of them (three gpt-6-luna, two claude-haiku-5-5, two gemini-3.8-flash, with 8 to 17 stripped responses in effect each) were continued with this version for three more requests, and no provider rejected one.
+
+What this does not show: sessions longer than a few prompts; folds that cover notes; whether the hedges ("I am going from my note, I cannot re-check it without a tool") would become checks when tools are allowed; any model beyond the four. gpt-6-luna and gemini-3.8-flash did not retract with nothing left either, so for them the line costs about 100 tokens per fold and is not known to change anything.
 
 <br />
 
