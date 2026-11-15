@@ -1354,7 +1354,7 @@ test('stats read the session: folds, rejections, cues followed, and the drop aft
       stats.folds.uncachedAfter.reduce((sum, tokens) => sum + tokens, 0)
     );
     assert.equal(
-      split.fresh + split.afterFold + split.afterCompaction + split.missed,
+      split.fresh + split.afterFold + split.afterCompaction + split.afterModelSwitch + split.missed,
       stats.requests.reduce((sum, request) => sum + request.uncached, 0)
     );
     assert.ok(stats.overhead.stamps > 0);

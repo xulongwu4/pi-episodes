@@ -266,6 +266,8 @@ test('uncached input is split by what explains it', () => {
     fresh: 10_000 + 2150 + 1000 + 500,
     afterFold: 4000,
     afterCompaction: 3000,
+    afterModelSwitch: 0,
+    afterModelSwitchRequests: 0,
     missed: 6000 + 13_000,
     missedRequests: 2,
     afterPause: 13_000,
@@ -278,4 +280,103 @@ test('uncached input is split by what explains it', () => {
       'uncached input ~40k: ~14k new content, ~4k after folds, ~3k after compactions, ~19k sent before and missed in 2 request(s), 1 of them (~13k) after a pause of 5 min or more'
     )
   );
+});
+
+test('switching models puts the prefix miss under model switches instead of missed', () => {
+  const minute = 60_000;
+  const split = uncachedSplit([
+    { tokens: 10_000, uncached: 10_000, at: 0, model: 'anthropic/sonnet' },
+    // Switched models: the 2,000 growth is new content; the 10,000 prefix goes to model switch.
+    { tokens: 12_000, uncached: 12_000, at: minute, model: 'openai/gpt-5' },
+    // Same model missed 6,000 of what it already saw: stays under missed.
+    { tokens: 13_000, uncached: 7000, at: 2 * minute, model: 'openai/gpt-5' },
+    // Switched models, but missed less than a cache block: stays under fresh.
+    { tokens: 13_500, uncached: 900, at: 3 * minute, model: 'google/gemini' },
+    // Fold and compaction keep precedence even when the model also changed.
+    { tokens: 6000, uncached: 4000, after: 'fold', at: 4 * minute, model: 'anthropic/opus' },
+    { tokens: 3000, uncached: 3000, after: 'compaction', at: 5 * minute, model: 'anthropic/sonnet' }
+  ]);
+  assert.deepEqual(split, {
+    fresh: 10_000 + 2000 + 1000 + 900,
+    afterFold: 4000,
+    afterCompaction: 3000,
+    afterModelSwitch: 10_000,
+    afterModelSwitchRequests: 1,
+    missed: 6000,
+    missedRequests: 1,
+    afterPause: 0,
+    afterPauseRequests: 0
+  });
+
+  const lines = statsLines({ ...episodeStats([], '/'), uncached: split });
+  assert.ok(
+    lines.includes(
+      'uncached input ~37k: ~14k new content, ~4k after folds, ~3k after compactions, ~10k after 1 model switch(es), ~6k sent before and missed in 1 request(s), none after a pause of 5 min or more'
+    )
+  );
+
+  // episodeStats propagates provider/model from assistant messages; startup or A->B->A
+  // model_change entries without an intervening request to B do not count as switches.
+  const { manager } = session([user('go', 1)]);
+  manager.appendModelChange('anthropic', 'opus');
+  manager.appendModelChange('anthropic', 'sonnet');
+  const sendAs = (
+    provider: string,
+    model: string,
+    input: number,
+    cacheRead: number,
+    ts: number
+  ) => {
+    manager.appendMessage({
+      ...assistant('ok'),
+      provider,
+      model,
+      usage: {
+        input,
+        output: 10,
+        cacheRead,
+        cacheWrite: 0,
+        totalTokens: input + cacheRead + 10,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+      },
+      timestamp: ts
+    });
+  };
+  sendAs('anthropic', 'sonnet', 10_000, 0, 0);
+  // A -> B -> A before the next request keeps A's cache.
+  manager.appendModelChange('openai', 'gpt-5');
+  manager.appendModelChange('anthropic', 'sonnet');
+  sendAs('anthropic', 'sonnet', 1000, 10_000, minute);
+  // Actual switch to openai/gpt-5: 11,000 prefix re-sent + 1,000 new content.
+  manager.appendModelChange('openai', 'gpt-5');
+  sendAs('openai', 'gpt-5', 12_000, 0, 8 * minute);
+
+  const stats = episodeStats(manager.getBranch(), '/repo');
+  assert.deepEqual(
+    stats.requests.map((r) => r.model),
+    ['anthropic/sonnet', 'anthropic/sonnet', 'openai/gpt-5']
+  );
+  assert.equal(stats.uncached.afterModelSwitch, 11_000);
+  assert.equal(stats.uncached.afterModelSwitchRequests, 1);
+  assert.equal(stats.uncached.missed, 0);
+  assert.equal(stats.uncached.afterPause, 0);
+
+  // Returning to an earlier model after >=5m still counts as a model switch ahead of pause;
+  // when the new tokenizer counts fewer tokens than the previous one, all uncached goes to switch.
+  const crossTokenizer = uncachedSplit([
+    { tokens: 15_000, uncached: 15_000, at: 0, model: 'anthropic/sonnet' },
+    { tokens: 12_000, uncached: 12_000, at: 10 * minute, model: 'openai/gpt-5' },
+    { tokens: 16_000, uncached: 16_000, at: 20 * minute, model: 'anthropic/sonnet' }
+  ]);
+  assert.deepEqual(crossTokenizer, {
+    fresh: 15_000 + 0 + 4000,
+    afterFold: 0,
+    afterCompaction: 0,
+    afterModelSwitch: 12_000 + 12_000,
+    afterModelSwitchRequests: 2,
+    missed: 0,
+    missedRequests: 0,
+    afterPause: 0,
+    afterPauseRequests: 0
+  });
 });

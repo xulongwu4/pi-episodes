@@ -208,6 +208,8 @@ export interface SentRequest extends RequestPoint {
   uncached: number;
   /** When the response was saved, in ms. */
   at?: number;
+  /** `provider/model` of the request, to tell when a miss followed a model switch. */
+  model?: string;
 }
 
 /** Providers cache in blocks, so a little of every request misses; less than this is no miss. */
@@ -222,7 +224,11 @@ export interface UncachedSplit {
   /** The first request after a fold or a compaction: the prefix it changed, sent again. */
   afterFold: number;
   afterCompaction: number;
-  /** A prefix sent before and not read back, with no fold or compaction to explain it. */
+  /** Prefix re-sent after the provider or model changed, since caches are per provider and model. */
+  afterModelSwitch: number;
+  /** Requests that missed at least a cache block after the provider or model changed. */
+  afterModelSwitchRequests: number;
+  /** A prefix sent before and not read back, with no fold, compaction or model switch to explain it. */
   missed: number;
   missedRequests: number;
   /** The part of `missed` that came after a pause long enough for the cache to expire. */
@@ -233,13 +239,15 @@ export interface UncachedSplit {
 /**
  * Says why input was not read from cache. A request cannot read what it adds, so growth
  * since the request before is new content; more than that is a prefix the provider had and
- * did not return, which a fold, a compaction or a long pause explains, or nothing does.
+ * did not return, which a fold, a compaction, a model switch or a long pause explains, or nothing does.
  */
 export function uncachedSplit(requests: readonly SentRequest[]): UncachedSplit {
   const split: UncachedSplit = {
     fresh: 0,
     afterFold: 0,
     afterCompaction: 0,
+    afterModelSwitch: 0,
+    afterModelSwitchRequests: 0,
     missed: 0,
     missedRequests: 0,
     afterPause: 0,
@@ -255,12 +263,21 @@ export function uncachedSplit(requests: readonly SentRequest[]): UncachedSplit {
       if (beyond < MISS_FLOOR_TOKENS) split.fresh += request.uncached;
       else {
         split.fresh += grown;
-        split.missed += beyond;
-        split.missedRequests++;
-        if (previous?.at !== undefined && request.at !== undefined) {
-          if (request.at - previous.at >= PAUSE_MS) {
-            split.afterPause += beyond;
-            split.afterPauseRequests++;
+        if (
+          previous?.model !== undefined &&
+          request.model !== undefined &&
+          request.model !== previous.model
+        ) {
+          split.afterModelSwitch += beyond;
+          split.afterModelSwitchRequests++;
+        } else {
+          split.missed += beyond;
+          split.missedRequests++;
+          if (previous?.at !== undefined && request.at !== undefined) {
+            if (request.at - previous.at >= PAUSE_MS) {
+              split.afterPause += beyond;
+              split.afterPauseRequests++;
+            }
           }
         }
       }
@@ -634,12 +651,14 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       const usage = found.usage;
       const tokens = usage.input + usage.cacheRead + usage.cacheWrite;
       if (tokens === 0) return;
-      usages.push({ ...usage, model: `${found.provider}/${found.model}` });
+      const model = `${found.provider}/${found.model}`;
+      usages.push({ ...usage, model });
       // The message carries the time its request began; the entry, the time it was written.
       const at = Number.isFinite(found.timestamp) ? found.timestamp : Date.parse(entry.timestamp);
       stats.requests.push({
         tokens,
         uncached: usage.input + usage.cacheWrite,
+        model,
         ...(mark ? { after: mark } : {}),
         ...(Number.isNaN(at) ? {} : { at })
       });
@@ -870,13 +889,17 @@ export function statsLines(stats: EpisodeStats): string[] {
   }
 
   const split = stats.uncached;
-  const uncached = split.fresh + split.afterFold + split.afterCompaction + split.missed;
+  const uncached =
+    split.fresh + split.afterFold + split.afterCompaction + split.afterModelSwitch + split.missed;
   if (uncached > 0) {
     const pauses = split.afterPauseRequests;
     const causes = [
       `~${k(split.fresh)} new content`,
       split.afterFold > 0 ? `~${k(split.afterFold)} after folds` : '',
       split.afterCompaction > 0 ? `~${k(split.afterCompaction)} after compactions` : '',
+      split.afterModelSwitch > 0
+        ? `~${k(split.afterModelSwitch)} after ${split.afterModelSwitchRequests} model switch(es)`
+        : '',
       split.missed > 0
         ? `~${k(split.missed)} sent before and missed in ${split.missedRequests} request(s), ${pauses > 0 ? `${pauses} of them (~${k(split.afterPause)}) after a pause of 5 min or more` : 'none after a pause of 5 min or more'}`
         : ''
