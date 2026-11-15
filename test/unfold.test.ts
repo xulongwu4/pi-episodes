@@ -10,15 +10,10 @@ import {
   fauxProvider,
   fauxToolCall,
   type Message,
-  type Model,
-  normalizeContext,
   type TextContent,
   type ThinkingContent,
-  type ToolCall,
   type TranscriptContext
 } from '@earendil-works/pi-ai';
-import { convertMessages as convertGoogleMessages } from '@earendil-works/pi-ai/api/google-shared';
-import { convertResponsesMessages } from '@earendil-works/pi-ai/api/openai-responses-shared';
 import {
   convertToLlm,
   createAgentSession,
@@ -44,24 +39,16 @@ import {
 } from '../src/archive.js';
 import { cacheAnchor } from '../src/cache.js';
 import {
-  branchRetiredResponsesCallIds,
   completeCutShortFolds,
   cutShortFold,
-  GEMINI_SKIP_THOUGHT_SIGNATURE,
   planFold,
   planUnfold,
-  retireAssistantContent,
-  retireAssistantMessage,
-  retiredResponsesCallIds,
-  sanitizeProviderPayload,
-  stripRetiredResponsesIds,
   USER_TEXT_CAP,
   workSince
 } from '../src/fold.js';
 import { ForkFolds } from '../src/fork-fold.js';
 import episodes from '../src/index.js';
 import { nudgeGrowth } from '../src/nudge.js';
-import { requestOptions } from '../src/requests.js';
 import { EpisodeState } from '../src/state.js';
 import { episodeStats } from '../src/stats.js';
 import { assistant, call, result, session, user } from './helpers.js';
@@ -99,191 +86,7 @@ function applyDrafts(
   }
 }
 
-test('retireAssistantContent sanitizes signed, unsigned, empty, redacted and thinking-only blocks, textSignature and preserves toolCall ids', () => {
-  // Plain unsigned non-empty thinking, plain text and tool calls (including call_id|fc_* ids) stay untouched.
-  const clean: AssistantMessage['content'] = [
-    { type: 'thinking', thinking: 'plain thought' },
-    { type: 'text', text: 'hello' },
-    { type: 'toolCall', id: 'call_1|fc_1', name: 'bash', arguments: { command: 'ls' } }
-  ];
-  assert.equal(retireAssistantContent(clean), undefined);
-
-  // Signed non-empty thinking keeps its text without thinkingSignature; empty signed thinking and
-  // redacted thinking are dropped.
-  const signedThinking: ThinkingContent = {
-    type: 'thinking',
-    thinking: 'step 1',
-    thinkingSignature: 'sig-anth'
-  };
-  const emptyEncrypted: ThinkingContent = {
-    type: 'thinking',
-    thinking: '',
-    thinkingSignature: '{"id":"rs_123","type":"reasoning","encrypted_content":"abc"}'
-  };
-  const redactedBlock: ThinkingContent = {
-    type: 'thinking',
-    thinking: '[Reasoning redacted]',
-    thinkingSignature: 'opaque-redacted-bytes',
-    redacted: true
-  };
-  const phaseText: TextContent = {
-    type: 'text',
-    text: 'final reply',
-    textSignature: JSON.stringify({ v: 1, id: 'msg_abc123', phase: 'final_answer' })
-  };
-  const idOnlyText: TextContent = {
-    type: 'text',
-    text: 'plain',
-    textSignature: JSON.stringify({ v: 1, id: 'msg_def456' })
-  };
-  const geminiText: TextContent = {
-    type: 'text',
-    text: 'gemini',
-    textSignature: 'Z2VtaW5pLXNpZw=='
-  };
-  const signedToolCall: ToolCall = {
-    type: 'toolCall',
-    id: 'call_99|fc_item99',
-    name: 'read',
-    arguments: { path: 'a.ts' },
-    thoughtSignature: 'Z29vZ2xlLXRjLXNpZw=='
-  };
-
-  const retired = retireAssistantContent([
-    signedThinking,
-    emptyEncrypted,
-    redactedBlock,
-    phaseText,
-    idOnlyText,
-    geminiText,
-    signedToolCall
-  ]);
-  assert.deepEqual(retired, [
-    { type: 'thinking', thinking: 'step 1' },
-    {
-      type: 'text',
-      text: 'final reply',
-      textSignature: JSON.stringify({ v: 1, id: '', phase: 'final_answer' })
-    },
-    { type: 'text', text: 'plain' },
-    { type: 'text', text: 'gemini' },
-    { type: 'toolCall', id: 'call_99|fc_item99', name: 'read', arguments: { path: 'a.ts' } }
-  ]);
-
-  // CRITICAL edge case: assistant message that held ONLY redacted or empty encrypted thinking
-  // never becomes content: [].
-  const redactedOnly = retireAssistantContent([redactedBlock]);
-  assert.deepEqual(redactedOnly, [{ type: 'text', text: '[thinking retired]' }]);
-  const encryptedOnly = retireAssistantContent([emptyEncrypted]);
-  assert.deepEqual(encryptedOnly, [{ type: 'text', text: '[thinking retired]' }]);
-
-  // Thinking-only turns convert non-empty thinking to plain text so OpenAI Responses (and all
-  // other adapters) emit a non-empty assistant message instead of dropping the turn.
-  const thinkingOnly = retireAssistantContent([signedThinking]);
-  assert.deepEqual(thinkingOnly, [{ type: 'text', text: 'step 1' }]);
-  const unsignedThinkingOnly = retireAssistantContent([
-    { type: 'thinking', thinking: 'unsigned step' }
-  ]);
-  assert.deepEqual(unsignedThinkingOnly, [{ type: 'text', text: 'unsigned step' }]);
-  const whitespaceTextAndThinking = retireAssistantContent([
-    { type: 'thinking', thinking: 'thought body', thinkingSignature: 'sig' },
-    { type: 'text', text: '   ' }
-  ]);
-  assert.deepEqual(whitespaceTextAndThinking, [{ type: 'text', text: 'thought body' }]);
-});
-
-test('planFold retires signatures on surviving turns after until and on the fold response itself', () => {
-  const preFold = {
-    ...assistant('early'),
-    content: [
-      { type: 'thinking' as const, thinking: 'keep signature', thinkingSignature: 'sig-before' },
-      { type: 'text' as const, text: 'early' },
-      { type: 'toolCall' as const, id: 'c0|fc_0', name: 'read', arguments: { path: 'a.ts' } }
-    ]
-  };
-  const foldedTurn = assistant(call('c1', 'bash', { command: 'echo 1' }));
-  const survivingTurn = {
-    ...assistant('kept'),
-    content: [
-      {
-        type: 'thinking' as const,
-        thinking: '',
-        thinkingSignature: '{"id":"rs_surviving","type":"reasoning","encrypted_content":"enc"}'
-      },
-      {
-        type: 'text' as const,
-        text: 'checking',
-        textSignature: JSON.stringify({ v: 1, id: 'msg_surviving', phase: 'commentary' })
-      },
-      {
-        type: 'toolCall' as const,
-        id: 'c2|fc_surviving',
-        name: 'bash',
-        arguments: { command: 'echo 2' },
-        thoughtSignature: 'dGhvdWdodA=='
-      }
-    ]
-  };
-  const foldCaller = {
-    ...assistant('folding'),
-    content: [
-      {
-        type: 'thinking' as const,
-        thinking: '[Reasoning redacted]',
-        thinkingSignature: 'redacted-blob',
-        redacted: true
-      },
-      { type: 'toolCall' as const, id: 'f1|fc_fold', name: 'fold', arguments: { since: 't3' } }
-    ]
-  };
-
-  const { manager } = session([
-    user('start', 1),
-    preFold,
-    result('c0|fc_0', 'read', 'file', 2),
-    foldedTurn,
-    result('c1', 'bash', 'one', 3),
-    survivingTurn,
-    result('c2|fc_surviving', 'bash', 'two', 4),
-    foldCaller
-  ]);
-
-  const plan = planFold(manager.buildSessionProjection().entries, 'f1|fc_fold', 3, { until: 3 });
-  applyDrafts(manager, plan.edits);
-  manager.appendMessage(result('f1|fc_fold', 'fold', '[fold note]', 5));
-
-  const view = manager.buildSessionProjection().messages;
-  const assistants = view.filter((m): m is AssistantMessage => m.role === 'assistant');
-  assert.equal(assistants.length, 3);
-
-  // Prefix before the folded span is untouched (cache preserved).
-  assert.equal((assistants[0]!.content[0] as ThinkingContent).thinkingSignature, 'sig-before');
-  assert.equal((assistants[0]!.content[2] as ToolCall).id, 'c0|fc_0');
-
-  // Surviving assistant after `until` had encrypted thinking dropped, textSignature sanitized,
-  // and thoughtSignature retired, while ToolCall.id stays intact to match ToolResultMessage.toolCallId.
-  assert.deepEqual(assistants[1]!.content, [
-    {
-      type: 'text',
-      text: 'checking',
-      textSignature: JSON.stringify({ v: 1, id: '', phase: 'commentary' })
-    },
-    { type: 'toolCall', id: 'c2|fc_surviving', name: 'bash', arguments: { command: 'echo 2' } }
-  ]);
-
-  // Fold caller had redacted thinking dropped and keeps its full ToolCall.id; branch retirement
-  // records c2 and f1 (leaving pre-fold c0 untouched) for wire-level fc_* stripping.
-  assert.deepEqual(assistants[2]!.content, [
-    { type: 'toolCall', id: 'f1|fc_fold', name: 'fold', arguments: { since: 't3' } }
-  ]);
-  assertPaired(view);
-  assert.deepEqual(
-    branchRetiredResponsesCallIds(manager.getBranch(), manager.buildSessionProjection().entries),
-    new Set(['c2', 'f1'])
-  );
-});
-
-test('unfold happy path restores assistant, toolResult, custom_message and capped user entries, replaces note and retires signatures', () => {
+test('unfold happy path restores assistant, toolResult, custom_message and capped user entries as they were, and replaces the note', () => {
   const longUser = `${'u'.repeat(USER_TEXT_CAP + 500)}\n`;
   const { manager, ids } = session([
     user('before', 1),
@@ -336,7 +139,7 @@ test('unfold happy path restores assistant, toolResult, custom_message and cappe
   ]);
 
   // Add a later signed assistant turn and an unfold call.
-  manager.appendMessage({
+  const laterId = manager.appendMessage({
     ...assistant('after fold'),
     content: [
       {
@@ -384,11 +187,10 @@ test('unfold happy path restores assistant, toolResult, custom_message and cappe
   // Custom message inside the span is restored.
   assert.equal(byId.get(customId)!.length, 1);
 
-  // Restored assistant message had its signature retired while keeping ToolCall.id === 'c1|fc_inner'
-  // so it pairs cleanly with result('c1|fc_inner').
+  // The restored response is as the provider sent it, signature included.
   const restoredAsst = byId.get(ids[2]!)![0] as AssistantMessage;
   assert.deepEqual(restoredAsst.content, [
-    { type: 'thinking', thinking: 'inner reasoning' },
+    { type: 'thinking', thinking: 'inner reasoning', thinkingSignature: 'sig-inner' },
     { type: 'toolCall', id: 'c1|fc_inner', name: 'bash', arguments: { command: 'echo hi' } }
   ]);
   assertPaired(projected.messages);
@@ -403,15 +205,19 @@ test('unfold happy path restores assistant, toolResult, custom_message and cappe
     stamp: '[t2]'
   });
 
-  // Thinking-only redacted assistant turn after the fold became [thinking retired], not [].
-  const retiredRedacted = projected.messages.find(
-    (m) =>
-      m.role === 'assistant' &&
-      m.content.length === 1 &&
-      m.content[0]?.type === 'text' &&
-      m.content[0].text === '[thinking retired]'
+  // Neither the fold nor the unfold edited a response outside the span.
+  assert.deepEqual((byId.get(laterId)![0] as AssistantMessage).content, [
+    {
+      type: 'thinking',
+      thinking: '[Reasoning redacted]',
+      thinkingSignature: 'opaque',
+      redacted: true
+    }
+  ]);
+  const edited = new Set(
+    manager.getBranch().flatMap((entry) => (entry.type === 'context_edit' ? [entry.targetId] : []))
   );
-  assert.ok(retiredRedacted);
+  assert.equal(edited.has(laterId), false);
 });
 
 test('unfold with covering folds: ep-A is refused while ep-B covers it; unfolding ep-B keeps ep-A folded; then unfolding ep-A works', () => {
@@ -712,7 +518,7 @@ test('cut-short unfold batch is completed cleanly on the next boundary', () => {
   assertPaired(manager.buildSessionProjection().messages);
 });
 
-test('ForkFolds retires stale signatures after fold and supports in-place unfold', async () => {
+test('ForkFolds folds with until and unfolds in place, and leaves the responses it keeps as they are', async () => {
   const state = new EpisodeState();
   state.nextStamp = 13;
   const parentPrefix: Message[] = [
@@ -798,29 +604,24 @@ test('ForkFolds retires stale signatures after fold and supports in-place unfold
   const parentAsst = viewAfterFold[1] as AssistantMessage;
   assert.equal((parentAsst.content[0] as ThinkingContent).thinkingSignature, 'parent-sig');
 
-  // Folded turn is omitted; surviving child assistant messages have signatures retired.
+  // The folded turn is omitted; the child's responses that stay are the messages themselves.
   assert.ok(!JSON.stringify(viewAfterFold).includes('secret-one'));
   const keptAsst = viewAfterFold.find(
     (m): m is AssistantMessage =>
       m.role === 'assistant' && m.content.some((b) => b.type === 'toolCall' && b.name === 'bash')
   )!;
-  assert.deepEqual(keptAsst.content, [
-    { type: 'toolCall', id: 'c2|fc_c2', name: 'bash', arguments: { command: 'echo kept-two' } }
-  ]);
+  assert.equal(keptAsst, messages[5]);
   const foldCallerView = viewAfterFold.find(
     (m): m is AssistantMessage =>
       m.role === 'assistant' && m.content.some((b) => b.type === 'toolCall' && b.name === 'fold')
   )!;
-  assert.deepEqual(foldCallerView.content, [
-    { type: 'toolCall', id: 'f_child|fc_fc', name: 'fold', arguments: {} }
-  ]);
+  assert.equal(foldCallerView, messages[7]);
   assertPaired(viewAfterFold);
-  assert.deepEqual(folds.retiredCallIds(messages), new Set(['c2', 'f_child']));
   assert.deepEqual(cacheAnchor(viewAfterFold, folds.activeHandles()), {
     toolUseId: 'f_child|fc_fc'
   });
 
-  // New child turn appended AFTER fold keeps its signatures and is excluded from retiredCallIds.
+  // A child turn appended after the fold is sent as it is too.
   const freshAfterFold: AssistantMessage = {
     ...assistant('fresh'),
     content: [
@@ -837,19 +638,14 @@ test('ForkFolds retires stale signatures after fold and supports in-place unfold
       m.content.some((b) => b.type === 'toolCall' && b.id === 'c_fresh|fc_fresh')
   )!;
   assert.equal((freshSeen.content[0] as ThinkingContent).thinkingSignature, 'fresh-sig');
-  assert.equal(folds.retiredCallIds(messages).has('c_fresh'), false);
 
-  // Unfold inside the fork restores secret-one, retires the note, and bounds retirement up to unfold.
+  // Unfold inside the fork restores secret-one and replaces the note.
   messages.push(assistant(call('u_child|fc_uc', 'unfold', { handle })));
   const unfolded = await unfoldTool.execute('u_child|fc_uc', { handle });
   messages.push(result('u_child|fc_uc', 'unfold', (unfolded.content[0] as TextContent).text, 15));
 
   assert.equal(folds.activeFolds.length, 0);
   assert.equal(folds.activeHandles().has(handle), false);
-  assert.deepEqual(
-    folds.retiredCallIds(messages),
-    new Set(['c1', 'c2', 'f_child', 'c_fresh', 'u_child'])
-  );
   const viewAfterUnfold = folds.view(messages);
   assertPaired(viewAfterUnfold);
   const contentTexts = viewAfterUnfold
@@ -860,7 +656,8 @@ test('ForkFolds retires stale signatures after fold and supports in-place unfold
   assert.ok(!contentTexts.includes('child folded turn 11'));
   assert.ok(contentTexts.includes(`[unfolded ${handle}]`));
 
-  // A turn appended AFTER unfold stays unretired.
+  // The restored response and a turn appended after the unfold are the messages themselves.
+  assert.equal(viewAfterUnfold[3], messages[3]);
   const postUnfoldTurn: AssistantMessage = {
     ...assistant('post-unfold'),
     content: [
@@ -870,12 +667,11 @@ test('ForkFolds retires stale signatures after fold and supports in-place unfold
   };
   messages.push(postUnfoldTurn);
   messages.push(result('c_post|fc_post', 'read', 'y', 16));
-  assert.equal(folds.retiredCallIds(messages).has('c_post'), false);
   const postSeen = folds.view(messages).at(-2) as AssistantMessage;
   assert.equal((postSeen.content[0] as ThinkingContent).thinkingSignature, 'post-unfold-sig');
 });
 
-test('live session unfold works both directly and through codemode, updates archive/status, and retires current turn signatures', async () => {
+test('live session unfold works both directly and through codemode, updates archive/status, and leaves the responses as they are', async () => {
   for (const mode of ['off', 'only'] as const) {
     const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-unfold-live-'));
     const faux = fauxProvider();
@@ -922,7 +718,7 @@ test('live session unfold works both directly and through codemode, updates arch
         const conv = context.messages.filter((m) => m.role !== 'system');
         const full = JSON.stringify(conv);
         assert.ok(!full.includes('UNIQUE_PAYLOAD_42'), `${mode}: payload omitted after fold`);
-        assert.ok(!full.includes('rs_live_fold'), `${mode}: fold turn reasoning retired`);
+        assert.ok(full.includes('rs_live_fold'), `${mode}: fold turn reasoning kept`);
         handle = /ep-[0-9a-f]{8}/.exec(full)![0];
         const msg =
           mode === 'only'
@@ -948,24 +744,15 @@ test('live session unfold works both directly and through codemode, updates arch
         assert.ok(full.includes('UNIQUE_PAYLOAD_42'), `${mode}: payload restored after unfold`);
         assert.ok(!full.includes('folded payload'), `${mode}: old fold note replaced`);
         assert.ok(full.includes(`[unfolded ${handle}]`), `${mode}: unfolded marker present`);
-        assert.ok(!full.includes('sig-unfold-turn'), `${mode}: unfold turn signature retired`);
+        assert.ok(full.includes('sig-unfold-turn'), `${mode}: unfold turn signature kept`);
         assertPaired(conv);
         return fauxAssistantMessage('All verified.');
       }
     ];
 
-    const strippedPayloads: Record<string, unknown>[][] = [];
     faux.setResponses(
-      steps.map((step) => async (context, streamOptions, _state, requestModel) => {
+      steps.map((step) => (context) => {
         requests.push(context);
-        const wire = {
-          model: requestModel.id,
-          input: convertResponsesMessages(requestModel, context, new Set([requestModel.provider]))
-        };
-        const out = ((await streamOptions?.onPayload?.(wire, requestModel)) ?? wire) as {
-          input: Record<string, unknown>[];
-        };
-        strippedPayloads.push(out.input);
         return step(context);
       })
     );
@@ -1020,15 +807,18 @@ test('live session unfold works both directly and through codemode, updates arch
       // Still searchable by direct handle in find() across session history? Wait: foldRecords checks appliedFolds!
       // Verify active threadRecords on branch is empty.
       assert.equal(threadRecords(branch).length, 0);
-      if (mode === 'off') {
-        const afterFoldInput = strippedPayloads[2]!;
-        const liveFoldCalls = afterFoldInput.filter(
-          (item) => item.type === 'function_call' && item.call_id === 'f_live'
-        );
-        assert.equal(liveFoldCalls.length, 1);
-        assert.equal('id' in liveFoldCalls[0]!, false);
-        assert.ok(!JSON.stringify(afterFoldInput).includes('No result provided'));
-      }
+      // The fold and the unfold edited what the fold removed and its note, nothing else.
+      const edited = new Set(
+        branch.flatMap((entry) => (entry.type === 'context_edit' ? [entry.targetId] : []))
+      );
+      const responses = branch.filter(
+        (entry) => entry.type === 'message' && entry.message.role === 'assistant'
+      );
+      assert.deepEqual(
+        responses.map((entry) => edited.has(entry.id)),
+        [true, false, false, false],
+        mode
+      );
     } finally {
       agentSession.dispose();
       await rm(dir, { recursive: true, force: true });
@@ -1121,393 +911,7 @@ test('codemode script fold note with sibling script output keeps script output w
   }
 });
 
-test('OpenAI Responses adapter pairs retired call_abc|fc_123 without synthetic error output and strips stale wire item ids', () => {
-  const model: Model<'openai-responses'> = {
-    id: 'gpt-5',
-    name: 'GPT-5',
-    api: 'openai-responses',
-    provider: 'openai',
-    baseUrl: 'https://api.openai.com/v1',
-    reasoning: true,
-    input: ['text'],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128000,
-    maxTokens: 16384
-  };
-  const allowedProviders = new Set(['openai', 'openai-codex', 'opencode']);
-
-  const prefixTurn: AssistantMessage = {
-    ...assistant('prefix'),
-    api: 'openai-responses',
-    provider: 'openai',
-    model: 'gpt-5',
-    content: [
-      {
-        type: 'thinking',
-        thinking: '',
-        thinkingSignature: JSON.stringify({
-          id: 'rs_prefix',
-          type: 'reasoning',
-          encrypted_content: 'enc_prefix',
-          summary: []
-        })
-      },
-      { type: 'toolCall', id: 'call_pre|fc_pre', name: 'read', arguments: { path: 'a.ts' } }
-    ]
-  };
-  const prefixResult = result('call_pre|fc_pre', 'read', 'contents');
-
-  const postFoldTurn: AssistantMessage = {
-    ...assistant('post'),
-    api: 'openai-responses',
-    provider: 'openai',
-    model: 'gpt-5',
-    content: [
-      {
-        type: 'thinking',
-        thinking: '',
-        thinkingSignature: JSON.stringify({
-          id: 'rs_123',
-          type: 'reasoning',
-          encrypted_content: 'enc_123',
-          summary: []
-        })
-      },
-      {
-        type: 'toolCall',
-        id: 'call_abc|fc_123',
-        name: 'bash',
-        arguments: { command: 'echo ok' }
-      }
-    ]
-  };
-  const postFoldResult = result('call_abc|fc_123', 'bash', 'ok');
-
-  const thinkingOnlyTurn: AssistantMessage = {
-    ...assistant('thought-only'),
-    api: 'openai-responses',
-    provider: 'openai',
-    model: 'gpt-5',
-    content: [
-      {
-        type: 'thinking',
-        thinking: 'deliberating on final answer',
-        thinkingSignature: JSON.stringify({
-          id: 'rs_think',
-          type: 'reasoning',
-          encrypted_content: 'enc_think',
-          summary: [{ type: 'summary_text', text: 'deliberating on final answer' }]
-        })
-      }
-    ]
-  };
-
-  const retiredTurn = retireAssistantMessage(postFoldTurn);
-  const retiredThinkingOnly = retireAssistantMessage(thinkingOnlyTurn);
-
-  // ToolCall.id remains intact so transformMessages pairs it with ToolResultMessage.toolCallId.
-  const retiredCall = retiredTurn.content.find((b): b is ToolCall => b.type === 'toolCall')!;
-  assert.equal(retiredCall.id, 'call_abc|fc_123');
-
-  const messages: Message[] = [
-    user('run check'),
-    prefixTurn,
-    prefixResult,
-    retiredTurn,
-    postFoldResult,
-    retiredThinkingOnly,
-    user('follow up')
-  ];
-
-  const rawInput = convertResponsesMessages(
-    model,
-    normalizeContext({ messages }),
-    allowedProviders
-  );
-  const retiredIds = retiredResponsesCallIds(messages, 3);
-  assert.deepEqual(retiredIds, new Set(['call_abc']));
-
-  const rawPayload = { model: model.id, input: rawInput };
-  const stripped = stripRetiredResponsesIds(rawPayload, retiredIds) as {
-    model: string;
-    input: Record<string, unknown>[];
-  };
-
-  // Cached prefix before the fold keeps its reasoning item and fc_pre item id untouched.
-  const preCall = stripped.input.find(
-    (item) => item.type === 'function_call' && item.call_id === 'call_pre'
-  )!;
-  assert.equal(preCall.id, 'fc_pre');
-  assert.ok(stripped.input.some((item) => item.type === 'reasoning' && item.id === 'rs_prefix'));
-
-  // Post-fold call has id omitted (undefined), call_id === 'call_abc', and a single output 'ok'
-  // (no synthetic 'No result provided' error output injected by transformMessages).
-  const postCalls = stripped.input.filter(
-    (item) => item.type === 'function_call' && item.call_id === 'call_abc'
-  );
-  assert.equal(postCalls.length, 1);
-  assert.equal(postCalls[0]!.id, undefined);
-  assert.equal('id' in postCalls[0]!, false);
-  assert.equal(postCalls[0]!.call_id, 'call_abc');
-
-  const postOutputs = stripped.input.filter(
-    (item) => item.type === 'function_call_output' && item.call_id === 'call_abc'
-  );
-  assert.equal(postOutputs.length, 1);
-  assert.equal(postOutputs[0]!.output, 'ok');
-  assert.ok(!JSON.stringify(stripped.input).includes('No result provided'));
-
-  // Thinking-only retired turn survived as an assistant message item instead of being dropped.
-  const assistantMessages = stripped.input.filter(
-    (item) => item.type === 'message' && item.role === 'assistant'
-  );
-  assert.equal(assistantMessages.length, 1);
-  assert.ok(JSON.stringify(assistantMessages[0]).includes('deliberating on final answer'));
-
-  // Custom grammar tool calls (ctc_*) are stripped too, and untouched payloads keep identity.
-  const withCustom = {
-    input: [
-      { type: 'custom_tool_call', id: 'ctc_9', call_id: 'call_abc', name: 'patch', input: '' }
-    ]
-  };
-  const strippedCustom = stripRetiredResponsesIds(withCustom, retiredIds) as {
-    input: Record<string, unknown>[];
-  };
-  assert.equal('id' in strippedCustom.input[0]!, false);
-  assert.equal(stripRetiredResponsesIds(stripped, retiredIds), stripped);
-  assert.equal(stripRetiredResponsesIds(rawPayload, new Set()), rawPayload);
-});
-
-test('requestOptions onPayload strips branch and fork retired Responses ids even when cacheAnchor is disabled', async () => {
-  const { manager } = session([
-    user('start', 1),
-    assistant(call('c_pre|fc_pre', 'read', { path: 'a.ts' })),
-    result('c_pre|fc_pre', 'read', 'a', 2),
-    assistant(call('c_span|fc_span', 'bash', { command: 'echo 1' })),
-    result('c_span|fc_span', 'bash', '1', 3),
-    assistant(call('f1|fc_fold', 'fold', { since: 't3', note: 'folded' }))
-  ]);
-  const plan = planFold(manager.buildSessionProjection().entries, 'f1|fc_fold', 3);
-  applyDrafts(manager, plan.edits);
-  manager.appendMessage(result('f1|fc_fold', 'fold', '[fold note]', 4));
-
-  const piStub = {
-    getSettings: () => ({ episodes: { cacheAnchor: false } }),
-    getThinkingLevel: () => 'off'
-  } as never;
-  const ctxStub = {
-    sessionManager: manager,
-    thinkingLevel: 'off'
-  } as never;
-
-  const opts = requestOptions(
-    piStub,
-    ctxStub,
-    () => manager.buildSessionProjection().messages,
-    undefined,
-    () => new Set(['c_fork'])
-  );
-  const wire = {
-    model: 'gpt-5',
-    input: [
-      { type: 'function_call', id: 'fc_pre', call_id: 'c_pre', name: 'read', arguments: '{}' },
-      { type: 'function_call', id: 'fc_fold', call_id: 'f1', name: 'fold', arguments: '{}' },
-      { type: 'custom_tool_call', id: 'ctc_fork', call_id: 'c_fork', name: 'patch', input: 'x' }
-    ]
-  };
-  const transformed = (await opts.onPayload!(wire, {} as never)) as typeof wire;
-  assert.notEqual(transformed, undefined);
-  assert.equal(transformed.input[0]!.id, 'fc_pre');
-  assert.equal('id' in transformed.input[1]!, false);
-  assert.equal('id' in transformed.input[2]!, false);
-  // Calling again when nothing matches returns undefined so pi-ai keeps the payload reference.
-  assert.equal(await opts.onPayload!(transformed, {} as never), undefined);
-});
-
-test('branchRetiredResponsesCallIds excludes new assistant turns created after the latest edit', () => {
-  const { manager } = session([
-    user('u1', 1),
-    assistant(call('c1|fc_1', 'bash', { command: 'echo 1' })),
-    result('c1|fc_1', 'bash', '1', 2),
-    assistant(call('f1|fc_f1', 'fold', { since: 't2', note: 'n' }))
-  ]);
-  const plan = planFold(manager.buildSessionProjection().entries, 'f1|fc_f1', 2);
-  applyDrafts(manager, plan.edits);
-  manager.appendMessage(result('f1|fc_f1', 'fold', '[fold note]', 3));
-  manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
-
-  // New turn appended AFTER the fold mutation keeps its Responses call_id unretired.
-  manager.appendMessage(assistant(call('c_new|fc_new', 'read', { path: 'fresh.ts' })));
-  manager.appendMessage(result('c_new|fc_new', 'read', 'fresh', 4));
-
-  const retired = branchRetiredResponsesCallIds(
-    manager.getBranch(),
-    manager.buildSessionProjection().entries
-  );
-  assert.deepEqual(retired, new Set(['f1']));
-  assert.equal(retired.has('c_new'), false);
-});
-
-test('sanitizeProviderPayload handles Gemini 3/4 skip_thought_signature_validator and Anthropic/Bedrock budget thinking', () => {
-  // 1. Google Gemini 3/4 via real convertGoogleMessages
-  const geminiModel: Model<'google-generative-ai'> = {
-    id: 'gemini-3-pro',
-    name: 'Gemini 3 Pro',
-    api: 'google-generative-ai',
-    provider: 'google',
-    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-    reasoning: true,
-    input: ['text'],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 1000000,
-    maxTokens: 16384
-  };
-  const validB64Sig = Buffer.from('valid-gemini-sig').toString('base64');
-  const priorTurn = retireAssistantMessage({
-    ...assistant('prior'),
-    api: 'google-generative-ai',
-    provider: 'google',
-    model: 'gemini-3-pro',
-    content: [
-      {
-        type: 'toolCall',
-        id: 'g_old',
-        name: 'read',
-        arguments: { path: 'old.ts' },
-        thoughtSignature: validB64Sig
-      }
-    ]
-  });
-  const currentRetiredParallel = retireAssistantMessage({
-    ...assistant('parallel'),
-    api: 'google-generative-ai',
-    provider: 'google',
-    model: 'gemini-3-pro',
-    content: [
-      {
-        type: 'toolCall',
-        id: 'g1',
-        name: 'read',
-        arguments: { path: 'a.ts' },
-        thoughtSignature: validB64Sig
-      },
-      { type: 'toolCall', id: 'g2', name: 'bash', arguments: { command: 'ls' } }
-    ]
-  });
-  const currentSignedTurn: AssistantMessage = {
-    ...assistant('signed'),
-    api: 'google-generative-ai',
-    provider: 'google',
-    model: 'gemini-3-pro',
-    content: [
-      {
-        type: 'toolCall',
-        id: 'g3',
-        name: 'read',
-        arguments: { path: 'b.ts' },
-        thoughtSignature: validB64Sig
-      }
-    ]
-  };
-  const contents = convertGoogleMessages(
-    geminiModel,
-    normalizeContext({
-      messages: [
-        user('first prompt'),
-        priorTurn,
-        result('g_old', 'read', 'old'),
-        user('second prompt'),
-        currentRetiredParallel,
-        result('g1', 'read', 'a'),
-        result('g2', 'bash', 'files'),
-        currentSignedTurn,
-        result('g3', 'read', 'b')
-      ]
-    })
-  );
-  const sanitizedGoogle = sanitizeProviderPayload(
-    { model: geminiModel.id, contents },
-    { retiredCallIds: new Set(), hasMutatedHistory: true }
-  ) as { contents: { role: string; parts: Record<string, unknown>[] }[] };
-  // Earlier turn before 'second prompt' stays untouched.
-  assert.equal(sanitizedGoogle.contents[1]!.parts[0]!.thoughtSignature, undefined);
-  // Retired parallel turn in current user turn gets skip_thought_signature_validator ONLY on first functionCall.
-  const parallelModelParts = sanitizedGoogle.contents[4]!.parts;
-  assert.equal(parallelModelParts[0]!.thoughtSignature, GEMINI_SKIP_THOUGHT_SIGNATURE);
-  assert.equal(parallelModelParts[1]!.thoughtSignature, undefined);
-  // Fresh signed turn keeps its real base64 signature.
-  assert.equal(sanitizedGoogle.contents[6]!.parts[0]!.thoughtSignature, validB64Sig);
-
-  // 2. Anthropic budget thinking (`thinking.type === 'enabled'`)
-  const anthropicToolCont = {
-    model: 'claude-sonnet-4-20250514',
-    thinking: { type: 'enabled', budget_tokens: 2048 },
-    betas: ['claude-code-20250219', 'interleaved-thinking-2025-05-14'],
-    messages: [
-      { role: 'user', content: [{ type: 'text', text: 'do work' }] },
-      {
-        role: 'assistant',
-        content: [
-          { type: 'text', text: 'retired thought' },
-          { type: 'tool_use', id: 'tu_1', name: 'fold', input: {} }
-        ]
-      },
-      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'ok' }] }
-    ]
-  };
-  const sanitizedAnth = sanitizeProviderPayload(anthropicToolCont, {
-    retiredCallIds: new Set(),
-    hasMutatedHistory: true
-  }) as Record<string, unknown>;
-  assert.equal('thinking' in sanitizedAnth, false);
-  assert.deepEqual(sanitizedAnth.betas, ['claude-code-20250219']);
-  // Once the assistant finishes that turn and a plain user prompt follows, budget thinking stays enabled.
-  const anthropicNextTurn = {
-    ...anthropicToolCont,
-    messages: [
-      ...anthropicToolCont.messages,
-      { role: 'assistant', content: [{ type: 'text', text: 'all done' }] },
-      { role: 'user', content: 'next question' }
-    ]
-  };
-  assert.equal(
-    sanitizeProviderPayload(anthropicNextTurn, {
-      retiredCallIds: new Set(),
-      hasMutatedHistory: true
-    }),
-    anthropicNextTurn
-  );
-  // Adaptive thinking stays untouched.
-  const anthropicAdaptive = { ...anthropicToolCont, thinking: { type: 'adaptive' } };
-  assert.equal(
-    sanitizeProviderPayload(anthropicAdaptive, {
-      retiredCallIds: new Set(),
-      hasMutatedHistory: true
-    }),
-    anthropicAdaptive
-  );
-
-  // 3. Bedrock Converse budget thinking
-  const bedrockCont = {
-    modelId: 'anthropic.claude-sonnet-4-v1:0',
-    additionalModelRequestFields: {
-      thinking: { type: 'enabled', budget_tokens: 2048 },
-      anthropic_beta: ['interleaved-thinking-2025-05-14']
-    },
-    messages: [
-      { role: 'user', content: [{ text: 'go' }] },
-      { role: 'assistant', content: [{ text: 'retired' }, { toolUse: { toolUseId: 'b1' } }] },
-      { role: 'user', content: [{ toolResult: { toolUseId: 'b1', content: [] } }] }
-    ]
-  };
-  const sanitizedBedrock = sanitizeProviderPayload(bedrockCont, {
-    retiredCallIds: new Set(),
-    hasMutatedHistory: true
-  }) as Record<string, unknown>;
-  assert.equal('additionalModelRequestFields' in sanitizedBedrock, false);
-});
-
-test('forkThreads replays archived fork folds, unfold stubs, historical nested snapshots, and retired call ids', async () => {
+test('forkThreads replays archived fork folds, unfold stubs and historical nested snapshots', async () => {
   const { manager } = session([user('root', 1)]);
   const parentAsstId = manager.appendMessage(
     assistant(call('fk_call', 'fork', { task: 'investigate' }))
@@ -1626,7 +1030,7 @@ test('forkThreads replays archived fork folds, unfold stubs, historical nested s
   assert.equal(await index.find(earlyHandle), undefined);
 
   // 2. Fork thread context() has early-fact restored, early note replaced with [unfolded ...],
-  //    retired turns stripped, and post-unfold turn sig_final preserved!
+  //    and every response that stays as the child received it.
   const forkThread = (await index.find('fk-arch0001'))!;
   const forkCtx = forkThread.context!();
   const forkText = JSON.stringify(forkCtx);
@@ -1638,12 +1042,8 @@ test('forkThreads replays archived fork folds, unfold stubs, historical nested s
     .join('\n');
   assert.ok(!forkResultText.includes('early note'));
   assert.ok(forkResultText.includes(`[unfolded ${earlyHandle}]`));
-  assert.ok(!forkText.includes('sig1'));
+  assert.ok(forkText.includes('sig1'));
   assert.ok(forkText.includes('sig_final'));
-  const retiredIds = forkThread.retiredCallIds!();
-  assert.equal(retiredIds.has('k1'), true);
-  assert.equal(retiredIds.has('k_final'), false);
-  assert.equal(forkThread.hasMutatedHistory!(), true);
 
   // 3. Nested fold ep-mid's historical context() at the time ep-mid ran STILL hides early-fact
   //    and shows early note (because ep-early was unfolded AFTER ep-mid was created!).
@@ -1838,7 +1238,7 @@ test('planUnfold rejects partial span overlap without covers and preserves newer
   assert.equal(r2Restored.content[0]!.text, 'EXT TOOL RESULT [t2]');
 });
 
-test('planFold orders signature retirement before removals and repair-only turn_end retires current response', async () => {
+test('a fold with until edits only its span, and a repair-only turn_end leaves the current response as it is', async () => {
   const { manager } = session([
     user('u1', 1),
     assistant(call('c1', 'bash', { command: 'echo 1' })),
@@ -1857,11 +1257,17 @@ test('planFold orders signature retirement before removals and repair-only turn_
     }
   ]);
   const plan = planFold(manager.buildSessionProjection().entries, 'f1', 2, { until: 2 });
-  // First edit retires surviving assistant signature; remaining edits remove span entries (replacement === null).
-  assert.notEqual(plan.edits[0]!.replacement, null);
-  assert.equal(plan.edits.at(-1)!.replacement, null);
+  // The response that called the fold stays as it is: the edits remove the span, newest first.
+  const spanIds = manager
+    .getBranch()
+    .slice(1, 3)
+    .map((entry) => entry.id);
+  assert.deepEqual(
+    plan.edits,
+    spanIds.reverse().map((targetId) => ({ type: 'context_edit', targetId, replacement: null }))
+  );
 
-  // Live session repair-only turn_end retires current assistant response's signature.
+  // A turn_end that only completes a cut-short fold edits nothing but that fold's span.
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-repair-retire-'));
   const faux = fauxProvider();
   faux.setResponses([
@@ -1912,7 +1318,11 @@ test('planFold orders signature retirement before removals and repair-only turn_
     await agentSession.prompt('finish repair');
     assert.equal(cutShortFold(sm.getBranch()), undefined);
     const projMsgs = sm.buildSessionProjection().messages;
-    assert.equal(JSON.stringify(projMsgs).includes('sig-repair-turn'), false);
+    assert.equal(JSON.stringify(projMsgs).includes('sig-repair-turn'), true);
+    assert.deepEqual(
+      sm.getBranch().flatMap((entry) => (entry.type === 'context_edit' ? [entry.targetId] : [])),
+      [rId, aId]
+    );
   } finally {
     agentSession.dispose();
     await rm(dir, { recursive: true, force: true });
@@ -2097,184 +1507,8 @@ test('episodeStats preserves historical savings accrued before unfold and stops 
   assert.equal(afterUnfold.folds.saved, 1960);
 });
 
-test('Bedrock cachePoint blocks, Anthropic/Bedrock steer continuations, and Chat Completions reasoning preservation', () => {
-  // 1. Bedrock Converse with default prompt caching appends `{ cachePoint: { type: 'default' } }`
-  //    to user messages: active tool continuation omits `thinking`, while a new plain prompt keeps it.
-  const bedrockToolCont = sanitizeProviderPayload(
-    {
-      messages: [
-        { role: 'user', content: [{ text: 'run fold' }, { cachePoint: { type: 'default' } }] },
-        {
-          role: 'assistant',
-          content: [
-            { text: 'folding now' },
-            { toolUse: { toolUseId: 'f1', name: 'fold', input: {} } }
-          ]
-        },
-        {
-          role: 'user',
-          content: [
-            { toolResult: { toolUseId: 'f1', content: [{ text: '[fold]' }], status: 'success' } },
-            { cachePoint: { type: 'default' } }
-          ]
-        }
-      ],
-      additionalModelRequestFields: {
-        thinking: { type: 'enabled', budgetTokens: 2048 },
-        anthropic_beta: ['interleaved-thinking-2025-05-14']
-      }
-    },
-    { retiredCallIds: new Set(), hasMutatedHistory: true }
-  ) as { additionalModelRequestFields?: unknown };
-  assert.equal(bedrockToolCont.additionalModelRequestFields, undefined);
-
-  const bedrockFreshPrompt = sanitizeProviderPayload(
-    {
-      messages: [
-        { role: 'user', content: [{ text: 'run fold' }] },
-        { role: 'assistant', content: [{ text: 'done' }] },
-        { role: 'user', content: [{ text: 'next question' }, { cachePoint: { type: 'default' } }] }
-      ],
-      additionalModelRequestFields: {
-        thinking: { type: 'enabled', budgetTokens: 2048 }
-      }
-    },
-    { retiredCallIds: new Set(), hasMutatedHistory: true }
-  ) as { additionalModelRequestFields?: { thinking?: unknown } };
-  assert.deepEqual(bedrockFreshPrompt.additionalModelRequestFields?.thinking, {
-    type: 'enabled',
-    budgetTokens: 2048
-  });
-
-  // 2. Anthropic steer continuation (`[assistant(tool_use), user([tool_result, text('steer')])]`)
-  const anthropicSteered = sanitizeProviderPayload(
-    {
-      thinking: { type: 'enabled', budget_tokens: 4096 },
-      betas: ['interleaved-thinking-2025-05-14'],
-      messages: [
-        { role: 'user', content: 'start' },
-        { role: 'assistant', content: [{ type: 'tool_use', id: 'f1', name: 'fold', input: {} }] },
-        {
-          role: 'user',
-          content: [
-            { type: 'tool_result', tool_use_id: 'f1', content: 'folded' },
-            { type: 'text', text: 'also check X' }
-          ]
-        }
-      ]
-    },
-    { retiredCallIds: new Set(), hasMutatedHistory: true }
-  ) as { thinking?: unknown; betas?: unknown };
-  assert.equal(anthropicSteered.thinking, undefined);
-  assert.equal(anthropicSteered.betas, undefined);
-
-  // 3. Chat Completions plain field selectors ('reasoning_content', 'reasoning', 'reasoning_text')
-  //    stay intact while cryptographic signatures are retired.
-  const deepseekUnchanged = retireAssistantContent([
-    { type: 'thinking', thinking: 'deepseek chain', thinkingSignature: 'reasoning_content' },
-    { type: 'toolCall', id: 'c1', name: 'bash', arguments: { command: 'ls' } }
-  ]);
-  assert.equal(deepseekUnchanged, undefined);
-
-  // 4. OpenRouter Gemini & Google OpenAI-compat Gemini & OpenRouter Claude Chat Completions payloads
-  const orGemini = sanitizeProviderPayload(
-    {
-      model: 'google/gemini-3-pro-preview',
-      reasoning: { effort: 'high' },
-      messages: [
-        { role: 'user', content: 'fold' },
-        {
-          role: 'assistant',
-          content: 'folding',
-          tool_calls: [
-            { id: 'call_g1', type: 'function', function: { name: 'fold', arguments: '{}' } }
-          ]
-        },
-        { role: 'tool', tool_call_id: 'call_g1', content: '[fold]' }
-      ]
-    },
-    { retiredCallIds: new Set(), hasMutatedHistory: true }
-  ) as { messages: Array<{ reasoning_details?: Array<{ data?: string; id?: string }> }> };
-  assert.equal(
-    orGemini.messages[1]!.reasoning_details?.[0]?.data,
-    'skip_thought_signature_validator'
-  );
-  assert.equal(orGemini.messages[1]!.reasoning_details?.[0]?.id, 'call_g1');
-
-  const compatGemini = sanitizeProviderPayload(
-    {
-      model: 'gemini-3-flash-preview',
-      messages: [
-        { role: 'user', content: 'fold' },
-        {
-          role: 'assistant',
-          tool_calls: [
-            { id: 'call_g2', type: 'function', function: { name: 'fold', arguments: '{}' } }
-          ]
-        },
-        { role: 'tool', tool_call_id: 'call_g2', content: '[fold]' }
-      ]
-    },
-    { retiredCallIds: new Set(), hasMutatedHistory: true }
-  ) as {
-    messages: Array<{
-      tool_calls?: Array<{ extra_content?: { google?: { thought_signature?: string } } }>;
-    }>;
-  };
-  assert.equal(
-    compatGemini.messages[1]!.tool_calls?.[0]?.extra_content?.google?.thought_signature,
-    'skip_thought_signature_validator'
-  );
-
-  const orClaude = sanitizeProviderPayload(
-    {
-      model: 'anthropic/claude-opus-4-6',
-      reasoning: { effort: 'high' },
-      messages: [
-        { role: 'user', content: 'fold' },
-        {
-          role: 'assistant',
-          content: 'folding',
-          tool_calls: [
-            { id: 'call_c1', type: 'function', function: { name: 'fold', arguments: '{}' } }
-          ]
-        },
-        { role: 'tool', tool_call_id: 'call_c1', content: '[fold]' }
-      ]
-    },
-    { retiredCallIds: new Set(), hasMutatedHistory: true }
-  ) as { reasoning?: unknown };
-  assert.equal(orClaude.reasoning, undefined);
-});
-
-test('retiredResponsesCallIds preserves intact (rs_*, fc_*) pairs between two folds while stripping retired turns', () => {
-  const msgs = [
-    {
-      ...assistant('retired-early'),
-      content: [
-        { type: 'thinking' as const, thinking: 'retired thought' },
-        { type: 'toolCall' as const, id: 'c_ret|fc_ret', name: 'bash', arguments: {} }
-      ]
-    },
-    {
-      ...assistant('intact-middle'),
-      content: [
-        {
-          type: 'thinking' as const,
-          thinking: 'intact thought',
-          thinkingSignature: JSON.stringify({ id: 'rs_mid', type: 'reasoning' })
-        },
-        { type: 'toolCall' as const, id: 'c_mid|fc_mid', name: 'bash', arguments: {} }
-      ]
-    }
-  ];
-  const ids = retiredResponsesCallIds(msgs, 0);
-  assert.equal(ids.has('c_ret'), true);
-  assert.equal(ids.has('c_mid'), false);
-});
-
-test('planUnfold retires signatures first, unfoldEditsOf preserves earlier turn_end boundary edits, and Thread exposes appliedFolds', async () => {
-  // 1. planUnfold orders surviving-assistant signature retirement BEFORE span restoration & note stub
+test('planUnfold edits only the span and the note, unfoldEditsOf preserves earlier turn_end boundary edits, and Thread exposes appliedFolds', async () => {
+  // 1. planUnfold restores the span, then replaces the note, and edits no response outside it
   const { manager } = session([
     user('u1', 1),
     assistant(call('c1', 'bash', { command: 'echo SECRET' })),
@@ -2311,7 +1545,15 @@ test('planUnfold retires signatures first, unfoldEditsOf preserves earlier turn_
     ]
   });
   const uPlan = planUnfold(manager.getBranch(), manager.buildSessionProjection().entries, p.handle);
-  assert.equal(uPlan.edits[0]!.targetId, survId);
+  const ids = manager.getBranch().map((entry) => entry.id);
+  assert.deepEqual(
+    uPlan.edits.map((edit) => edit.targetId),
+    [ids[1], ids[2], uPlan.noteEntryId]
+  );
+  assert.equal(
+    uPlan.edits.some((edit) => edit.targetId === survId),
+    false
+  );
 
   // ThreadIndex.find exposes appliedFolds() for historical fold context
   const index = new ThreadIndex(manager, new Map());
@@ -2401,63 +1643,14 @@ test('planUnfold retires signatures first, unfoldEditsOf preserves earlier turn_
       .join('\n');
     assert.ok(toolResultTexts.includes('REDACTED BY EARLIER HOOK'));
     assert.ok(!toolResultTexts.includes('SECRET'));
-    assert.ok(!JSON.stringify(projMsgs).includes('sig-unfold-call'));
+    assert.ok(JSON.stringify(projMsgs).includes('sig-unfold-call'));
   } finally {
     agentSession.dispose();
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test('completeCutShortFolds reconciles interrupted unfold recovery with pending boundary edits and split-message steers', () => {
-  // 1. Split-message steer shape produced by pi-ai (`user([tool_result])` followed by `user(text)`)
-  const anthropicSplitSteer = sanitizeProviderPayload(
-    {
-      thinking: { type: 'enabled', budget_tokens: 4096 },
-      betas: ['interleaved-thinking-2025-05-14'],
-      messages: [
-        { role: 'user', content: 'start' },
-        {
-          role: 'assistant',
-          content: [
-            { type: 'text', text: 'folding' },
-            { type: 'tool_use', id: 'f1', name: 'fold', input: {} }
-          ]
-        },
-        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'f1', content: 'folded' }] },
-        { role: 'user', content: [{ type: 'text', text: 'also check X' }] }
-      ]
-    },
-    { retiredCallIds: new Set(), hasMutatedHistory: true }
-  ) as { thinking?: unknown; betas?: unknown };
-  assert.equal(anthropicSplitSteer.thinking, undefined);
-  assert.equal(anthropicSplitSteer.betas, undefined);
-
-  const bedrockSplitSteer = sanitizeProviderPayload(
-    {
-      messages: [
-        { role: 'user', content: [{ text: 'start' }] },
-        {
-          role: 'assistant',
-          content: [{ text: 'folding' }, { toolUse: { toolUseId: 'f1', name: 'fold', input: {} } }]
-        },
-        {
-          role: 'user',
-          content: [
-            { toolResult: { toolUseId: 'f1', content: [{ text: 'folded' }], status: 'success' } }
-          ]
-        },
-        { role: 'user', content: [{ text: 'also check X' }, { cachePoint: { type: 'default' } }] }
-      ],
-      additionalModelRequestFields: {
-        thinking: { type: 'enabled', budgetTokens: 2048 }
-      }
-    },
-    { retiredCallIds: new Set(), hasMutatedHistory: true }
-  ) as { additionalModelRequestFields?: unknown };
-  assert.equal(bedrockSplitSteer.additionalModelRequestFields, undefined);
-
-  // 2. Interrupted unfold recovery preserves pending boundary replacement on toolResult and retires
-  //    signatures on pending boundary replacement of a restored assistant message!
+test('completeCutShortFolds completes an interrupted unfold and leaves pending boundary edits of restored entries standing', () => {
   const { manager, ids } = session([
     user('u1', 1),
     {
@@ -2492,7 +1685,7 @@ test('completeCutShortFolds reconciles interrupted unfold recovery with pending 
   applyDrafts(manager, p.edits);
   manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: p.handle });
 
-  // Add surviving signed assistant message so uPlan.edits[0] is its retirement, then interrupt after edits[0]!
+  // A later response, which the unfold does not touch; the unfold is cut short after one edit.
   manager.appendMessage({
     ...assistant('surv'),
     content: [
@@ -2506,7 +1699,7 @@ test('completeCutShortFolds reconciles interrupted unfold recovery with pending 
   assert.equal(cutShortFold(manager.getBranch()), p.handle);
 
   // At recovery boundary, an earlier hook passes pending replacements on BOTH the restored toolResult
-  // AND the restored assistant message (with a fresh stale signature)!
+  // AND the restored assistant message.
   const pendingBoundary = [
     {
       type: 'context_edit' as const,
@@ -2532,9 +1725,12 @@ test('completeCutShortFolds reconciles interrupted unfold recovery with pending 
   assert.ok(projText.includes('REDACTED BY EARLIER HOOK'));
   assert.ok(!projText.includes('SECRET'));
   assert.ok(projText.includes('hook-t'));
-  assert.ok(!projText.includes('sig-from-hook'));
+  assert.ok(projText.includes('sig-from-hook'));
+  assert.ok(projText.includes('sig-surv'));
+  assert.ok(projText.includes(`[unfolded ${p.handle}]`));
 });
-test('running fork callingFork and prefixEntryId integrate with nested unfold and retired signatures', async () => {
+
+test('running fork callingFork and prefixEntryId integrate with nested unfold', async () => {
   const { manager, ids } = session([
     user('parent start', 1),
     assistant(call('p1', 'bash', { command: 'echo p' })),
@@ -2628,8 +1824,7 @@ test('running fork callingFork and prefixEntryId integrate with nested unfold an
   const foundFolded = await idxFolded.find(childHandle);
   assert.notEqual(foundFolded, undefined);
   assert.equal(foundFolded!.appliedFolds!().has(parPlan.handle), true);
-  assert.equal(foundFolded!.hasMutatedHistory!(), true);
-  assert.equal(foundFolded!.retiredCallIds!().has('f_par'), true);
+  assert.ok(JSON.stringify(foundFolded!.context!()).includes('rs_p'));
 
   // Now the running fork unfolds childHandle: it disappears from running ThreadIndex!
   childMsgs.push(assistant(call('cu1|fc_cu1', 'unfold', { handle: childHandle })));

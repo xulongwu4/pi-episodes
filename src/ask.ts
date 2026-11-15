@@ -66,8 +66,6 @@ export function registerAsk(pi: ExtensionAPI, state: EpisodeState): void {
           { messages: convertToLlm(messages) },
           requestOptions(pi, ctx, messages, signal, {
             includeBranch: false,
-            retiredCallIds: thread.retiredCallIds,
-            hasMutatedHistory: thread.hasMutatedHistory,
             extraApplied: thread.appliedFolds
           })
         )

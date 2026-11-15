@@ -92,13 +92,6 @@ function signedAssistant(id: string, toolCall: ReturnType<typeof call>): Assista
   };
 }
 
-function hasLiveSignature(message: AgentMessage): boolean {
-  if (message.role !== 'assistant') return false;
-  return message.content.some(
-    (block) => block.type === 'thinking' && Boolean(block.thinkingSignature)
-  );
-}
-
 type Step = (context: TranscriptContext) => AssistantMessage | Promise<AssistantMessage>;
 
 async function createLiveSession(
@@ -272,8 +265,7 @@ test('planFoldBatch sorts disjoint spans chronologically, retains interior gaps,
   assert.deepEqual(batch.keptUserTurns, ['t3']);
   assert.equal(batch.open, 'test edge case');
 
-  // Every prefix of batch.edits never orphans a toolResult AND never leaves a live signature
-  // after an already-mutated entry.
+  // No prefix of batch.edits leaves a toolResult without its call.
   for (let k = 0; k <= batch.edits.length; k++) {
     const { manager: copy, ids: copyIds } = session([
       user('initial prompt', 1),
@@ -292,30 +284,20 @@ test('planFoldBatch sorts disjoint spans chronologically, retains interior gaps,
       signedAssistant('fold_caller', call('f1', 'fold', {}))
     ]);
     const idMap = new Map(ids.map((orig, idx) => [orig, copyIds[idx]!]));
-    let earliestMutatedNonAssistant = Infinity;
     for (const edit of batch.edits.slice(0, k)) {
-      const idx = ids.indexOf(edit.targetId);
-      if (edit.replacement === null || idx === 3) {
-        earliestMutatedNonAssistant = Math.min(earliestMutatedNonAssistant, idx);
-      }
       copy.appendContextEdit(idMap.get(edit.targetId)!, edit.replacement);
     }
     copy.appendMessage(result('f1', 'fold', 'batch note', 9));
     const proj = copy.buildSessionProjection();
     assertResultsHaveCallers(proj.messages, `prefix ${k}`);
-    if (earliestMutatedNonAssistant < Infinity) {
-      for (const entry of proj.entries) {
-        const origIdx = copyIds.indexOf(entry.sourceEntry.id);
-        if (origIdx > earliestMutatedNonAssistant && entry.messages[0]) {
-          assert.equal(
-            hasLiveSignature(entry.messages[0]),
-            false,
-            `prefix ${k}: surviving assistant at index ${origIdx} still had live signature`
-          );
-        }
-      }
-    }
   }
+
+  // The edits are those of the two spans, newest first; what stands before, between and after
+  // the spans is not edited.
+  assert.deepEqual(
+    batch.edits.map((edit) => ids.indexOf(edit.targetId)),
+    [12, 11, 10, 9, 5, 4, 3, 2, 1]
+  );
 });
 
 test('live session batch fold retires disjoint spans, excludes interior gaps from recall/files, tracks stats once, and unfolds cleanly', async () => {
@@ -2063,8 +2045,8 @@ test('R2-5 (monotonic crash-prefix edit ordering & spilled staleness): newest-to
       'all readEdits must appear at the very end'
     );
 
-    // Verify both interior-gap assistants (sig_gap_early removal + sig_gap_late failed-arg trim) are in nonReadEdits
-    // AND every consecutive pair in nonReadEdits has strictly decreasing branchIndex!
+    // Every consecutive pair in nonReadEdits (span removals and the failed-arg trim) has strictly
+    // decreasing branchIndex.
     const indices = nonReadEdits.map((e) => indexById.get(e.targetId) ?? -1);
     for (let i = 1; i < indices.length; i++) {
       assert.ok(
@@ -2073,13 +2055,13 @@ test('R2-5 (monotonic crash-prefix edit ordering & spilled staleness): newest-to
       );
     }
 
-    // Verify failed-arg trim actually happened on t5 alongside redacted thinking removal on t4:
-    const trimmedGapLate = nonReadEdits.some(
-      (e) =>
-        e.replacement !== null &&
-        JSON.stringify(e.replacement.content).includes('characters omitted from failed bash call')
-    );
-    assert.equal(trimmedGapLate, true, 'expected interior-gap failed-arg trim edit');
+    // The failed-arg trim happened on t5 and left the rest of that response as it was; no other
+    // response outside the spans was edited.
+    const kept = nonReadEdits.filter((e) => e.replacement !== null);
+    assert.equal(kept.length, 1, 'expected the failed-arg trim as the only non-removal edit');
+    const trimmed = JSON.stringify(kept[0]!.replacement!.content);
+    assert.ok(trimmed.includes('characters omitted from failed bash call'));
+    assert.ok(trimmed.includes('sig_gap_late'));
   } finally {
     await hOrder.cleanup();
   }

@@ -230,9 +230,7 @@ export function registerFork(pi: ExtensionAPI, state: EpisodeState, registry: Fo
       });
       // The child's view changes as it folds; the cache anchor follows its latest note.
       const options = requestOptions(pi, ctx, () => folds.view(agent.state.messages), undefined, {
-        retiredCallIds: () => folds.retiredCallIds(agent.state.messages),
-        extraApplied: () => folds.activeHandles(),
-        hasMutatedHistory: () => folds.hasMutated
+        extraApplied: () => folds.activeHandles()
       });
       // The agent loop passes its own settings, but not these.
       const limits: Pick<typeof options, 'timeoutMs' | 'maxRetries'> = {};

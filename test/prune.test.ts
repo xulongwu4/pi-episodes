@@ -338,7 +338,7 @@ test('capped read deduplication verifies full archived files and skips middle-li
   }
 });
 
-test('failed tool argument pruning enforces age threshold, preserves structure/paths/siblings/grammar strings, and composes with signature retirement', () => {
+test('failed tool argument pruning enforces age threshold, preserves structure/paths/siblings/grammar strings, and leaves signatures as they are', () => {
   assert.equal(ERROR_PRUNE_AFTER_TURNS, 3);
   const hugeCode = `const payload = "${'x'.repeat(ERROR_ARG_MIN_CHARS + 200)}";`;
   const hugeWrite = 'y'.repeat(ERROR_ARG_MIN_CHARS + 300);
@@ -426,10 +426,10 @@ test('failed tool argument pruning enforces age threshold, preserves structure/p
   const blocks = tailPlan.assistantReplacements.get(ids[3]!)!;
   const thinking = blocks[0] as ThinkingContent;
   assert.equal(thinking.type, 'thinking');
-  assert.equal('thinkingSignature' in thinking, false);
+  assert.equal(thinking.thinkingSignature, '{"id":"rs_old","type":"reasoning"}');
 
   const errWrite = blocks[1] as ToolCall;
-  assert.equal('thoughtSignature' in errWrite, false);
+  assert.equal(errWrite.thoughtSignature, 'sig_w1');
   assert.equal(errWrite.arguments.path, 'src/target.ts');
   assert.match(
     String(errWrite.arguments.content),
@@ -440,7 +440,7 @@ test('failed tool argument pruning enforces age threshold, preserves structure/p
   assert.match(String(nested.bigPatch), /^\[\d+ characters omitted from failed write call\]$/);
 
   const okWrite = blocks[2] as ToolCall;
-  assert.equal('thoughtSignature' in okWrite, false);
+  assert.equal(okWrite.thoughtSignature, 'sig_w2');
   assert.equal(okWrite.arguments.content, hugeWrite);
 
   const errCm = blocks[3] as ToolCall;
@@ -1432,8 +1432,8 @@ test('double crash persists recovery-segment markers, restores episodes edits, a
   assert.ok(unfoldedMsgs.some((m) => text(m).includes('[external note on t6]')));
 });
 
-test('recovery retires signed intervening resumed assistants before removals and never claims external edits before an empty completion marker', () => {
-  // 1. Signed intervening resumed assistant Turn A must be retired BEFORE recovery removes earlier history.
+test('recovery edits no response written since the fold began and never claims external edits before an empty completion marker', () => {
+  // 1. A response written between the cut-short fold and its recovery stays as it is.
   {
     const { manager } = session([
       user('start', 1),
@@ -1474,15 +1474,18 @@ test('recovery retires signed intervening resumed assistants before removals and
     manager.appendMessage(user('resumed B', 5));
     const rec = completeCutShortFolds(manager.getBranch());
     const editTargets = rec.flatMap((d) => (d.type === 'context_edit' ? [d.targetId] : []));
-    // Turn A must be retired BEFORE any history removal in plan.edits!
-    assert.equal(editTargets[0], turnAId);
+    assert.deepEqual(
+      editTargets,
+      plan.edits.map((edit) => edit.targetId)
+    );
+    assert.equal(editTargets.includes(turnAId), false);
     for (const item of rec) {
       if (item.type === 'context_edit') manager.appendContextEdit(item.targetId, item.replacement);
       else manager.appendCustomEntry(item.customType, item.data);
     }
     const projStr = JSON.stringify(manager.buildSessionProjection().messages);
-    assert.equal(projStr.includes('sig-turn-A'), false);
-    assert.equal(projStr.includes('txt-sig-A'), false);
+    assert.equal(projStr.includes('sig-turn-A'), true);
+    assert.equal(projStr.includes('txt-sig-A'), true);
   }
 
   // 2. Empty recovery (`rest.length === 0`) immediately following external identical `targetId -> null` edits

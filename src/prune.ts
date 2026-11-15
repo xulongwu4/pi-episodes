@@ -8,7 +8,6 @@ import {
 import { FOLD_TOOL, FORK_TOOL, UNFOLD_TOOL } from './archive.js';
 import { absolutePath } from './messages.js';
 import { type ReadPayloadCoverage, verifyCompleteRead } from './output.js';
-import { retireAssistantContent } from './retire.js';
 import { isStampBlock, readStamp, stampLabel, withStamp } from './stamps.js';
 
 /** Surviving assistant turns after a failed call required before trimming its large arguments. */
@@ -442,8 +441,7 @@ export function planFoldTailPruning(options: FoldTailPruneOptions): FoldTailPrun
       };
     });
     if (!modified) continue;
-    const retired = retireAssistantContent(nextBlocks) ?? nextBlocks;
-    assistantReplacements.set(item.entryId, retired);
+    assistantReplacements.set(item.entryId, nextBlocks);
   }
 
   return { assistantReplacements, readEdits, readDeps };

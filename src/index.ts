@@ -16,14 +16,7 @@ import { cacheAnchor, placeAnchor } from './cache.js';
 import { registerCompactionNotice } from './compaction.js';
 import { registerStampDisplay } from './display.js';
 import { recordEvent, recordMeta } from './events.js';
-import {
-  besideNote,
-  branchHasMutatedHistory,
-  branchRetiredResponsesCallIds,
-  codemodeOnly,
-  registerFold,
-  sanitizeProviderPayload
-} from './fold.js';
+import { besideNote, codemodeOnly, registerFold } from './fold.js';
 import { registerFork } from './fork.js';
 import { ForkRegistry, registerForksView } from './forks-view.js';
 import { absolutePath, type FileTouch, fileTouch, withFiles } from './messages.js';
@@ -119,18 +112,15 @@ export default function episodes(pi: ExtensionAPI): void {
   // The anchor comes from the model's view, not the raw branch: after a compaction the
   // newest stamped user message may only exist in the summary.
   pi.on('before_provider_request', (event, ctx) => {
-    const branch = ctx.sessionManager.getBranch();
-    const projection = ctx.sessionManager.buildSessionProjection();
-    const sanitized = sanitizeProviderPayload(event.payload, {
-      retiredCallIds: branchRetiredResponsesCallIds(branch, projection.entries),
-      hasMutatedHistory: branchHasMutatedHistory(branch, projection.entries)
-    });
     const anchor = episodesSettings(pi.getSettings()).cacheAnchor
-      ? cacheAnchor(projection.messages, appliedFolds(branch))
+      ? cacheAnchor(
+          ctx.sessionManager.buildSessionProjection().messages,
+          appliedFolds(ctx.sessionManager.getBranch())
+        )
       : undefined;
-    const placed = placeAnchor(sanitized, anchor);
+    const placed = placeAnchor(event.payload, anchor);
     state.anchorPlaced = placed.placed;
-    return placed.payload ?? (sanitized !== event.payload ? sanitized : undefined);
+    return placed.payload;
   });
 
   // A snapshot still being written must not see the changes of the next tool call.

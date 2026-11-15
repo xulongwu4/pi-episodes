@@ -12,12 +12,6 @@ import {
   sessionEntryToContextMessages
 } from '@earendil-works/pi-coding-agent';
 import type { ArchivedImage } from './images.js';
-import {
-  branchHasMutatedHistory,
-  branchRetiredResponsesCallIds,
-  retireAssistantMessage,
-  retiredResponsesCallIds
-} from './retire.js';
 import { readStamp, stampLabel, withStamp } from './stamps.js';
 
 export type SessionView = ExtensionContext['sessionManager'];
@@ -234,10 +228,6 @@ export interface NestedFold {
   createdAt?: number;
   /** Child message count when this fold was unfolded. */
   unfoldedAt?: number;
-  /** Child assistant message indices whose replay signatures were retired by this fold. */
-  retired?: number[];
-  /** Child assistant message indices whose replay signatures were retired when unfolded. */
-  unfoldRetired?: number[];
 }
 
 export function foldSpans(fold: FoldDetails): readonly FoldSpanDetails[] {
@@ -298,42 +288,25 @@ function isNestedFoldUnfoldedAt(fold: NestedFold, stateAt: number): boolean {
   return Boolean(fold.unfolded);
 }
 
-/** Replays child fork messages at `stateAt` (up to `messageLimit`), applying omits, unfold stubs, and bounded signature retirement. */
+/** Replays child fork messages at `stateAt` (up to `messageLimit`), applying omits and unfold stubs. */
 export function replayForkMessages(
   messages: readonly AgentMessage[],
   folds: readonly NestedFold[],
   options: { messageLimit?: number; stateAt?: number } = {}
-): { messages: AgentMessage[]; retiredCallIds: Set<string>; mutated: boolean } {
+): AgentMessage[] {
   const limit = Math.min(options.messageLimit ?? messages.length, messages.length);
   const stateAt = options.stateAt ?? messages.length;
   const relevant = folds.filter((fold) => (fold.createdAt ?? 0) <= stateAt);
   const omitted = new Set<number>();
   const unfoldedHandles = new Set<string>();
-  const retiredSet = new Set<number>();
   for (const fold of relevant) {
-    const unfolded = isNestedFoldUnfoldedAt(fold, stateAt);
-    if (unfolded) {
+    if (isNestedFoldUnfoldedAt(fold, stateAt)) {
       unfoldedHandles.add(fold.record.handle);
     } else {
       for (const idx of fold.omit) omitted.add(idx);
     }
-    if (fold.retired !== undefined) {
-      for (const idx of fold.retired) retiredSet.add(idx);
-    } else {
-      const end = fold.createdAt ?? messages.length;
-      for (let idx = fold.first; idx < end; idx++) retiredSet.add(idx);
-    }
-    if (unfolded) {
-      if (fold.unfoldRetired !== undefined) {
-        for (const idx of fold.unfoldRetired) retiredSet.add(idx);
-      } else {
-        const end = fold.unfoldedAt ?? stateAt;
-        for (let idx = fold.first; idx < end; idx++) retiredSet.add(idx);
-      }
-    }
   }
   const out: AgentMessage[] = [];
-  const retiredCallIds = new Set<string>();
   for (let index = 0; index < limit; index++) {
     if (omitted.has(index)) continue;
     let current = messages[index]!;
@@ -347,13 +320,10 @@ export function replayForkMessages(
           content: stamp === undefined ? [{ type: 'text', text: marker }] : withStamp(marker, stamp)
         };
       }
-    } else if (current.role === 'assistant' && retiredSet.has(index)) {
-      current = retireAssistantMessage(current);
-      for (const id of retiredResponsesCallIds([current])) retiredCallIds.add(id);
     }
     out.push(current);
   }
-  return { messages: out, retiredCallIds, mutated: relevant.length > 0 };
+  return out;
 }
 
 export interface ForkArchive {
@@ -390,10 +360,6 @@ export interface Thread {
    */
   context?: () => AgentMessage[];
   record: ThreadRecord;
-  /** Responses `call_id` values retired inside `context()`, for `ask` wire replay. */
-  retiredCallIds?: () => ReadonlySet<string>;
-  /** Whether `context()` replays a prefix mutated by a fold, unfold, or context edit. */
-  hasMutatedHistory?: () => boolean;
   /** Applied fold handles visible inside `context()`, for cache breakpoint placement in `ask`. */
   appliedFolds?: () => ReadonlySet<string>;
 }
@@ -836,20 +802,6 @@ export class ThreadIndex {
         while (isFoldRequest(messages.at(-1))) messages.pop();
         return messages;
       },
-      retiredCallIds: () => {
-        const leafId = note?.id ?? fold.lastEntryId;
-        return branchRetiredResponsesCallIds(
-          this.sessions.getBranch(leafId),
-          buildSessionProjection(this.sessions.getEntries(), leafId).entries
-        );
-      },
-      hasMutatedHistory: () => {
-        const leafId = note?.id ?? fold.lastEntryId;
-        return branchHasMutatedHistory(
-          this.sessions.getBranch(leafId),
-          buildSessionProjection(this.sessions.getEntries(), leafId).entries
-        );
-      },
       appliedFolds: () => appliedFolds(this.sessions.getBranch(note?.id ?? fold.lastEntryId)),
       record: fold
     };
@@ -870,18 +822,8 @@ export class ThreadIndex {
         handle: fork.handle,
         kind: 'fork',
         label: `fork: ${fork.task.slice(0, 80)}`,
-        messages: finalReplay.messages,
-        context: () => [...this.forkPrefix(archive), ...finalReplay.messages],
-        retiredCallIds: () => {
-          const { branch, proj } = this.forkParentState(archive);
-          const ids = branchRetiredResponsesCallIds(branch, proj.entries);
-          for (const id of finalReplay.retiredCallIds) ids.add(id);
-          return ids;
-        },
-        hasMutatedHistory: () => {
-          const { branch, proj } = this.forkParentState(archive);
-          return finalReplay.mutated || branchHasMutatedHistory(branch, proj.entries);
-        },
+        messages: finalReplay,
+        context: () => [...this.forkPrefix(archive), ...finalReplay],
         appliedFolds: () => {
           const active = appliedFolds(this.forkParentState(archive).branch);
           for (const nested of folds) {
@@ -962,17 +904,7 @@ export class ThreadIndex {
         ...(segments.length > 1 ? { segments } : {}),
         ...(childMessageSpanIndex.length > 0 ? { messageSpanIndex: childMessageSpanIndex } : {}),
         // What the child saw when it folded: its earlier folds at `snapAt`, this one not yet.
-        context: () => [...this.forkPrefix(archive), ...snapReplay().messages],
-        retiredCallIds: () => {
-          const { branch, proj } = this.forkParentState(archive);
-          const ids = branchRetiredResponsesCallIds(branch, proj.entries);
-          for (const id of snapReplay().retiredCallIds) ids.add(id);
-          return ids;
-        },
-        hasMutatedHistory: () => {
-          const { branch, proj } = this.forkParentState(archive);
-          return snapReplay().mutated || branchHasMutatedHistory(branch, proj.entries);
-        },
+        context: () => [...this.forkPrefix(archive), ...snapReplay()],
         appliedFolds: () => {
           const active = appliedFolds(this.forkParentState(archive).branch);
           for (const other of folds.slice(0, order)) {

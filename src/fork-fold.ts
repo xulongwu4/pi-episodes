@@ -16,8 +16,6 @@ import {
   planFoldBatch,
   renderCovered,
   renderNote,
-  retireAssistantMessage,
-  retiredResponsesCallIds,
   writtenMark
 } from './fold.js';
 import { carriedMediaBlocks, FOLD_ABORTED_MESSAGE, prepareCarriedMedia } from './images.js';
@@ -44,8 +42,6 @@ export class ForkFolds {
   private readonly omitted = new Set<AgentMessage>();
   private readonly replaced = new Map<AgentMessage, (TextContent | ImageContent)[]>();
   private readonly applied = new Set<string>();
-  /** Child assistant message indices whose replay signatures were retired by an earlier fold/unfold. */
-  private readonly retiredIndices = new Set<number>();
 
   constructor(options: {
     forkHandle: string;
@@ -73,40 +69,19 @@ export class ForkFolds {
     return this.applied;
   }
 
-  /** Whether any fold or unfold has mutated this child's history. */
-  get hasMutated(): boolean {
-    return this.retiredIndices.size > 0 || this.folds.length > 0;
-  }
-
-  /** What the child sees: everything but the spans it folded, with stale replay signatures retired. */
+  /** What the child sees: everything but the spans it folded. */
   view(messages: readonly AgentMessage[]): AgentMessage[] {
     const out: AgentMessage[] = [];
-    for (let i = 0; i < messages.length; i++) {
-      const message = messages[i]!;
+    for (const message of messages) {
       if (this.omitted.has(message)) continue;
-      const ownIndex = i - this.prefixLength;
       const noteReplacement = this.replaced.get(message);
-      let current: AgentMessage =
+      out.push(
         noteReplacement && message.role === 'toolResult'
           ? { ...message, content: noteReplacement }
-          : message;
-      if (ownIndex >= 0 && this.retiredIndices.has(ownIndex) && current.role === 'assistant') {
-        current = retireAssistantMessage(current);
-      }
-      out.push(current);
+          : message
+      );
     }
     return out;
-  }
-
-  /** Responses `call_id` values from retired child assistant turns (excluding turns added after the latest edit). */
-  retiredCallIds(messages: readonly AgentMessage[]): Set<string> {
-    const ids = new Set<string>();
-    for (const ownIndex of this.retiredIndices) {
-      const message = messages[this.prefixLength + ownIndex];
-      if (!message || this.omitted.has(message) || message.role !== 'assistant') continue;
-      for (const id of retiredResponsesCallIds([retireAssistantMessage(message)])) ids.add(id);
-    }
-    return ids;
   }
 
   /** Stamps a child tool result in place, before the loop sends it. */
@@ -133,13 +108,10 @@ export class ForkFolds {
       const ownIndex = index - this.siblings;
       const id = sibling ? `${this.forkHandle}/s${index}` : `${this.forkHandle}/${ownIndex}`;
       const noteReplacement = this.replaced.get(message);
-      let projected: AgentMessage =
+      const projected: AgentMessage =
         noteReplacement && message.role === 'toolResult'
           ? { ...message, content: noteReplacement }
           : message;
-      if (!sibling && this.retiredIndices.has(ownIndex) && projected.role === 'assistant') {
-        projected = retireAssistantMessage(projected);
-      }
       const sourceEntry = {
         type: 'message',
         id,
@@ -150,20 +122,6 @@ export class ForkFolds {
       return { sourceEntry, messages: this.omitted.has(message) ? [] : [projected] };
     });
     return [...this.parentEntries, ...own];
-  }
-
-  private collectRetiredFrom(
-    ownMessages: readonly AgentMessage[],
-    startOwnIndex: number
-  ): number[] {
-    const retired: number[] = [];
-    for (let idx = Math.max(0, startOwnIndex); idx < ownMessages.length; idx++) {
-      const message = ownMessages[idx];
-      if (!message || this.omitted.has(message) || message.role !== 'assistant') continue;
-      this.retiredIndices.add(idx);
-      retired.push(idx);
-    }
-    return retired;
   }
 
   private async fold(
@@ -185,7 +143,7 @@ export class ForkFolds {
     });
 
     // Archive covered-note media once for the combined batch before mutating any ForkFolds
-    // state so errors or cancellation leave omitted/retired/applied/folds untouched.
+    // state so errors or cancellation leave omitted/applied/folds untouched.
     const prepared = await prepareCarriedMedia(batch.handle, batch.media, this.archiveDir, signal);
     if (signal?.aborted) throw new Error(FOLD_ABORTED_MESSAGE);
 
@@ -193,8 +151,7 @@ export class ForkFolds {
     const index = (id: string) => Number(id.slice(this.forkHandle.length + 1));
     const omit: number[] = [];
     for (const edit of batch.edits) {
-      // Children have no user messages, so a fold only omits span entries (and retires assistant
-      // signatures through `mutatedFrom` below).
+      // Children have no user messages, so a fold only omits span entries.
       if (edit.replacement !== null) continue;
       const ownIndex = index(edit.targetId);
       const message = ownMessages[ownIndex];
@@ -208,7 +165,6 @@ export class ForkFolds {
       first: index(span.firstEntryId),
       last: index(span.lastEntryId)
     }));
-    const retired = this.collectRetiredFrom(ownMessages, firstIndex);
     this.applied.add(batch.handle);
 
     const spanDetails: FoldSpanDetails[] = batch.spans.map((span) => {
@@ -267,8 +223,7 @@ export class ForkFolds {
       last: lastIndex,
       ...(childSpans.length > 1 ? { spans: childSpans } : {}),
       omit,
-      createdAt: ownMessages.length,
-      retired
+      createdAt: ownMessages.length
     });
 
     const content = [
@@ -364,7 +319,6 @@ export class ForkFolds {
         stamp === undefined ? [{ type: 'text', text: marker }] : withStamp(marker, stamp)
       );
     }
-    nested.unfoldRetired = this.collectRetiredFrom(ownMessages, nested.first);
     const record = nested.record;
     const range = formatFoldRange(record);
     return {

@@ -53,10 +53,6 @@ import {
   touchedPaths
 } from './messages.js';
 import { completeReadBlocks } from './output.js';
-import { retireAssistantContent } from './retire.js';
-
-export * from './retire.js';
-
 import { planFoldTailPruning, type ReadPruneDependency } from './prune.js';
 
 export * from './prune.js';
@@ -813,12 +809,6 @@ export function completeCutShortFolds(
     }
 )[] {
   const branchById = new Map(branch.map((entry) => [entry.id, entry]));
-  const assistantBlocks = (replacement: unknown): AssistantMessage['content'] | undefined => {
-    if (!replacement || typeof replacement !== 'object') return undefined;
-    const raw = (replacement as { content?: unknown }).content;
-    if (typeof raw === 'string') return [{ type: 'text', text: raw }];
-    return Array.isArray(raw) ? (raw as AssistantMessage['content']) : [];
-  };
   const effectiveReplacement = (targetId: string): unknown => {
     const source = branchById.get(targetId);
     const base = source ? defaultEntryContent(source) : undefined;
@@ -886,17 +876,7 @@ export function completeCutShortFolds(
       const newer = latestRaw.get(edit.targetId);
       if (JSON.stringify(newer) === JSON.stringify(edit.replacement)) return [];
       const source = branchById.get(edit.targetId);
-      if (kind === 'fold') {
-        if (edit.replacement === null) return [edit];
-        if (source?.type === 'message' && source.message.role === 'assistant') {
-          const blocks = assistantBlocks(newer);
-          const retired = blocks ? retireAssistantContent(blocks) : undefined;
-          return retired
-            ? [{ type: 'context_edit', targetId: edit.targetId, replacement: { content: retired } }]
-            : [];
-        }
-        return [];
-      }
+      if (kind === 'fold') return edit.replacement === null ? [edit] : [];
       const noteRecord = source?.type === 'message' ? foldNoteDetails(source.message) : undefined;
       if (noteRecord?.handle === handle) {
         const pendingNote = editedContent(edit.targetId, branch, pending);
@@ -911,48 +891,16 @@ export function completeCutShortFolds(
         }
         return [];
       }
-      if (source?.type === 'message' && source.message.role === 'assistant') {
-        const blocks = assistantBlocks(newer);
-        const retired = blocks ? retireAssistantContent(blocks) : undefined;
-        return retired
-          ? [{ type: 'context_edit', targetId: edit.targetId, replacement: { content: retired } }]
-          : [];
-      }
       return [];
     });
     if (rest.length === 0) return [marker];
-    const restTargets = new Set(rest.map((edit) => edit.targetId));
-    const interveningRetires: ContextEditEntryDraft[] = [];
-    for (let m = branch.length - 1; m > index; m--) {
-      const step = branch[m]!;
-      if (
-        step.type !== 'message' ||
-        step.message.role !== 'assistant' ||
-        restTargets.has(step.id) ||
-        laterRemovals.has(step.id)
-      ) {
-        continue;
-      }
-      const current = effectiveReplacement(step.id);
-      if (!current) continue;
-      const blocks = assistantBlocks(current);
-      const retired = blocks ? retireAssistantContent(blocks) : undefined;
-      if (retired) {
-        interveningRetires.push({
-          type: 'context_edit',
-          targetId: step.id,
-          replacement: { content: retired }
-        });
-      }
-    }
-    const finalRest = [...interveningRetires, ...rest];
     return [
       {
         type: 'custom' as const,
         customType: FOLD_RECOVERY_STARTED_TYPE,
-        data: { kind, handle, edits: finalRest }
+        data: { kind, handle, edits: rest }
       },
-      ...finalRest,
+      ...rest,
       marker
     ];
   });
@@ -1173,26 +1121,9 @@ export function planFold(
     }
   }
 
-  // Pi writes these edits one entry at a time, so a crash can apply only some of them. Retiring
-  // surviving assistant signatures first ensures no mutated prefix ever coexists with unretired
-  // signatures, and removing the span from its end keeps every intermediate prefix valid.
+  // Pi writes these edits one entry at a time, so a crash can apply only some of them.
+  // Removing the span from its end keeps every intermediate prefix valid.
   edits.reverse();
-  const retireEdits: ContextEditEntryDraft[] = [];
-  for (let index = endIndex; index < entries.length; index++) {
-    const entry = entries[index]!;
-    if (entry.messages.length === 0) continue;
-    const shown = entry.messages[0];
-    if (shown?.role !== 'assistant') continue;
-    const retired = retireAssistantContent(shown.content);
-    if (retired) {
-      retireEdits.push({
-        type: 'context_edit',
-        targetId: entry.sourceEntry.id,
-        replacement: { content: retired }
-      });
-    }
-  }
-  edits.unshift(...retireEdits);
 
   let anchorStamp: number | undefined;
   for (let index = startIndex - 1; index >= 0 && anchorStamp === undefined; index--) {
@@ -1384,8 +1315,7 @@ export function mergeSpanDiskChanges(
 /**
  * Resolves one or more non-overlapping spans against the pre-call projection, sorts them
  * chronologically, rejects overlaps after turn-boundary expansion, and composes one crash-safe
- * edit sequence (surviving downstream assistant signature retirements newest-first, followed by
- * selected span removals/caps in reverse chronological order).
+ * edit sequence (span removals and cuts, newest first).
  */
 export function planFoldBatch(
   entries: readonly ProjectedSessionEntry[],
@@ -1446,24 +1376,6 @@ export function planFoldBatch(
   const selectedIndices = new Set<number>();
   for (const item of resolved) {
     for (let idx = item.startIndex; idx < item.endIndex; idx++) selectedIndices.add(idx);
-  }
-
-  const retireEdits: ContextEditEntryDraft[] = [];
-  for (let idx = entries.length - 1; idx >= resolved[0]!.endIndex; idx--) {
-    if (selectedIndices.has(idx)) continue;
-    const entry = entries[idx]!;
-    if (entry.messages.length === 0) continue;
-    const shown = entry.messages[0];
-    if (shown?.role === 'assistant') {
-      const retired = retireAssistantContent(shown.content);
-      if (retired) {
-        retireEdits.push({
-          type: 'context_edit',
-          targetId: entry.sourceEntry.id,
-          replacement: { content: retired }
-        });
-      }
-    }
   }
 
   const selectedSpanEdits: ContextEditEntryDraft[] = [];
@@ -1631,7 +1543,7 @@ export function planFoldBatch(
     media,
     edits: (() => {
       const entryIndexById = new Map(entries.map((entry, idx) => [entry.sourceEntry.id, idx]));
-      return [...retireEdits, ...selectedSpanEdits].sort(
+      return selectedSpanEdits.sort(
         (a, b) => (entryIndexById.get(b.targetId) ?? -1) - (entryIndexById.get(a.targetId) ?? -1)
       );
     })()
@@ -2118,8 +2030,7 @@ export function planUnfold(
         continue;
       }
       // Unfold batch: keep its `[unfolded ...]` stub on its own note (while still unfolded);
-      // skip span/tail restorations so active folds and external edits win, while assistant
-      // signature retirement is enforced on `finalDesired` below.
+      // skip span/tail restorations so active folds and external edits win.
       const isUnfoldedStub =
         !remaining.has(owner.handle) && target.id === noteEntryIdByHandle.get(owner.handle);
       if (isUnfoldedStub) {
@@ -2148,10 +2059,6 @@ export function planUnfold(
   const byId = new Map(projection.map((entry) => [entry.sourceEntry.id, entry]));
   const restoreEdits: ContextEditEntryDraft[] = [];
   const tailRestoreEdits: ContextEditEntryDraft[] = [];
-  const postSpanAssistantRestores = new Map<
-    string,
-    NonNullable<ContextEditEntryDraft['replacement']>
-  >();
 
   // Restore span entries in forward order so each assistant turn returns before its toolResults,
   // plus any post-span entries that this fold pruned.
@@ -2165,14 +2072,6 @@ export function planUnfold(
     if (!editable) continue;
     const desired = desiredWithoutOwn(entry);
     if (desired === undefined) continue;
-    let finalDesired = desired;
-    if (finalDesired !== null && entry.type === 'message' && entry.message.role === 'assistant') {
-      const blocks = Array.isArray(finalDesired.content)
-        ? (finalDesired.content as AssistantMessage['content'])
-        : ([{ type: 'text', text: String(finalDesired.content) }] as AssistantMessage['content']);
-      const retired = retireAssistantContent(blocks);
-      if (retired) finalDesired = { content: retired };
-    }
     const projected = byId.get(entry.id);
     const firstMsg = projected?.messages[0];
     const current =
@@ -2183,22 +2082,12 @@ export function planUnfold(
           : 'content' in firstMsg
             ? { content: firstMsg.content }
             : undefined;
-    if (JSON.stringify(current) !== JSON.stringify(finalDesired)) {
-      if (spanIds.has(entry.id)) {
-        restoreEdits.push({ type: 'context_edit', targetId: entry.id, replacement: finalDesired });
-      } else if (
-        finalDesired !== null &&
-        entry.type === 'message' &&
-        entry.message.role === 'assistant'
-      ) {
-        postSpanAssistantRestores.set(entry.id, finalDesired);
-      } else {
-        tailRestoreEdits.push({
-          type: 'context_edit',
-          targetId: entry.id,
-          replacement: finalDesired
-        });
-      }
+    if (JSON.stringify(current) !== JSON.stringify(desired)) {
+      (spanIds.has(entry.id) ? restoreEdits : tailRestoreEdits).push({
+        type: 'context_edit',
+        targetId: entry.id,
+        replacement: desired
+      });
     }
   }
 
@@ -2223,45 +2112,11 @@ export function planUnfold(
         ]
       : [];
 
-  // Retire stale thinking/replay signatures (and apply any post-span assistant argument
-  // restorations with signatures kept retired) from newest to oldest FIRST, so an interrupted
-  // batch never leaves restored messages before signed turns.
-  const retireEdits: ContextEditEntryDraft[] = [];
-  for (let i = projection.length - 1; i >= 0; i--) {
-    const entry = projection[i]!;
-    if (entry.messages.length === 0 || spanIds.has(entry.sourceEntry.id)) continue;
-    const idx = branchIndexById.get(entry.sourceEntry.id) ?? -1;
-    if (idx < firstBranchIndex) continue;
-    const restoredAssistant = postSpanAssistantRestores.get(entry.sourceEntry.id);
-    if (restoredAssistant) postSpanAssistantRestores.delete(entry.sourceEntry.id);
-    if (restoredAssistant) {
-      retireEdits.push({
-        type: 'context_edit',
-        targetId: entry.sourceEntry.id,
-        replacement: restoredAssistant
-      });
-      continue;
-    }
-    const shown = entry.messages[0];
-    if (shown?.role !== 'assistant') continue;
-    const retired = retireAssistantContent(shown.content);
-    if (retired) {
-      retireEdits.push({
-        type: 'context_edit',
-        targetId: entry.sourceEntry.id,
-        replacement: { content: retired }
-      });
-    }
-  }
-
-  for (const [targetId, replacement] of postSpanAssistantRestores) {
-    retireEdits.push({ type: 'context_edit', targetId, replacement });
-  }
   return {
     handle: trimmed,
     record,
     noteEntryId: noteEntry.id,
-    edits: [...retireEdits, ...restoreEdits, ...tailRestoreEdits, ...noteEdits]
+    edits: [...restoreEdits, ...tailRestoreEdits, ...noteEdits]
   };
 }
 
@@ -2816,41 +2671,6 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       applied.length > 0
         ? attributeEpisodesEdits(branch)
         : new Map<string, { kind: 'fold' | 'unfold'; handle: string }>();
-    const latestPendingEdit = (targetId: string): PendingDraft | undefined =>
-      (event.entries as readonly PendingDraft[]).findLast(
-        (draft) => draft.type === 'context_edit' && draft.targetId === targetId
-      );
-    const assistantBlocksOf = (replacement: unknown): AssistantMessage['content'] | undefined => {
-      if (!replacement || typeof replacement !== 'object') return undefined;
-      const content = (replacement as { content?: unknown }).content;
-      if (typeof content === 'string') return [{ type: 'text', text: content }];
-      return Array.isArray(content) ? (content as AssistantMessage['content']) : [];
-    };
-    const reconcileAssistantPending = (
-      targetId: string
-    ): ContextEditEntryDraft | null | undefined => {
-      const pending = latestPendingEdit(targetId);
-      if (!pending) return undefined;
-      if (!pending.replacement) return null;
-      const blocks = assistantBlocksOf(pending.replacement);
-      const retired = blocks ? retireAssistantContent(blocks) : undefined;
-      return retired ? { type: 'context_edit', targetId, replacement: { content: retired } } : null;
-    };
-    const retireCurrent = (): ContextEditEntryDraft[] => {
-      if (event.message.role !== 'assistant' || !event.messageEntryId) return [];
-      const reconciled = reconcileAssistantPending(event.messageEntryId);
-      if (reconciled !== undefined) return reconciled ? [reconciled] : [];
-      const retired = retireAssistantContent(event.message.content);
-      return retired
-        ? [
-            {
-              type: 'context_edit',
-              targetId: event.messageEntryId,
-              replacement: { content: retired }
-            }
-          ]
-        : [];
-    };
 
     // The cut of a user message only saves tokens, so an edit an earlier handler queued for
     // that message stands, as it does when a cut-short fold is completed. The note was written
@@ -2867,8 +2687,6 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       pruneAfterEntryId?: string;
       callerEntryId?: string;
     }) => {
-      const current = retireCurrent();
-      const currentIds = new Set(current.map((edit) => edit.targetId));
       const beforeEntryId = fold.callerEntryId ?? event.messageEntryId;
       const pruneAfter = fold.pruneAfterEntryId ?? fold.lastEntryId;
       const ownRemovalDrafts = fold.edits.filter((edit) => edit.replacement === null);
@@ -2892,7 +2710,6 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       const foldAssistantMap = new Map<string, ContextEditEntryDraft>();
       const spanEdits: ContextEditEntryDraft[] = [];
       for (const edit of fold.edits) {
-        if (currentIds.has(edit.targetId)) continue;
         if (edit.replacement === null) {
           spanEdits.push(edit);
           continue;
@@ -2907,17 +2724,12 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
 
       const sortedAssistantIds = [
         ...new Set([...foldAssistantMap.keys(), ...tailPrune.assistantReplacements.keys()])
-      ]
-        .filter((id) => !currentIds.has(id))
-        .sort((a, b) => (branchIndexById.get(b) ?? -1) - (branchIndexById.get(a) ?? -1));
+      ].sort((a, b) => (branchIndexById.get(b) ?? -1) - (branchIndexById.get(a) ?? -1));
 
       const assistantEdits: ContextEditEntryDraft[] = [];
       for (const targetId of sortedAssistantIds) {
-        const reconciled = reconcileAssistantPending(targetId);
-        if (reconciled !== undefined) {
-          if (reconciled) assistantEdits.push(reconciled);
-          continue;
-        }
+        // An edit an earlier handler queued for the response stands, as for a user message.
+        if (edited.has(targetId)) continue;
         const composed = tailPrune.assistantReplacements.get(targetId);
         if (composed) {
           assistantEdits.push({
@@ -2931,20 +2743,17 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         if (existing) assistantEdits.push(existing);
       }
 
-      // Order all surviving assistant edits (signature retirements + failed-arg trims) and span
-      // removals/caps strictly newest -> oldest by branch index so no crash prefix ever mutates an
-      // earlier entry while a later entry still carries an unretired signature or unpaired toolResult.
+      // Order the edits of responses (failed-argument trims) and the span removals and cuts
+      // newest to oldest by branch index, so no crash prefix leaves a tool result without its call.
       const orderedEdits = [...assistantEdits, ...spanEdits].sort(
         (a, b) => (branchIndexById.get(b.targetId) ?? -1) - (branchIndexById.get(a.targetId) ?? -1)
       );
 
-      const readEdits = tailPrune.readEdits.filter(
-        (edit) => !currentIds.has(edit.targetId) && !edited.has(edit.targetId)
-      );
+      const readEdits = tailPrune.readEdits.filter((edit) => !edited.has(edit.targetId));
       const keptReadIds = new Set(readEdits.map((edit) => edit.targetId));
       const readDeps = tailPrune.readDeps.filter((dep) => keptReadIds.has(dep.targetId));
       return {
-        edits: [...current, ...orderedEdits, ...readEdits],
+        edits: [...orderedEdits, ...readEdits],
         readDeps
       };
     };
@@ -2954,11 +2763,8 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       edits: readonly ContextEditEntryDraft[];
       noteEntryId: string;
     }) => {
-      const current = retireCurrent();
-      const currentIds = new Set(current.map((edit) => edit.targetId));
       const base: ContextEditEntryDraft[] = [];
       for (const edit of unfold.edits) {
-        if (currentIds.has(edit.targetId)) continue;
         if (edit.targetId === unfold.noteEntryId) {
           if (!edited.has(unfold.noteEntryId)) {
             base.push(edit);
@@ -2977,27 +2783,10 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
           }
           continue;
         }
-        const source = branchById.get(edit.targetId);
-        if (source?.type === 'message' && source.message.role === 'assistant') {
-          const reconciled = reconcileAssistantPending(edit.targetId);
-          if (reconciled !== undefined) {
-            if (reconciled) base.push(reconciled);
-            continue;
-          }
-          base.push(edit);
-          continue;
-        }
         if (!edited.has(edit.targetId)) base.push(edit);
       }
-      return [...current, ...base];
+      return base;
     };
-    const repairRetire =
-      applied.length === 0 && unfolded.length === 0 && repairs.length > 0
-        ? retireCurrent().filter(
-            (edit) =>
-              !repairs.some((r) => r.type === 'context_edit' && r.targetId === edit.targetId)
-          )
-        : [];
 
     for (const fold of applied) {
       ctx.ui.notify(
@@ -3014,7 +2803,6 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
     return {
       entries: [
         ...event.entries,
-        ...repairRetire,
         ...repairs,
         // The marker goes last. A fold cut short leaves part of its span removed, a valid
         // context, and no applied note; a marker written first would leave the rest of the span
