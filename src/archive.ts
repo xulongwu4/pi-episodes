@@ -382,6 +382,8 @@ export interface Thread {
   messages: AgentMessage[];
   /** Disjoint span message segments when a batch fold archived non-contiguous ranges. */
   segments?: AgentMessage[][];
+  /** Parallel to `messages`: index into `record.spans` each message originated from. */
+  messageSpanIndex?: readonly number[];
   /**
    * The full context the thread ran with: everything before it plus the thread. Absent for
    * compacted turns, which filled the window when they were compacted; `ask` cannot resume them.
@@ -777,19 +779,28 @@ export class ThreadIndex {
       }
     }
 
-    // Coalesce adjacent spans when no uncovered context message sits between them so recall
-    // turn read-back and stamp attribution match a contiguous fold.
+    const messageSpanIndex: number[] = [];
+    if (intervals.length > 1) {
+      intervals.forEach(([first, last], spanIdx) => {
+        const count = path
+          .slice(first, last + 1)
+          .filter((entry) => !covered.has(entry.id))
+          .flatMap(sessionEntryToContextMessages).length;
+        for (let i = 0; i < count; i++) messageSpanIndex.push(spanIdx);
+      });
+    }
+
+    // Coalesce adjacent spans only when no message-bearing entry ever sat between them on path
+    // (an earlier-folded interior gap still separated the two turns chronologically).
     const coalesced: [number, number][] = [];
     for (const [first, last] of intervals) {
       const prev = coalesced.at(-1);
-      const hasUncoveredGap =
+      const hasGap =
         prev !== undefined &&
         path
           .slice(prev[1] + 1, first)
-          .some(
-            (entry) => !covered.has(entry.id) && sessionEntryToContextMessages(entry).length > 0
-          );
-      if (prev && !hasUncoveredGap) {
+          .some((entry) => sessionEntryToContextMessages(entry).length > 0);
+      if (prev && !hasGap) {
         prev[1] = Math.max(prev[1], last);
       } else {
         coalesced.push([first, last]);
@@ -807,6 +818,7 @@ export class ThreadIndex {
       label: formatFoldRange(fold, { turnsPrefix: true }),
       messages: segments.flat(),
       ...(segments.length > 1 ? { segments } : {}),
+      ...(messageSpanIndex.length > 0 ? { messageSpanIndex } : {}),
       context: () => {
         // As the agent saw the span when it folded: the edits of earlier folds are written
         // after their notes, which can be after this span.
@@ -915,19 +927,21 @@ export class ThreadIndex {
           messageLimit: fold.last + 1,
           stateAt: snapAt
         });
+      const rawChildSpans = nestedFoldSpans(fold);
+      const childMessageSpanIndex: number[] = [];
+      if (rawChildSpans.length > 1) {
+        rawChildSpans.forEach((span, spanIdx) => {
+          const count = archive.messages
+            .slice(span.first, span.last + 1)
+            .filter((_, index) => !earlier.has(span.first + index)).length;
+          for (let i = 0; i < count; i++) childMessageSpanIndex.push(spanIdx);
+        });
+      }
       const coalescedChildSpans: { first: number; last: number }[] = [];
-      for (const span of nestedFoldSpans(fold)) {
+      for (const span of rawChildSpans) {
         const prev = coalescedChildSpans.at(-1);
-        let hasUncoveredGap = false;
-        if (prev) {
-          for (let idx = prev.last + 1; idx < span.first; idx++) {
-            if (!earlier.has(idx)) {
-              hasUncoveredGap = true;
-              break;
-            }
-          }
-        }
-        if (prev && !hasUncoveredGap) {
+        const hasGap = prev !== undefined && prev.last + 1 < span.first;
+        if (prev && !hasGap) {
           prev.last = Math.max(prev.last, span.last);
         } else {
           coalescedChildSpans.push({ first: span.first, last: span.last });
@@ -944,6 +958,7 @@ export class ThreadIndex {
         label: `${formatFoldRange(fold.record, { turnsPrefix: true })}, inside ${archive.handle}`,
         messages: segments.flat(),
         ...(segments.length > 1 ? { segments } : {}),
+        ...(childMessageSpanIndex.length > 0 ? { messageSpanIndex: childMessageSpanIndex } : {}),
         // What the child saw when it folded: its earlier folds at `snapAt`, this one not yet.
         context: () => [...this.forkPrefix(archive), ...snapReplay().messages],
         retiredCallIds: () => {

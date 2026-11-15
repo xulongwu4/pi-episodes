@@ -1812,6 +1812,16 @@ test('later fold removing only newer read preserves prefix bytes and advertises 
         (e) => e.type === 'context_edit' && e.targetId === olderReadEntry.id
       );
       assert.equal(editsOnOlder.length, 1);
+      const lastAsst = [...branch]
+        .reverse()
+        .find((e) => e.type === 'message' && e.message.role === 'assistant');
+      assert.equal(
+        lastAsst?.type === 'message' && lastAsst.message.role === 'assistant'
+          ? lastAsst.message.errorMessage
+          : undefined,
+        undefined
+      );
+      assert.equal(faux.getPendingResponseCount(), 0);
     } finally {
       await created.session.dispose();
     }

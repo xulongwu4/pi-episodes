@@ -1640,3 +1640,341 @@ test('L6 and interrupted batch unfold recovery: compaction error when early span
     assert.match(recoveredTxt, /out2/);
   }
 });
+
+test('R2-1 (archivedReadTurns & until:null): pre-Span-0 and interior-gap duplicate-read stubs emit redirect locators; until:null is accepted', () => {
+  assert.equal(normalizeFoldSpans({ since: 't2', until: null, note: 'ok' })[0]!.until, undefined);
+  assert.equal(
+    normalizeFoldSpans({ spans: [{ since: 't2', until: null, note: 'ok' }] })[0]!.until,
+    undefined
+  );
+
+  const sm = SessionManager.inMemory();
+  sm.appendMessage(user('task', 1));
+  sm.appendMessage(assistant(call('r_pre', 'read', { path: 'a.ts' })));
+  sm.appendMessage(
+    result('r_pre', 'read', '[duplicate read of a.ts, 900 chars; identical to t4 — see below]', 2)
+  );
+  sm.appendMessage(assistant(call('b0', 'bash', { command: 'prep' })));
+  sm.appendMessage(result('b0', 'bash', 'ok', 3));
+  sm.appendMessage(assistant(call('r_w1', 'read', { path: 'a.ts' })));
+  sm.appendMessage(result('r_w1', 'read', 'const A = 1;', 4));
+  sm.appendMessage(assistant(call('r_gap', 'read', { path: 'b.ts' })));
+  sm.appendMessage(
+    result('r_gap', 'read', '[duplicate read of b.ts, 900 chars; identical to t7 — see below]', 5)
+  );
+  sm.appendMessage(assistant(call('b_gap', 'bash', { command: 'keep' })));
+  sm.appendMessage(result('b_gap', 'bash', 'kept', 6));
+  sm.appendMessage(assistant(call('r_w2', 'read', { path: 'b.ts' })));
+  sm.appendMessage(result('r_w2', 'read', 'const B = 2;', 7));
+  sm.appendMessage(assistant(call('f_arch', 'fold', {})));
+
+  const entries = sm.buildSessionProjection().entries;
+  const single = planFoldBatch(entries, 'f_arch', [{ since: 4, until: 4, note: 'Single.' }], {
+    latestStamp: 7
+  });
+  assert.deepEqual(single.archivedReadTurns, ['t4']);
+
+  const batch = planFoldBatch(
+    entries,
+    'f_arch',
+    [
+      { since: 4, until: 4, note: 'Span 0.' },
+      { since: 7, note: 'Span 1.' }
+    ],
+    { latestStamp: 7 }
+  );
+  assert.deepEqual(batch.archivedReadTurns, ['t4', 't7']);
+});
+
+test('R2-2 (compaction kept window): folds at or after firstKeptEntryId remain unfoldable; post-compaction missing start throws start error', () => {
+  const sm = SessionManager.inMemory();
+  sm.appendMessage(user('old work', 1));
+  sm.appendMessage(assistant(call('c_old', 'bash', { command: 'old' })));
+  sm.appendMessage(result('c_old', 'bash', 'old-out', 2));
+  const firstKeptId = sm.appendMessage(user('kept phase', 3));
+  sm.appendMessage(assistant(call('c_kept1', 'bash', { command: 'k1' })));
+  sm.appendMessage(result('c_kept1', 'bash', 'k1-out', 4));
+  sm.appendMessage(assistant(call('c_kept2', 'bash', { command: 'k2' })));
+  sm.appendMessage(result('c_kept2', 'bash', 'k2-out', 5));
+  sm.appendMessage(assistant(call('f_kept', 'fold', {})));
+  const batch = planFoldBatch(
+    sm.buildSessionProjection().entries,
+    'f_kept',
+    [{ since: 4, until: 5, note: 'Kept fold.' }],
+    { latestStamp: 5 }
+  );
+  sm.appendMessage({
+    role: 'toolResult',
+    toolCallId: 'f_kept',
+    toolName: 'fold',
+    content: withStamp(`[fold ${batch.handle}]`, 6),
+    details: {
+      kind: 'fold',
+      handle: batch.handle,
+      since: 't4',
+      until: 't5',
+      firstEntryId: batch.firstEntryId,
+      lastEntryId: batch.lastEntryId,
+      messages: batch.omitted.length,
+      tokens: batch.tokens,
+      headline: batch.headline,
+      keptUserTurns: [],
+      files: []
+    } as never,
+    isError: false,
+    timestamp: Date.now()
+  });
+  sm.appendCustomEntry(FOLD_STARTED_TYPE, { handle: batch.handle, edits: batch.edits });
+  for (const e of batch.edits) sm.appendContextEdit(e.targetId, e.replacement);
+  sm.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: batch.handle });
+
+  sm.appendCompaction('Summary of t1..t2', firstKeptId, 300);
+  sm.appendMessage(assistant(call('u_kept', 'unfold', { handle: batch.handle })));
+
+  const unfoldPlan = planUnfold(sm.getBranch(), sm.buildSessionProjection().entries, batch.handle, {
+    callerId: 'u_kept'
+  });
+  assert.ok(unfoldPlan.edits.length >= 2);
+
+  sm.appendMessage(assistant(call('f_post', 'fold', {})));
+  sm.appendMessage({
+    role: 'toolResult',
+    toolCallId: 'f_post',
+    toolName: 'fold',
+    content: withStamp('[fold ep-feedface]', 7),
+    details: {
+      kind: 'fold',
+      handle: 'ep-feedface',
+      since: 't6',
+      firstEntryId: 'nonexistent-post-compaction-id',
+      lastEntryId: 'nonexistent-post-compaction-id',
+      messages: 2,
+      tokens: 10,
+      headline: 'h',
+      keptUserTurns: [],
+      files: []
+    } as never,
+    isError: false,
+    timestamp: Date.now()
+  });
+  sm.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: 'ep-feedface' });
+  sm.appendMessage(assistant(call('u_post', 'unfold', { handle: 'ep-feedface' })));
+  assert.throws(
+    () =>
+      planUnfold(sm.getBranch(), sm.buildSessionProjection().entries, 'ep-feedface', {
+        callerId: 'u_post'
+      }),
+    /Cannot find the start of ep-feedface/
+  );
+});
+
+test('R2-3 (staleness on parallel backward expansion & coalesced adjacent spans) and R2-4 (prior-folded interior gap isolation)', async () => {
+  let parHandle = '';
+  const h1 = await createLiveSession(
+    [
+      () =>
+        fauxAssistantMessage([
+          fauxToolCall('bash', {
+            command: 'echo PAR_SHARED_TOK > par.txt && echo PAR_SHARED_TOK > other.txt'
+          })
+        ]),
+      () =>
+        fauxAssistantMessage([
+          fauxToolCall('read', { path: 'par.txt' }),
+          fauxToolCall('bash', { command: 'echo par-sibling' })
+        ]),
+      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo UPDATED_PAR > par.txt' })),
+      () => fauxAssistantMessage(fauxToolCall('read', { path: 'other.txt' })),
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', {
+            spans: [
+              { since: 't4', until: 't4', note: 'Parallel span 0.' },
+              { since: 't6', note: 'Span 1.' }
+            ]
+          }),
+          { stopReason: 'toolUse' }
+        ),
+      (ctx) => {
+        parHandle = /\[fold (ep-[0-9a-f]{8}):/.exec(ctx.messages.map(text).join('\n'))![1]!;
+        return fauxAssistantMessage(
+          [
+            fauxToolCall('recall', { query: '"PAR_SHARED_TOK"' }),
+            fauxToolCall('recall', { handle: parHandle, turn: 't3' })
+          ],
+          { stopReason: 'toolUse' }
+        );
+      },
+      (after) => {
+        const [qOut, tOut] = after.messages.slice(-2).map(text);
+        assert.match(qOut!, /predates changes to: .*par\.txt/);
+        assert.match(tOut!, /predates changes to: .*par\.txt/);
+        return fauxAssistantMessage('Verified parallel expansion staleness.');
+      }
+    ],
+    { git: true }
+  );
+  try {
+    execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: h1.dir });
+    await h1.session.prompt('parallel staleness');
+    if (h1.failures[0]) throw h1.failures[0];
+  } finally {
+    await h1.cleanup();
+  }
+
+  let coalHandle = '';
+  const h2 = await createLiveSession(
+    [
+      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo span0' })),
+      () =>
+        fauxAssistantMessage([
+          { type: 'text', text: 'COAL_SPAN1_OPENING_CLAIM about coal.txt' },
+          fauxToolCall('bash', { command: 'echo v1 > coal.txt' })
+        ]),
+      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo v2 > coal.txt' })),
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', {
+            spans: [
+              { since: 't2', until: 't2', note: 'Adj 0.' },
+              { since: 't3', until: 't3', note: 'Adj 1.' }
+            ]
+          }),
+          { stopReason: 'toolUse' }
+        ),
+      (ctx) => {
+        coalHandle = /\[fold (ep-[0-9a-f]{8}):/.exec(ctx.messages.map(text).join('\n'))![1]!;
+        return fauxAssistantMessage(
+          [
+            fauxToolCall('recall', { query: '"COAL_SPAN1_OPENING_CLAIM"' }),
+            fauxToolCall('recall', { handle: coalHandle, turn: 't2' })
+          ],
+          { stopReason: 'toolUse' }
+        );
+      },
+      (after) => {
+        const [qOut, tOut] = after.messages.slice(-2).map(text);
+        assert.match(qOut!, /predates changes to: .*coal\.txt/);
+        assert.match(tOut!, /predates changes to: .*coal\.txt/);
+        return fauxAssistantMessage('Verified coalesced staleness.');
+      }
+    ],
+    { git: true }
+  );
+  try {
+    execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: h2.dir });
+    await h2.session.prompt('coalesced staleness');
+    if (h2.failures[0]) throw h2.failures[0];
+  } finally {
+    await h2.cleanup();
+  }
+
+  let outerBatchHandle = '';
+  const h3 = await createLiveSession([
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo EARLY_T2_WORK' })),
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo PRIOR_FOLDED_GAP_T3' })),
+    () =>
+      fauxAssistantMessage([
+        { type: 'text', text: 'AFTER_GAP_T4_OPENING_ASST' },
+        fauxToolCall('bash', { command: 'echo LATE_T4_WORK' })
+      ]),
+    () =>
+      fauxAssistantMessage(
+        fauxToolCall('fold', { since: 't3', until: 't3', note: 'Folded gap t3 first.' }),
+        { stopReason: 'toolUse' }
+      ),
+    () =>
+      fauxAssistantMessage(
+        fauxToolCall('fold', {
+          spans: [
+            { since: 't2', until: 't2', note: 'Early t2.' },
+            { since: 't4', until: 't4', note: 'Late t4.' }
+          ]
+        }),
+        { stopReason: 'toolUse' }
+      ),
+    (ctx) => {
+      const handles = [
+        ...ctx.messages
+          .map(text)
+          .join('\n')
+          .matchAll(/\[fold (ep-[0-9a-f]{8}):/g)
+      ].map((m) => m[1]!);
+      outerBatchHandle = handles.at(-1)!;
+      return fauxAssistantMessage(
+        [
+          fauxToolCall('recall', { handle: outerBatchHandle, turn: 't2' }),
+          fauxToolCall('recall', { handle: outerBatchHandle, query: '"AFTER_GAP_T4_OPENING_ASST"' })
+        ],
+        { stopReason: 'toolUse' }
+      );
+    },
+    (after) => {
+      const [turnT2, grepOut] = after.messages.slice(-2).map(text);
+      assert.doesNotMatch(turnT2!, /AFTER_GAP_T4_OPENING_ASST/);
+      assert.match(grepOut!, new RegExp(`${outerBatchHandle} - assistant:`));
+      return fauxAssistantMessage('Verified prior-folded gap isolation.');
+    }
+  ]);
+  try {
+    test('R2-5 (interior-gap failed-arg trim ordering & spilled staleness): Span 1 removes before gap arg-trim; spilled hits past limit check staleness', async () => {
+      // Live session with > limit matches where Span 0 match appears AFTER limit (spilled) and Span 0 file changed in gap:
+      let spillHandle = '';
+      const h = await createLiveSession(
+        [
+          // t2..t3 (Span 0): write SPILL_TOK to early_spill.txt and read it
+          () =>
+            fauxAssistantMessage([
+              fauxToolCall('bash', { command: 'echo SPILL_TOK_ALPHA > early_spill.txt' }),
+              fauxToolCall('read', { path: 'early_spill.txt' })
+            ]),
+          // t4 (Gap): overwrite early_spill.txt AND create late_spill.txt with many SPILL_TOK_ALPHA lines so BM25 ranks Span 1 higher!
+          () =>
+            fauxAssistantMessage(
+              fauxToolCall('bash', {
+                command:
+                  'echo CHANGED > early_spill.txt && printf "SPILL_TOK_ALPHA\n%.0s" 1 2 3 4 5 > late_spill.txt'
+              })
+            ),
+          // t5..t7 (Span 1): 3 separate reads/outputs with SPILL_TOK_ALPHA so limit: 1 only shows Span 1 while Span 0 spills!
+          () => fauxAssistantMessage(fauxToolCall('read', { path: 'late_spill.txt' })),
+          () =>
+            fauxAssistantMessage(
+              fauxToolCall('fold', {
+                spans: [
+                  { since: 't2', until: 't3', note: 'Early spill span.' },
+                  { since: 't5', note: 'Late spill span.' }
+                ]
+              }),
+              { stopReason: 'toolUse' }
+            ),
+          (ctx) => {
+            spillHandle = /\[fold (ep-[0-9a-f]{8}):/.exec(ctx.messages.map(text).join('\n'))![1]!;
+            return fauxAssistantMessage(
+              fauxToolCall('recall', { handle: spillHandle, query: 'SPILL_TOK_ALPHA', limit: 1 }),
+              { stopReason: 'toolUse' }
+            );
+          },
+          (after) => {
+            const out = text(after.messages.at(-1)!);
+            // Even with limit: 1 (Span 1 ranked #1, Span 0 spilled to file), staleness must warn early_spill.txt changed!
+            assert.match(out, /predates changes to: .*early_spill\.txt/);
+            return fauxAssistantMessage('Verified spilled staleness.');
+          }
+        ],
+        { git: true }
+      );
+      try {
+        execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: h.dir });
+        await h.session.prompt('spilled staleness');
+        if (h.failures[0]) throw h.failures[0];
+      } finally {
+        await h.cleanup();
+      }
+    });
+    await h3.session.prompt('prior-folded gap isolation');
+    if (h3.failures[0]) throw h3.failures[0];
+  } finally {
+    await h3.cleanup();
+  }
+});

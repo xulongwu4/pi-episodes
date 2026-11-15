@@ -12,12 +12,14 @@ export interface RecallMatch {
   turn: string | undefined;
   role: string;
   line: string;
+  spanIndex?: number | undefined;
 }
 
 export interface SearchableThread {
   handle: string;
   messages: readonly AgentMessage[];
   segments?: readonly (readonly AgentMessage[])[];
+  messageSpanIndex?: readonly number[];
 }
 
 interface Chunk {
@@ -26,6 +28,7 @@ interface Chunk {
   turn: string | undefined;
   role: string;
   text: string;
+  spanIndex: number | undefined;
 }
 
 export function excerpt(line: string, index: number, length: number): string {
@@ -67,7 +70,8 @@ const isWord = (term: string, min: number) => term.length >= min && /^\p{L}+$/u.
 function chunks(
   handle: string,
   segments: readonly (readonly AgentMessage[])[],
-  firstId: number
+  firstId: number,
+  spanByMessage?: ReadonlyMap<AgentMessage, number>
 ): Chunk[] {
   const out: Chunk[] = [];
   for (const messages of segments) {
@@ -75,10 +79,18 @@ function chunks(
     for (const message of messages) {
       const stamp = readStamp(message);
       const label = stamp !== undefined ? stampLabel(stamp) : turn;
+      const spanIndex = spanByMessage?.get(message);
       let text = '';
       const flush = () => {
         if (text.trim()) {
-          out.push({ id: firstId + out.length, handle, turn: label, role: message.role, text });
+          out.push({
+            id: firstId + out.length,
+            handle,
+            turn: label,
+            role: message.role,
+            text,
+            spanIndex
+          });
         }
         text = '';
       };
@@ -133,7 +145,15 @@ export class RecallIndex {
     for (const thread of threads) {
       if (this.indexed.has(thread.handle)) continue;
       this.indexed.add(thread.handle);
-      const added = chunks(thread.handle, thread.segments ?? [thread.messages], this.chunks.length);
+      const spanByMessage = thread.messageSpanIndex
+        ? new Map(thread.messages.map((msg, idx) => [msg, thread.messageSpanIndex![idx]!]))
+        : undefined;
+      const added = chunks(
+        thread.handle,
+        thread.segments ?? [thread.messages],
+        this.chunks.length,
+        spanByMessage
+      );
       this.chunks.push(...added);
       this.index.addAll(added);
     }
@@ -160,7 +180,8 @@ export class RecallIndex {
         handle: chunk.handle,
         turn: chunk.turn,
         role: chunk.role,
-        line: bestLine(chunk, result.terms)
+        line: bestLine(chunk, result.terms),
+        ...(chunk.spanIndex !== undefined ? { spanIndex: chunk.spanIndex } : {})
       };
     });
     return { matches, partial };

@@ -48,10 +48,14 @@ export function grepThreads(
 ): RecallMatch[] {
   const matches: RecallMatch[] = [];
   for (const thread of threads) {
+    const spanByMessage = thread.messageSpanIndex
+      ? new Map(thread.messages.map((msg, idx) => [msg, thread.messageSpanIndex![idx]!]))
+      : undefined;
     for (const segment of thread.segments ?? [thread.messages]) {
       let turn: string | undefined;
       for (const message of segment) {
         const stamp = readStamp(message);
+        const spanIndex = spanByMessage?.get(message);
         for (const line of messageText(message).split('\n')) {
           const hit = match(line);
           if (!hit) continue;
@@ -59,7 +63,8 @@ export function grepThreads(
             handle: thread.handle,
             turn: stamp !== undefined ? stampLabel(stamp) : turn,
             role: message.role,
-            line: excerpt(line, hit.index, hit.length)
+            line: excerpt(line, hit.index, hit.length),
+            ...(spanIndex !== undefined ? { spanIndex } : {})
           });
         }
         if (stamp !== undefined) turn = stampLabel(stamp);
@@ -154,25 +159,11 @@ export interface Staleness {
   line: string;
 }
 
-function spanCoversStamp(
-  spans: readonly { since: string; until?: string | undefined }[],
-  idx: number,
-  stamp: number
-): boolean {
-  const span = spans[idx]!;
-  const start = parseStamp(span.since);
-  if (start === undefined) return false;
-  const explicitEnd = span.until ? parseStamp(span.until) : undefined;
-  const nextStart = idx + 1 < spans.length ? parseStamp(spans[idx + 1]!.since) : undefined;
-  const end = explicitEnd ?? (nextStart !== undefined ? nextStart - 1 : Number.POSITIVE_INFINITY);
-  return stamp >= start && stamp <= end;
-}
-
 /** Which files an archived thread touched have changed since it was archived. */
 export async function staleness(
   state: EpisodeState,
   threads: readonly Thread[],
-  relevantStampsByHandle?: ReadonlyMap<string, ReadonlySet<number>>
+  relevantSpansByHandle?: ReadonlyMap<string, ReadonlySet<number>>
 ): Promise<Staleness[]> {
   const snapshots = state.snapshots;
   const records = threads.flatMap((thread) => {
@@ -203,13 +194,11 @@ export async function staleness(
       if (!anySpanMetadata && record.treeAfter) {
         filesByTree.set(record.treeAfter, [...record.files]);
       } else {
-        const filterStamps = relevantStampsByHandle?.get(record.handle);
-        const matchedSpans = filterStamps
-          ? record.spans.filter((_, idx) =>
-              [...filterStamps].some((stamp) => spanCoversStamp(record.spans!, idx, stamp))
-            )
-          : record.spans;
-        const targetSpans = matchedSpans.length > 0 ? matchedSpans : record.spans;
+        const filterIndices = relevantSpansByHandle?.get(record.handle);
+        const targetSpans =
+          filterIndices && filterIndices.size > 0
+            ? record.spans.filter((_, idx) => filterIndices.has(idx))
+            : record.spans;
         for (const span of targetSpans) {
           if (!span.treeAfter || !span.files?.length) continue;
           for (const file of span.files) addFileForTree(span.treeAfter, file);
@@ -443,9 +432,19 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
           turn,
           chars: text.length
         };
-        const askedStamps = new Set<number>();
-        for (let s = first!; s <= (last ?? first!); s++) askedStamps.add(s);
-        const stale = await staleness(state, [thread], new Map([[thread.handle, askedStamps]]));
+        let relevantSpans: ReadonlyMap<string, ReadonlySet<number>> | undefined;
+        if (thread.messageSpanIndex) {
+          const spanByMessage = new Map(
+            thread.messages.map((msg, idx) => [msg, thread.messageSpanIndex![idx]!])
+          );
+          const spanSet = new Set<number>();
+          for (const msg of messages) {
+            const idx = spanByMessage.get(msg);
+            if (idx !== undefined) spanSet.add(idx);
+          }
+          if (spanSet.size > 0) relevantSpans = new Map([[thread.handle, spanSet]]);
+        }
+        const stale = await staleness(state, [thread], relevantSpans);
         if (stale.length > 0) {
           details.stale = stale.map(({ handle, files }) => ({ handle, files }));
         }
@@ -510,22 +509,25 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
         matches.some((found) => found.handle === thread.handle)
       );
       details.hits = hitThreads.map((thread) => thread.handle);
-      const relevantStampsByHandle = new Map<string, ReadonlySet<number>>();
-      for (const thread of hitThreads) {
-        const threadMatches = matches.filter((found) => found.handle === thread.handle);
-        const stamps: number[] = [];
-        let allStamped = threadMatches.length > 0;
+      const allHitThreads = threads.filter((thread) =>
+        all.some((found) => found.handle === thread.handle)
+      );
+      const relevantSpansByHandle = new Map<string, ReadonlySet<number>>();
+      for (const thread of allHitThreads) {
+        if (!thread.messageSpanIndex) continue;
+        const threadMatches = all.filter((found) => found.handle === thread.handle);
+        const spanSet = new Set<number>();
+        let allMapped = threadMatches.length > 0;
         for (const found of threadMatches) {
-          const parsed = found.turn !== undefined ? parseStamp(found.turn) : undefined;
-          if (parsed === undefined) {
-            allStamped = false;
+          if (found.spanIndex === undefined) {
+            allMapped = false;
             break;
           }
-          stamps.push(parsed);
+          spanSet.add(found.spanIndex);
         }
-        if (allStamped) relevantStampsByHandle.set(thread.handle, new Set(stamps));
+        if (allMapped) relevantSpansByHandle.set(thread.handle, spanSet);
       }
-      const stale = await staleness(state, hitThreads, relevantStampsByHandle);
+      const stale = await staleness(state, allHitThreads, relevantSpansByHandle);
       if (stale.length > 0) {
         details.stale = stale.map(({ handle, files }) => ({ handle, files }));
       }

@@ -1288,7 +1288,7 @@ function parseSingleFoldSpan(raw: Record<string, unknown>): NormalizedFoldSpan {
       `since must be a turn stamp such as "t12", got "${String(raw.since ?? '')}".`
     );
   }
-  if (raw.until !== undefined && typeof raw.until !== 'string') {
+  if (raw.until !== undefined && raw.until !== null && typeof raw.until !== 'string') {
     throw new FoldError(
       'bad-stamp',
       `until must be a turn stamp such as "t20", got "${String(raw.until)}".`
@@ -1526,7 +1526,7 @@ export function planFoldBatch(
   }
   const archivedReadTurns: string[] = [];
   const seenArchived = new Set<string>();
-  for (let idx = resolved[0]!.endIndex; idx < entries.length; idx++) {
+  for (let idx = 0; idx < lastResolved.startIndex; idx++) {
     if (selectedIndices.has(idx)) continue;
     for (const msg of entries[idx]!.messages) {
       if (msg.role !== 'toolResult' || msg.toolName !== 'read') continue;
@@ -2011,7 +2011,7 @@ export function planUnfold(
   const noteEntry = branch[noteIndex] as SessionEntry & { type: 'message' };
   const record = foldNoteDetails(noteEntry.message)!;
 
-  const resolveIntervals = (target: FoldDetails): [number, number][] | undefined => {
+  const resolveAllIntervals = (target: FoldDetails): [number, number][] | undefined => {
     const out: [number, number][] = [];
     for (const span of foldSpans(target)) {
       const first = branchIndexById.get(span.firstEntryId) ?? -1;
@@ -2021,26 +2021,39 @@ export function planUnfold(
     }
     return out;
   };
+  const resolveKnownIntervals = (target: FoldDetails): [number, number][] => {
+    const out: [number, number][] = [];
+    for (const span of foldSpans(target)) {
+      const first = branchIndexById.get(span.firstEntryId) ?? -1;
+      if (first < 0) continue;
+      const rawLast = branchIndexById.get(span.lastEntryId) ?? -1;
+      out.push([first, rawLast >= first ? rawLast : first]);
+    }
+    return out;
+  };
 
   const compactionIndex = branch.findLastIndex((entry) => entry.type === 'compaction');
-  const ownIntervals = resolveIntervals(record);
   if (compactionIndex >= 0) {
     const compaction = branch[compactionIndex] as SessionEntry & {
       type: 'compaction';
       firstKeptEntryId: string;
     };
     const firstKeptIndex = branchIndexById.get(compaction.firstKeptEntryId) ?? -1;
-    const firstSpanIndex = ownIntervals?.[0]?.[0] ?? -1;
-    if (
-      !ownIntervals ||
-      noteIndex <= compactionIndex ||
-      (firstSpanIndex <= compactionIndex && (firstKeptIndex < 0 || firstSpanIndex < firstKeptIndex))
-    ) {
+    const isBeforeKept = (idx: number) =>
+      idx <= compactionIndex && (firstKeptIndex < 0 || idx < firstKeptIndex);
+    const anyCompactedSpan = foldSpans(record).some((span) => {
+      const first = branchIndexById.get(span.firstEntryId) ?? -1;
+      const last = branchIndexById.get(span.lastEntryId) ?? -1;
+      if (first >= 0) return isBeforeKept(first);
+      return isBeforeKept(noteIndex) || (last >= 0 && isBeforeKept(last));
+    });
+    if (isBeforeKept(noteIndex) || anyCompactedSpan) {
       throw new Error(
         `${trimmed} lies before the latest compaction: its turns were compacted by pi and remain accessible via recall and ask.`
       );
     }
   }
+  const ownIntervals = resolveAllIntervals(record);
   if (!ownIntervals || ownIntervals.length === 0) {
     throw new Error(`Cannot find the start of ${trimmed} on this branch.`);
   }
@@ -2055,7 +2068,7 @@ export function planUnfold(
         `${trimmed} is covered by ${laterFold.handle}; unfold ${laterFold.handle} first.`
       );
     }
-    const laterIntervals = resolveIntervals(laterFold) ?? [];
+    const laterIntervals = resolveKnownIntervals(laterFold);
     const overlaps = ownIntervals.some(([aFirst, aLast]) =>
       laterIntervals.some(([bFirst, bLast]) => aFirst <= bLast && bFirst <= aLast)
     );
@@ -2884,31 +2897,51 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         if (!edited.has(edit.targetId)) spanEdits.push(edit);
       }
 
+      const lastFoldIndex =
+        fold.lastEntryId !== undefined ? (branchIndexById.get(fold.lastEntryId) ?? -1) : -1;
       const sortedAssistantIds = [
         ...new Set([...foldAssistantMap.keys(), ...tailPrune.assistantReplacements.keys()])
       ]
         .filter((id) => !currentIds.has(id))
         .sort((a, b) => (branchIndexById.get(b) ?? -1) - (branchIndexById.get(a) ?? -1));
 
-      const assistantEdits: ContextEditEntryDraft[] = [];
+      const preSpanAssistantEdits: ContextEditEntryDraft[] = [];
+      const gapPruneAssistantEdits: ContextEditEntryDraft[] = [];
       for (const targetId of sortedAssistantIds) {
         const reconciled = reconcileAssistantPending(targetId);
         if (reconciled !== undefined) {
-          if (reconciled) assistantEdits.push(reconciled);
+          if (reconciled) preSpanAssistantEdits.push(reconciled);
           continue;
         }
         const composed = tailPrune.assistantReplacements.get(targetId);
         if (composed) {
-          assistantEdits.push({
+          const draft: ContextEditEntryDraft = {
             type: 'context_edit',
             targetId,
             replacement: { content: composed }
-          });
+          };
+          const targetIdx = branchIndexById.get(targetId) ?? -1;
+          if (lastFoldIndex >= 0 && targetIdx >= 0 && targetIdx < lastFoldIndex) {
+            gapPruneAssistantEdits.push(draft);
+          } else {
+            preSpanAssistantEdits.push(draft);
+          }
           continue;
         }
         const existing = foldAssistantMap.get(targetId);
-        if (existing) assistantEdits.push(existing);
+        if (existing) preSpanAssistantEdits.push(existing);
       }
+
+      // Order interior-gap failed-arg trims strictly by reverse branch index alongside spanEdits
+      // so later spans (e.g. Span 1) are omitted before an interior-gap assistant's args change,
+      // while that assistant's signature is still retired before earlier spans (e.g. Span 0).
+      const orderedSpanAndGapEdits =
+        gapPruneAssistantEdits.length === 0
+          ? spanEdits
+          : [...spanEdits, ...gapPruneAssistantEdits].sort(
+              (a, b) =>
+                (branchIndexById.get(b.targetId) ?? -1) - (branchIndexById.get(a.targetId) ?? -1)
+            );
 
       const readEdits = tailPrune.readEdits.filter(
         (edit) => !currentIds.has(edit.targetId) && !edited.has(edit.targetId)
@@ -2916,7 +2949,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       const keptReadIds = new Set(readEdits.map((edit) => edit.targetId));
       const readDeps = tailPrune.readDeps.filter((dep) => keptReadIds.has(dep.targetId));
       return {
-        edits: [...current, ...assistantEdits, ...spanEdits, ...readEdits],
+        edits: [...current, ...preSpanAssistantEdits, ...orderedSpanAndGapEdits, ...readEdits],
         readDeps
       };
     };
