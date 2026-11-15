@@ -33,6 +33,7 @@ import {
   attributeEpisodesEdits,
   completeCutShortFolds,
   FoldError,
+  mergeSpanDiskChanges,
   normalizeFoldSpans,
   planFoldBatch,
   planUnfold,
@@ -1187,6 +1188,7 @@ test('planFoldBatch orders transitive covered notes oldest-first by written orde
         .at(-1)!;
       const idx1 = noteText.indexOf('OLDEST_NOTE_EP1');
       const idx2 = noteText.indexOf('SECOND_NOTE_EP2');
+
       const idx3 = noteText.indexOf('THIRD_NOTE_EP3');
       assert.ok(idx1 > 0 && idx2 > 0 && idx3 > 0);
       assert.ok(idx1 < idx2, `Expected ep-1 (${idx1}) before ep-2 (${idx2})`);
@@ -1200,5 +1202,441 @@ test('planFoldBatch orders transitive covered notes oldest-first by written orde
     if (harness.failures[0]) throw harness.failures[0];
   } finally {
     await harness.cleanup();
+  }
+});
+test('H1: planFoldBatch never resurrects earlier-omitted signed assistant entries in gaps or trailing tails', () => {
+  const sm = SessionManager.inMemory();
+  sm.appendMessage(user('task', 1));
+  // t2 (Span 0)
+  sm.appendMessage(signedAssistant('s1', call('c1', 'bash', { command: 'one' })));
+  sm.appendMessage(result('c1', 'bash', 'out1', 2));
+  // Earlier-omitted signed assistant + result right at end of Span 0 / in interior gap:
+  const omittedGapAsstId = sm.appendMessage(
+    signedAssistant('s_dead_gap', call('c_dead_gap', 'bash', { command: 'dead-gap' }))
+  );
+  const omittedGapResId = sm.appendMessage(result('c_dead_gap', 'bash', 'dead-gap-out', 3));
+  // Active interior gap t4
+  sm.appendMessage(
+    signedAssistant('s_live_gap', call('c_live_gap', 'bash', { command: 'live-gap' }))
+  );
+  sm.appendMessage(result('c_live_gap', 'bash', 'live-gap-out', 4));
+  // t5 (Span 1)
+  sm.appendMessage(signedAssistant('s2', call('c2', 'bash', { command: 'two' })));
+  sm.appendMessage(result('c2', 'bash', 'out2', 5));
+  // Earlier-omitted signed assistant + result in trailing tail after Span 1:
+  const omittedTailAsstId = sm.appendMessage(
+    signedAssistant('s_dead_tail', call('c_dead_tail', 'bash', { command: 'dead-tail' }))
+  );
+  const omittedTailResId = sm.appendMessage(result('c_dead_tail', 'bash', 'dead-tail-out', 6));
+  // Active trailing turn t7
+  sm.appendMessage(
+    signedAssistant('s_live_tail', call('c_live_tail', 'bash', { command: 'live-tail' }))
+  );
+  sm.appendMessage(result('c_live_tail', 'bash', 'live-tail-out', 7));
+
+  // Hide both dead pairs as an earlier fold would have done:
+  sm.appendContextEdit(omittedGapAsstId, null);
+  sm.appendContextEdit(omittedGapResId, null);
+  sm.appendContextEdit(omittedTailAsstId, null);
+  sm.appendContextEdit(omittedTailResId, null);
+
+  sm.appendMessage(signedAssistant('s_fold', call('f_batch', 'fold', {})));
+  const preEntries = sm.buildSessionProjection().entries;
+  const hiddenBefore = new Set(
+    preEntries.filter((e) => e.messages.length === 0).map((e) => e.sourceEntry.id)
+  );
+  assert.ok(hiddenBefore.has(omittedGapAsstId));
+  assert.ok(hiddenBefore.has(omittedTailAsstId));
+
+  // Both single-span bounded and multi-span batch must never emit non-null replacements for hidden entries:
+  for (const spans of [
+    [{ since: 2, until: 2, note: 'Single bounded.' }],
+    [
+      { since: 2, until: 2, note: 'Batch span 1.' },
+      { since: 5, until: 5, note: 'Batch span 2.' }
+    ]
+  ]) {
+    const batch = planFoldBatch(preEntries, 'f_batch', spans, { latestStamp: 7 });
+    for (const edit of batch.edits) {
+      if (edit.replacement !== null) {
+        assert.ok(
+          !hiddenBefore.has(edit.targetId),
+          `Resurrected hidden entry ${edit.targetId} with non-null replacement`
+        );
+      }
+    }
+  }
+});
+
+test('M1/M2/L4: context_edit entries before caller preserve runsToCall; empty top-level fields next to spans work; missing non-final until errors clearly', async () => {
+  // 1. M2: empty/null top-level fields alongside spans
+  const parsed = normalizeFoldSpans({
+    since: '',
+    until: '   ',
+    note: null,
+    spans: [
+      { since: 't2', until: 't3', note: 'First.' },
+      { since: 't5', note: 'Second.' }
+    ]
+  });
+  assert.equal(parsed.length, 2);
+
+  // 2. L4: missing until on non-final span gives clear bad-spans error, while out-of-order final omit works
+  const sm = SessionManager.inMemory();
+  sm.appendMessage(user('task', 1));
+  sm.appendMessage(assistant(call('c1', 'bash', { command: 'one' })));
+  const r1Id = sm.appendMessage(result('c1', 'bash', 'out1', 2));
+  sm.appendMessage(assistant(call('c2', 'bash', { command: 'two' })));
+  sm.appendMessage(result('c2', 'bash', 'out2', 3));
+  sm.appendMessage(assistant(call('c3', 'bash', { command: 'three' })));
+  sm.appendMessage(result('c3', 'bash', 'out3', 4));
+  // Append context_edit and custom entries right BEFORE the fold caller (M1 reproduction!):
+  sm.appendContextEdit(r1Id, { content: withStamp('edited-out1', 2) });
+  sm.appendCustomEntry('some-extension-event', { ok: true });
+  sm.appendMessage(assistant(call('f1', 'fold', {})));
+  const entries = sm.buildSessionProjection().entries;
+
+  assert.throws(
+    () =>
+      planFoldBatch(
+        entries,
+        'f1',
+        [
+          { since: 2, note: 'Missing until on earlier span.' },
+          { since: 4, note: 'Final span.' }
+        ],
+        { latestStamp: 4 }
+      ),
+    (err: unknown) =>
+      err instanceof FoldError && err.reason === 'bad-spans' && /until/i.test(err.message)
+  );
+
+  // Out-of-order where chronologically final span (t4) omits until still works AND has keptFrom === undefined (M1):
+  const outOfOrder = planFoldBatch(
+    entries,
+    'f1',
+    [
+      { since: 4, note: 'Open final span.' },
+      { since: 2, until: 2, note: 'Bounded early span.' }
+    ],
+    { latestStamp: 4 }
+  );
+  assert.equal(outOfOrder.spans[1]!.keptFrom, undefined);
+  assert.match(outOfOrder.note, /\[turns from t4 on\]/);
+});
+
+test('L2/L3/GPT2/GPT5: mergeSpanDiskChanges returns undefined if any span is unknown, preserves A+A and T, and excludes A+D from readOnly', async () => {
+  // Partial unknown diff must be undefined, never [] ("Working tree unchanged"):
+  assert.equal(mergeSpanDiskChanges([undefined, []]), undefined);
+  assert.equal(mergeSpanDiskChanges([[{ status: 'M', path: '/a' }], undefined]), undefined);
+  // A + A across a deleted gap stays A; T stays T:
+  assert.deepEqual(
+    mergeSpanDiskChanges([
+      [
+        { status: 'A', path: '/recreated.ts' },
+        { status: 'T', path: '/mode.ts' }
+      ],
+      [{ status: 'A', path: '/recreated.ts' }]
+    ]),
+    [
+      { status: 'A', path: '/recreated.ts' },
+      { status: 'T', path: '/mode.ts' }
+    ]
+  );
+
+  // Live session where Span 0 creates + reads temp.txt, gap keeps state, Span 1 deletes temp.txt (A + D cancels in net diff):
+  const harness = await createLiveSession(
+    [
+      // t2 (Span 0): create temp.txt via bash AND read it via read tool
+      () =>
+        fauxAssistantMessage([
+          fauxToolCall('bash', { command: 'echo transient > temp.txt' }),
+          fauxToolCall('read', { path: 'temp.txt' })
+        ]),
+      // t4 (Interior gap)
+      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo gap' })),
+      // t5 (Span 1): delete temp.txt
+      () => fauxAssistantMessage(fauxToolCall('bash', { command: 'rm temp.txt' })),
+      // Batch fold Span 0 (t2..t3) and Span 1 (t5)
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', {
+            spans: [
+              { since: 't2', until: 't3', note: 'Created and read temp.txt.' },
+              { since: 't5', note: 'Removed temp.txt.' }
+            ]
+          }),
+          { stopReason: 'toolUse' }
+        ),
+      () => fauxAssistantMessage('Done.')
+    ],
+    { git: true }
+  );
+
+  try {
+    execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: harness.dir });
+    await harness.session.prompt('run A+D readOnly check');
+    if (harness.failures[0]) throw harness.failures[0];
+    const branch = harness.session.sessionManager.getBranch();
+    const record = branch
+      .flatMap((e) =>
+        e.type === 'message' && e.message.role === 'toolResult' && e.message.toolName === 'fold'
+          ? [e.message.details as unknown as FoldDetails]
+          : []
+      )
+      .at(-1)!;
+    assert.ok(
+      !(record.readOnly ?? []).some((p) => p.endsWith('temp.txt')),
+      `Expected temp.txt not to be classified readOnly, got ${JSON.stringify(record.readOnly)}`
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('GPT3/GPT4: same-file staleness warns when earlier span is recalled after gap edit; adjacent spans keep contiguous recall parity', async () => {
+  let sameFileHandle = '';
+  const harness1 = await createLiveSession(
+    [
+      // t2..t3 (Span 0): write v1 to shared.txt and read it
+      () =>
+        fauxAssistantMessage([
+          fauxToolCall('bash', { command: 'echo SHARED_V1_BODY > shared.txt' }),
+          fauxToolCall('read', { path: 'shared.txt' })
+        ]),
+      // t4 (Retained gap): overwrite shared.txt with v2
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: 'echo SHARED_V2_BODY > shared.txt' })),
+      // t5 (Span 1): read shared.txt (now v2)
+      () => fauxAssistantMessage(fauxToolCall('read', { path: 'shared.txt' })),
+      // Batch fold Span 0 (t2..t3) and Span 1 (t5), keeping gap t4
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', {
+            spans: [
+              { since: 't2', until: 't3', note: 'Read shared.txt v1.' },
+              { since: 't5', note: 'Read shared.txt v2.' }
+            ]
+          }),
+          { stopReason: 'toolUse' }
+        ),
+      (ctx) => {
+        sameFileHandle = /\[fold (ep-[0-9a-f]{8}):/.exec(ctx.messages.map(text).join('\n'))![1]!;
+        return fauxAssistantMessage(
+          [
+            fauxToolCall('recall', { query: '"SHARED_V1_BODY"' }),
+            fauxToolCall('recall', { handle: sameFileHandle, turn: 't3' }),
+            fauxToolCall('recall', { handle: sameFileHandle, turn: 't5' })
+          ],
+          { stopReason: 'toolUse' }
+        );
+      },
+      (afterRecall) => {
+        const outs = afterRecall.messages.slice(-3).map(text);
+        // Querying v1 (Span 0) or turn t3 (Span 0) MUST warn shared.txt changed after Span 0:
+        assert.match(outs[0]!, /predates changes to: .*shared\.txt/);
+        assert.match(outs[1]!, /predates changes to: .*shared\.txt/);
+        // Querying turn t5 (Span 1, which saw v2) must NOT falsely warn:
+        assert.doesNotMatch(outs[2]!, /predates changes to/);
+        return fauxAssistantMessage('Verified same-file span staleness.');
+      }
+    ],
+    { git: true }
+  );
+
+  try {
+    execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: harness1.dir });
+    await harness1.session.prompt('same-file staleness');
+    if (harness1.failures[0]) throw harness1.failures[0];
+  } finally {
+    await harness1.cleanup();
+  }
+
+  // GPT4: adjacent spans [t2..t2] and [t3..on] with NO gap must keep contiguous turn readback & attribution parity!
+  let adjHandle = '';
+  const harness2 = await createLiveSession([
+    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo ADJ_A_OUT' })),
+    () =>
+      fauxAssistantMessage(
+        fauxToolCall('bash', { command: 'echo ADJ_B_CALL_MARKER >/dev/null && echo ADJ_B_OUT' })
+      ),
+    () =>
+      fauxAssistantMessage(
+        fauxToolCall('fold', {
+          spans: [
+            { since: 't2', until: 't2', note: 'Span A.' },
+            { since: 't3', note: 'Span B.' }
+          ]
+        }),
+        { stopReason: 'toolUse' }
+      ),
+    (ctx) => {
+      adjHandle = /\[fold (ep-[0-9a-f]{8}):/.exec(ctx.messages.map(text).join('\n'))![1]!;
+      return fauxAssistantMessage(
+        [
+          fauxToolCall('recall', { handle: adjHandle, turn: 't2' }),
+          fauxToolCall('recall', { query: '"ADJ_B_CALL_MARKER"' }),
+          fauxToolCall('recall', { query: 'ADJ_B_CALL_MARKER' })
+        ],
+        { stopReason: 'toolUse' }
+      );
+    },
+    (afterRecall) => {
+      const [turnOut, grepOut, bm25Out] = afterRecall.messages.slice(-3).map(text);
+      // Because t2 and t3 were adjacent with no retained gap, assistant B follows t2 directly:
+      assert.match(turnOut!, /ADJ_B_CALL_MARKER/);
+      assert.match(grepOut!, new RegExp(`${adjHandle} t2 assistant:`));
+      assert.match(bm25Out!, new RegExp(`${adjHandle} t2 assistant:`));
+      return fauxAssistantMessage('Verified adjacent parity.');
+    }
+  ]);
+
+  try {
+    await harness2.session.prompt('adjacent parity');
+    if (harness2.failures[0]) throw harness2.failures[0];
+  } finally {
+    await harness2.cleanup();
+  }
+});
+
+test('L6 and interrupted batch unfold recovery: compaction error when early span pruned, and every interrupted unfold prefix recovers', () => {
+  // 1. L6: compaction error when Span 0 firstEntryId was pruned before compaction
+  const smComp = SessionManager.inMemory();
+  smComp.appendMessage(user('task', 1));
+  smComp.appendMessage(assistant(call('c1', 'bash', { command: 'one' })));
+  const r1Id = smComp.appendMessage(result('c1', 'bash', 'out1', 2));
+  const keepId = smComp.appendMessage(user('keep', 3));
+  smComp.appendCompaction('Compacted summary', keepId, 500);
+  const foldCallId = 'f_pre_comp';
+  smComp.appendMessage(assistant(call(foldCallId, 'fold', {})));
+  const noteMsg: AgentMessage = {
+    role: 'toolResult',
+    toolCallId: foldCallId,
+    toolName: 'fold',
+    content: withStamp('[fold ep-deadbeef]', 4),
+    details: {
+      kind: 'fold',
+      handle: 'ep-deadbeef',
+      since: 't2',
+      firstEntryId: 'missing-pruned-id',
+      lastEntryId: r1Id,
+      spans: [
+        {
+          since: 't2',
+          until: 't2',
+          firstEntryId: 'missing-pruned-id',
+          lastEntryId: r1Id,
+          note: 'n1'
+        },
+        { since: 't3', until: 't3', firstEntryId: keepId, lastEntryId: keepId, note: 'n2' }
+      ],
+      messages: 2,
+      tokens: 20,
+      headline: 'h',
+      keptUserTurns: [],
+      files: []
+    } as never,
+    isError: false,
+    timestamp: Date.now()
+  };
+  smComp.appendMessage(noteMsg);
+  smComp.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: 'ep-deadbeef' });
+  smComp.appendMessage(assistant(call('u_comp', 'unfold', { handle: 'ep-deadbeef' })));
+  assert.throws(
+    () =>
+      planUnfold(smComp.getBranch(), smComp.buildSessionProjection().entries, 'ep-deadbeef', {
+        callerId: 'u_comp'
+      }),
+    /lies before the latest compaction/
+  );
+
+  // 2. Every interrupted prefix of a batch unfold recovers cleanly via completeCutShortFolds
+  function buildUnfoldReady() {
+    const sm = SessionManager.inMemory();
+    sm.appendMessage(user('task', 1));
+    sm.appendMessage(signedAssistant('s1', call('c1', 'bash', { command: 'one' })));
+    sm.appendMessage(result('c1', 'bash', 'out1', 2));
+    sm.appendMessage(signedAssistant('sg', call('cg', 'bash', { command: 'gap' })));
+    sm.appendMessage(result('cg', 'bash', 'gap-out', 3));
+    sm.appendMessage(signedAssistant('s2', call('c2', 'bash', { command: 'two' })));
+    sm.appendMessage(result('c2', 'bash', 'out2', 4));
+    sm.appendMessage(signedAssistant('sf', call('f_b', 'fold', {})));
+    const batch = planFoldBatch(
+      sm.buildSessionProjection().entries,
+      'f_b',
+      [
+        { since: 2, until: 2, note: 'n1' },
+        { since: 4, until: 4, note: 'n2' }
+      ],
+      { latestStamp: 4 }
+    );
+    sm.appendMessage({
+      role: 'toolResult',
+      toolCallId: 'f_b',
+      toolName: 'fold',
+      content: withStamp(`[fold ${batch.handle}]`, 5),
+      details: {
+        kind: 'fold',
+        handle: batch.handle,
+        since: 't2',
+        until: 't4',
+        firstEntryId: batch.firstEntryId,
+        lastEntryId: batch.lastEntryId,
+        spans: batch.spans.map((s) => ({
+          since: `t${s.since}`,
+          until: `t${s.until ?? s.since}`,
+          firstEntryId: s.firstEntryId,
+          lastEntryId: s.lastEntryId,
+          note: s.note
+        })),
+        messages: batch.omitted.length,
+        tokens: batch.tokens,
+        headline: batch.headline,
+        keptUserTurns: [],
+        files: []
+      } as never,
+      isError: false,
+      timestamp: Date.now()
+    });
+    sm.appendCustomEntry(FOLD_STARTED_TYPE, { handle: batch.handle, edits: batch.edits });
+    for (const e of batch.edits) sm.appendContextEdit(e.targetId, e.replacement);
+    sm.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: batch.handle });
+    sm.appendMessage(signedAssistant('su', call('u_b', 'unfold', { handle: batch.handle })));
+    const unfoldPlan = planUnfold(
+      sm.getBranch(),
+      sm.buildSessionProjection().entries,
+      batch.handle,
+      { callerId: 'u_b' }
+    );
+    return { sm, batch, unfoldPlan };
+  }
+
+  const probe = buildUnfoldReady();
+  assert.ok(probe.unfoldPlan.edits.length >= 4);
+
+  for (let k = 0; k <= probe.unfoldPlan.edits.length; k++) {
+    const { sm: smCrash, batch, unfoldPlan: freshUnfold } = buildUnfoldReady();
+    smCrash.appendMessage(result('u_b', 'unfold', `[unfolded ${batch.handle}]`, 6));
+    smCrash.appendCustomEntry('episodes-fold-unfold-started', {
+      handle: batch.handle,
+      edits: freshUnfold.edits
+    });
+    for (let i = 0; i < k; i++) {
+      const e = freshUnfold.edits[i]!;
+      smCrash.appendContextEdit(e.targetId, e.replacement);
+    }
+    const midMsgs = smCrash.buildSessionProjection().messages;
+    assertResultsHaveCallers(midMsgs, `unfold crash prefix k=${k}`);
+
+    const repairs = completeCutShortFolds(smCrash.getBranch());
+    for (const item of repairs) {
+      if (item.type === 'context_edit') smCrash.appendContextEdit(item.targetId, item.replacement);
+      else smCrash.appendCustomEntry(item.customType, item.data);
+    }
+    assert.ok(!appliedFolds(smCrash.getBranch()).has(batch.handle));
+    const recoveredTxt = smCrash.buildSessionProjection().messages.map(text).join('\n');
+    assert.match(recoveredTxt, /out1/);
+    assert.match(recoveredTxt, /gap-out/);
+    assert.match(recoveredTxt, /out2/);
   }
 });

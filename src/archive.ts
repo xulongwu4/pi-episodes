@@ -263,17 +263,21 @@ export function formatFoldRange(
 ): string {
   const onSuffix = options.onSuffix ?? true;
   const turnsPrefix = options.turnsPrefix ?? false;
-  const spans =
-    fold.spans && fold.spans.length > 0
-      ? fold.spans
-      : [{ since: fold.since, ...(fold.until !== undefined ? { until: fold.until } : {}) }];
+  const hasBatchSpans = Boolean(fold.spans && fold.spans.length > 0);
+  const spans = hasBatchSpans
+    ? fold.spans!
+    : [{ since: fold.since, ...(fold.until !== undefined ? { until: fold.until } : {}) }];
   if (spans.length === 1) {
     const only = spans[0]!;
     if (turnsPrefix) {
       if (!only.until) return `turns from ${only.since} on`;
+      if (!hasBatchSpans) return `turns ${only.since}-${only.until}`;
       return only.until === only.since ? `turn ${only.since}` : `turns ${only.since}-${only.until}`;
     }
-    if (only.until) return only.until === only.since ? only.since : `${only.since}-${only.until}`;
+    if (only.until) {
+      if (!hasBatchSpans) return `${only.since}-${only.until}`;
+      return only.until === only.since ? only.since : `${only.since}-${only.until}`;
+    }
     return onSuffix ? `from ${only.since} on` : only.since;
   }
   const parts = spans.map((span) => {
@@ -773,7 +777,25 @@ export class ThreadIndex {
       }
     }
 
-    const segments = intervals.map(([first, last]) =>
+    // Coalesce adjacent spans when no uncovered context message sits between them so recall
+    // turn read-back and stamp attribution match a contiguous fold.
+    const coalesced: [number, number][] = [];
+    for (const [first, last] of intervals) {
+      const prev = coalesced.at(-1);
+      const hasUncoveredGap =
+        prev !== undefined &&
+        path
+          .slice(prev[1] + 1, first)
+          .some(
+            (entry) => !covered.has(entry.id) && sessionEntryToContextMessages(entry).length > 0
+          );
+      if (prev && !hasUncoveredGap) {
+        prev[1] = Math.max(prev[1], last);
+      } else {
+        coalesced.push([first, last]);
+      }
+    }
+    const segments = coalesced.map(([first, last]) =>
       path
         .slice(first, last + 1)
         .filter((entry) => !covered.has(entry.id))
@@ -893,7 +915,25 @@ export class ThreadIndex {
           messageLimit: fold.last + 1,
           stateAt: snapAt
         });
-      const segments = nestedFoldSpans(fold).map((span) =>
+      const coalescedChildSpans: { first: number; last: number }[] = [];
+      for (const span of nestedFoldSpans(fold)) {
+        const prev = coalescedChildSpans.at(-1);
+        let hasUncoveredGap = false;
+        if (prev) {
+          for (let idx = prev.last + 1; idx < span.first; idx++) {
+            if (!earlier.has(idx)) {
+              hasUncoveredGap = true;
+              break;
+            }
+          }
+        }
+        if (prev && !hasUncoveredGap) {
+          prev.last = Math.max(prev.last, span.last);
+        } else {
+          coalescedChildSpans.push({ first: span.first, last: span.last });
+        }
+      }
+      const segments = coalescedChildSpans.map((span) =>
         archive.messages
           .slice(span.first, span.last + 1)
           .filter((_, index) => !earlier.has(span.first + index))

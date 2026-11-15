@@ -154,10 +154,25 @@ export interface Staleness {
   line: string;
 }
 
+function spanCoversStamp(
+  spans: readonly { since: string; until?: string | undefined }[],
+  idx: number,
+  stamp: number
+): boolean {
+  const span = spans[idx]!;
+  const start = parseStamp(span.since);
+  if (start === undefined) return false;
+  const explicitEnd = span.until ? parseStamp(span.until) : undefined;
+  const nextStart = idx + 1 < spans.length ? parseStamp(spans[idx + 1]!.since) : undefined;
+  const end = explicitEnd ?? (nextStart !== undefined ? nextStart - 1 : Number.POSITIVE_INFINITY);
+  return stamp >= start && stamp <= end;
+}
+
 /** Which files an archived thread touched have changed since it was archived. */
 export async function staleness(
   state: EpisodeState,
-  threads: readonly Thread[]
+  threads: readonly Thread[],
+  relevantStampsByHandle?: ReadonlyMap<string, ReadonlySet<number>>
 ): Promise<Staleness[]> {
   const snapshots = state.snapshots;
   const records = threads.flatMap((thread) => {
@@ -175,14 +190,30 @@ export async function staleness(
   const notes: Staleness[] = [];
   for (const record of records) {
     const filesByTree = new Map<string, string[]>();
+    const addFileForTree = (tree: string, file: string) => {
+      const group = filesByTree.get(tree) ?? [];
+      if (!group.includes(file)) group.push(file);
+      filesByTree.set(tree, group);
+    };
+
     if (record.kind === 'fold' && record.spans && record.spans.length > 1) {
-      for (const file of record.files) {
-        const latestSpan = record.spans.findLast((span) => span.files?.includes(file));
-        const tree = latestSpan?.treeAfter ?? record.treeAfter;
-        if (!tree) continue;
-        const group = filesByTree.get(tree) ?? [];
-        group.push(file);
-        filesByTree.set(tree, group);
+      const anySpanMetadata = record.spans.some(
+        (span) => span.files !== undefined || span.treeAfter !== undefined
+      );
+      if (!anySpanMetadata && record.treeAfter) {
+        filesByTree.set(record.treeAfter, [...record.files]);
+      } else {
+        const filterStamps = relevantStampsByHandle?.get(record.handle);
+        const matchedSpans = filterStamps
+          ? record.spans.filter((_, idx) =>
+              [...filterStamps].some((stamp) => spanCoversStamp(record.spans!, idx, stamp))
+            )
+          : record.spans;
+        const targetSpans = matchedSpans.length > 0 ? matchedSpans : record.spans;
+        for (const span of targetSpans) {
+          if (!span.treeAfter || !span.files?.length) continue;
+          for (const file of span.files) addFileForTree(span.treeAfter, file);
+        }
       }
     } else if (record.treeAfter) {
       filesByTree.set(record.treeAfter, [...record.files]);
@@ -412,7 +443,9 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
           turn,
           chars: text.length
         };
-        const stale = await staleness(state, [thread]);
+        const askedStamps = new Set<number>();
+        for (let s = first!; s <= (last ?? first!); s++) askedStamps.add(s);
+        const stale = await staleness(state, [thread], new Map([[thread.handle, askedStamps]]));
         if (stale.length > 0) {
           details.stale = stale.map(({ handle, files }) => ({ handle, files }));
         }
@@ -477,7 +510,22 @@ export function registerRecall(pi: ExtensionAPI, state: EpisodeState): void {
         matches.some((found) => found.handle === thread.handle)
       );
       details.hits = hitThreads.map((thread) => thread.handle);
-      const stale = await staleness(state, hitThreads);
+      const relevantStampsByHandle = new Map<string, ReadonlySet<number>>();
+      for (const thread of hitThreads) {
+        const threadMatches = matches.filter((found) => found.handle === thread.handle);
+        const stamps: number[] = [];
+        let allStamped = threadMatches.length > 0;
+        for (const found of threadMatches) {
+          const parsed = found.turn !== undefined ? parseStamp(found.turn) : undefined;
+          if (parsed === undefined) {
+            allStamped = false;
+            break;
+          }
+          stamps.push(parsed);
+        }
+        if (allStamped) relevantStampsByHandle.set(thread.handle, new Set(stamps));
+      }
+      const stale = await staleness(state, hitThreads, relevantStampsByHandle);
       if (stale.length > 0) {
         details.stale = stale.map(({ handle, files }) => ({ handle, files }));
       }

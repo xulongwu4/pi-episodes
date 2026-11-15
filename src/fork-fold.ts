@@ -176,7 +176,6 @@ export class ForkFolds {
     const normalizedSpans = normalizeFoldSpans((args ?? {}) as Record<string, unknown>);
 
     const entries = this.entries(messages);
-    const foldIndex = entries.length - 1;
     // The task is the first entry after the parent's view and the siblings; the fork's own
     // work starts after it.
     const batch = planFoldBatch(entries, toolCallId, normalizedSpans, {
@@ -214,7 +213,7 @@ export class ForkFolds {
 
     const spanDetails: FoldSpanDetails[] = batch.spans.map((span) => {
       const sinceLabel = stampLabel(span.since);
-      const runsToCall = span.endIndex === foldIndex;
+      const runsToCall = span.keptFrom === undefined;
       const untilLabel = runsToCall
         ? span.lastStamp !== undefined && span.lastStamp !== span.since
           ? stampLabel(span.lastStamp)

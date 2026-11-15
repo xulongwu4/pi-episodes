@@ -1242,6 +1242,7 @@ export interface NormalizedFoldSpan {
 export interface FoldBatchSpanPlan {
   since: number;
   until: number | undefined;
+  keptFrom: number | undefined;
   note: string;
   startIndex: number;
   endIndex: number;
@@ -1317,9 +1318,10 @@ function parseSingleFoldSpan(raw: Record<string, unknown>): NormalizedFoldSpan {
 
 /** Validates single-span `{ since, until?, note }` or batch `{ spans: [...] }` arguments. */
 export function normalizeFoldSpans(params: Record<string, unknown>): NormalizedFoldSpan[] {
-  const hasSpans = params.spans !== undefined;
-  const hasSingle =
-    params.since !== undefined || params.until !== undefined || params.note !== undefined;
+  const hasSpans = params.spans !== undefined && params.spans !== null;
+  const isPresent = (value: unknown): boolean =>
+    value !== undefined && value !== null && (typeof value !== 'string' || value.trim() !== '');
+  const hasSingle = isPresent(params.since) || isPresent(params.until) || isPresent(params.note);
   if (hasSpans && hasSingle) {
     throw new FoldError('bad-spans', 'Pass either spans or top-level since/until/note, not both.');
   }
@@ -1346,27 +1348,29 @@ export function normalizeFoldSpans(params: Record<string, unknown>): NormalizedF
 export function mergeSpanDiskChanges(
   spanChangesList: readonly (readonly DiskChange[] | undefined)[]
 ): DiskChange[] | undefined {
-  let anyKnown = false;
+  if (spanChangesList.length === 0 || spanChangesList.some((list) => list === undefined)) {
+    return undefined;
+  }
   const byPath = new Map<string, string>();
   for (const list of spanChangesList) {
-    if (!list) continue;
-    anyKnown = true;
-    for (const change of list) {
+    for (const change of list!) {
       const prev = byPath.get(change.path);
       if (prev === undefined) {
         byPath.set(change.path, change.status);
-      } else if (prev === 'A' && change.status === 'D') {
-        byPath.delete(change.path);
-      } else if (prev === 'A' && change.status === 'M') {
-        byPath.set(change.path, 'A');
+      } else if (prev === 'A') {
+        if (change.status === 'D') byPath.delete(change.path);
+        else byPath.set(change.path, 'A');
       } else if (change.status === 'D') {
         byPath.set(change.path, 'D');
+      } else if (prev === 'D' && change.status === 'A') {
+        byPath.set(change.path, 'M');
+      } else if (change.status === 'T') {
+        byPath.set(change.path, 'T');
       } else {
         byPath.set(change.path, 'M');
       }
     }
   }
-  if (!anyKnown) return undefined;
   return [...byPath.entries()].map(([path, status]) => ({ status, path }));
 }
 
@@ -1388,8 +1392,6 @@ export function planFoldBatch(
       'spans must be a non-empty array of { since, until?, note } items.'
     );
   }
-  const callerId = options.callerId ?? foldCallId;
-  const foldIndex = entries.findIndex((entry) => callsTool(entry, callerId));
   const entryIndexById = new Map(entries.map((entry, idx) => [entry.sourceEntry.id, idx]));
 
   const resolved = spans.map((item) => {
@@ -1408,6 +1410,16 @@ export function planFoldBatch(
   });
 
   resolved.sort((a, b) => a.startIndex - b.startIndex || a.endIndex - b.endIndex);
+
+  for (let i = 0; i < resolved.length - 1; i++) {
+    const spanItem = resolved[i]!.item;
+    if (spanItem.until === undefined) {
+      throw new FoldError(
+        'bad-spans',
+        `Span from ${stampLabel(spanItem.since)} must specify "until"; only the final span in a batch can omit "until".`
+      );
+    }
+  }
 
   for (let i = 1; i < resolved.length; i++) {
     const prev = resolved[i - 1]!;
@@ -1433,11 +1445,10 @@ export function planFoldBatch(
   for (let idx = entries.length - 1; idx >= resolved[0]!.endIndex; idx--) {
     if (selectedIndices.has(idx)) continue;
     const entry = entries[idx]!;
-    if (entry.sourceEntry.type === 'message' && entry.sourceEntry.message.role === 'assistant') {
-      const projected = entry.messages[0];
-      const blocks =
-        projected?.role === 'assistant' ? projected.content : entry.sourceEntry.message.content;
-      const retired = retireAssistantContent(blocks);
+    if (entry.messages.length === 0) continue;
+    const shown = entry.messages[0];
+    if (shown?.role === 'assistant') {
+      const retired = retireAssistantContent(shown.content);
       if (retired) {
         retireEdits.push({
           type: 'context_edit',
@@ -1479,7 +1490,8 @@ export function planFoldBatch(
   const lastResolved = resolved.at(-1)!;
   const trailingKeptFrom =
     lastResolved.plan.keptFrom === undefined ? undefined : stampLabel(lastResolved.plan.keptFrom);
-  const keptFrom = interiorGaps[0]?.firstStamp ?? trailingKeptFrom;
+  const firstKeptFrom = interiorGaps[0]?.firstStamp ?? trailingKeptFrom;
+
   let keptNotice: string | undefined;
   if (interiorGaps.length === 0) {
     keptNotice = trailingKeptFrom
@@ -1499,12 +1511,8 @@ export function planFoldBatch(
 
   const omitted = resolved.flatMap((entry) => entry.plan.omitted);
   const spanMessages = resolved.flatMap((entry) => entry.plan.spanMessages);
-  const tokens = estimateTokens(omitted);
   const keptUserTurns = resolved.flatMap((entry) => entry.plan.keptUserTurns);
-
-  const selectedEntries = resolved.flatMap((entry) =>
-    entries.slice(entry.startIndex, entry.endIndex)
-  );
+  const selectedEntries = entries.filter((_, idx) => selectedIndices.has(idx));
   const applied = options.applied ?? appliedFolds(entries.map((entry) => entry.sourceEntry));
   const covers = coveredNotes(entries, selectedEntries, applied);
   const media = coveredMedia(selectedEntries, applied);
@@ -1518,7 +1526,7 @@ export function planFoldBatch(
   }
   const archivedReadTurns: string[] = [];
   const seenArchived = new Set<string>();
-  for (let idx = 0; idx < lastResolved.startIndex; idx++) {
+  for (let idx = resolved[0]!.endIndex; idx < entries.length; idx++) {
     if (selectedIndices.has(idx)) continue;
     for (const msg of entries[idx]!.messages) {
       if (msg.role !== 'toolResult' || msg.toolName !== 'read') continue;
@@ -1538,6 +1546,7 @@ export function planFoldBatch(
     return {
       since: entry.item.since,
       until: entry.item.until,
+      keptFrom: entry.plan.keptFrom,
       note: entry.item.note,
       startIndex: entry.startIndex,
       endIndex: entry.endIndex,
@@ -1557,14 +1566,18 @@ export function planFoldBatch(
       : batchSpans
           .map((span) => {
             const sinceLabel = stampLabel(span.since);
-            const runsToCall = span.endIndex === foldIndex;
+            const runsToCall = span.keptFrom === undefined;
             const endLabel = runsToCall
               ? span.lastStamp !== undefined && span.lastStamp !== span.since
                 ? stampLabel(span.lastStamp)
                 : undefined
               : stampLabel(span.lastStamp ?? span.until ?? span.since);
+            const singleSpanRange = {
+              since: sinceLabel,
+              ...(endLabel ? { until: endLabel } : {})
+            };
             const header = formatFoldRange(
-              { since: sinceLabel, ...(endLabel ? { until: endLabel } : {}) },
+              { ...singleSpanRange, spans: [singleSpanRange] },
               { turnsPrefix: true }
             );
             return `[${header}]\n${span.note}`;
@@ -1589,12 +1602,13 @@ export function planFoldBatch(
   });
   const combinedOpen = combinedOpenList.length > 0 ? combinedOpenList.join('; ') : undefined;
 
+  const tokens = estimateTokens(omitted);
   return {
     handle: resolved[0]!.plan.handle,
     spans: batchSpans,
     firstEntryId: resolved[0]!.plan.firstEntryId,
     lastEntryId: lastResolved.plan.lastEntryId,
-    keptFrom,
+    keptFrom: firstKeptFrom,
     keptNotice,
     note: combinedNote,
     headline: combinedHeadline,
@@ -2008,7 +2022,25 @@ export function planUnfold(
     return out;
   };
 
+  const compactionIndex = branch.findLastIndex((entry) => entry.type === 'compaction');
   const ownIntervals = resolveIntervals(record);
+  if (compactionIndex >= 0) {
+    const compaction = branch[compactionIndex] as SessionEntry & {
+      type: 'compaction';
+      firstKeptEntryId: string;
+    };
+    const firstKeptIndex = branchIndexById.get(compaction.firstKeptEntryId) ?? -1;
+    const firstSpanIndex = ownIntervals?.[0]?.[0] ?? -1;
+    if (
+      !ownIntervals ||
+      noteIndex <= compactionIndex ||
+      (firstSpanIndex <= compactionIndex && (firstKeptIndex < 0 || firstSpanIndex < firstKeptIndex))
+    ) {
+      throw new Error(
+        `${trimmed} lies before the latest compaction: its turns were compacted by pi and remain accessible via recall and ask.`
+      );
+    }
+  }
   if (!ownIntervals || ownIntervals.length === 0) {
     throw new Error(`Cannot find the start of ${trimmed} on this branch.`);
   }
@@ -2030,23 +2062,6 @@ export function planUnfold(
     if (overlaps) {
       throw new Error(
         `${trimmed} overlaps active fold ${laterFold.handle}; unfold ${laterFold.handle} first.`
-      );
-    }
-  }
-
-  const compactionIndex = branch.findLastIndex((entry) => entry.type === 'compaction');
-  if (compactionIndex >= 0) {
-    const compaction = branch[compactionIndex] as SessionEntry & {
-      type: 'compaction';
-      firstKeptEntryId: string;
-    };
-    const firstKeptIndex = branchIndexById.get(compaction.firstKeptEntryId) ?? -1;
-    if (
-      firstBranchIndex <= compactionIndex &&
-      (firstKeptIndex < 0 || firstBranchIndex < firstKeptIndex)
-    ) {
-      throw new Error(
-        `${trimmed} lies before the latest compaction: its turns were compacted by pi and remain accessible via recall and ask.`
       );
     }
   }
@@ -2366,7 +2381,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
 
       const spanDetails: FoldSpanDetails[] = batch.spans.map((span) => {
         const sinceLabel = stampLabel(span.since);
-        const runsToCall = span.endIndex === foldIndex;
+        const runsToCall = span.keptFrom === undefined;
         const untilLabel = runsToCall
           ? span.lastStamp !== undefined && span.lastStamp !== span.since
             ? stampLabel(span.lastStamp)
@@ -2394,6 +2409,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       const perSpanFiles = batch.spans.map(
         (span) => new Set(touchedPaths(span.spanMessages, state.cwd))
       );
+      const changedPathsAnySpan = new Set<string>();
 
       let changes: DiskChange[] | undefined;
       let treeAfter: string | undefined;
@@ -2408,7 +2424,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         const perSpanChanges: (DiskChange[] | undefined)[] = [];
         for (let i = 0; i < batch.spans.length; i++) {
           const span = batch.spans[i]!;
-          const runsToCall = span.endIndex === foldIndex;
+          const runsToCall = span.keptFrom === undefined;
           const spanTreeAfter =
             runsToCall || span.lastStamp === undefined
               ? await currentTree()
@@ -2427,6 +2443,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
             for (const change of spanDiff ?? []) {
               files.add(change.path);
               perSpanFiles[i]!.add(change.path);
+              changedPathsAnySpan.add(change.path);
             }
           } else {
             perSpanChanges.push(undefined);
@@ -2461,7 +2478,9 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       const readOnly = readOnlyPaths(
         batch.spanMessages,
         state.cwd,
-        (changes ?? []).map((change) => change.path)
+        changedPathsAnySpan.size > 0
+          ? [...changedPathsAnySpan]
+          : (changes ?? []).map((change) => change.path)
       );
       if (readOnly.length > 0) details.readOnly = readOnly;
       details.noteTokens = Math.ceil(batch.note.length / 4);
