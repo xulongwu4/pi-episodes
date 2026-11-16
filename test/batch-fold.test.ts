@@ -153,8 +153,6 @@ async function createLiveSession(
       : SessionManager.inMemory(dir),
     settingsManager: SettingsManager.inMemory({
       compaction: { enabled: false },
-      // The line a fold leaves is on for these tests, whatever the model is called.
-      ...({ episodes: { foldLine: true } } as object),
       ...(options.codemodeOnly ? { codemode: { mode: 'only' } } : {})
     })
   });

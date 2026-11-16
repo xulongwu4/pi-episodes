@@ -1053,7 +1053,7 @@ test('forkThreads replays archived fork folds, unfold stubs and historical neste
   assert.ok(forkText.includes('sig_final'));
   // The fold still in effect shows its marker; the unfolded one shows none.
   assert.ok(forkText.includes(foldMarker(midHandle, 't12')));
-  assert.ok(!forkText.includes(`[${earlyHandle}: earlier responses`));
+  assert.ok(!forkText.includes(foldMarker(earlyHandle, 't10')));
 
   // 3. Nested fold ep-mid's historical context() at the time ep-mid ran STILL hides early-fact
   //    and shows early note (because ep-early was unfolded AFTER ep-mid was created!).
@@ -1063,7 +1063,7 @@ test('forkThreads replays archived fork folds, unfold stubs and historical neste
   assert.ok(midCtxText.includes('early note'));
   assert.ok(midCtxText.includes('mid-fact'));
   assert.ok(midCtxText.includes(foldMarker(earlyHandle, 't10')));
-  assert.ok(!midCtxText.includes(`[${midHandle}: earlier responses`));
+  assert.ok(!midCtxText.includes(foldMarker(midHandle, 't12')));
 });
 
 test('ThreadIndex.find resolves fold active on Branch 1 even when unfolded on Branch 2', async () => {
@@ -1929,7 +1929,9 @@ test('a fold in a fork takes the line of the fold it covers, also of one that an
   const lines = () =>
     folds.view(msgs).flatMap((message) => {
       const block = message.role === 'assistant' ? message.content[0] : undefined;
-      return block?.type === 'text' && block.text.startsWith('[ep-') ? [block.text] : [];
+      return block?.type === 'text' && block.text.startsWith('[Earlier responses of mine')
+        ? [block.text]
+        : [];
     });
 
   run('a'); // t10
@@ -1954,6 +1956,5 @@ test('a fold in a fork takes the line of the fold it covers, also of one that an
   assert.deepEqual(lines(), [foldMarker(first.handle, 't10')]);
   const third = await fold('f3', 't11');
   assert.deepEqual(third.covers, [first.handle]);
-  assert.equal(lines().length, 1);
-  assert.match(lines()[0]!, new RegExp(`^\\[${third.handle}: `));
+  assert.deepEqual(lines(), [foldMarker(third.handle, 't11-t14')]);
 });

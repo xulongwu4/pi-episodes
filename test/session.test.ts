@@ -97,8 +97,7 @@ async function createSession(
           ? {}
           : { keepRecentTokens: options.keepRecentTokens })
       },
-      // The line a fold leaves is on for these tests, whatever the model is called.
-      ...{ episodes: { foldLine: true, ...options.episodes } }
+      ...(options.episodes ? { episodes: options.episodes } : {})
     })
   });
   await session.bindExtensions({});
@@ -137,7 +136,7 @@ test('fold, recall, ask and fork in a live session', async () => {
       const handleOf = /ep-[0-9a-f]{8}/.exec(note)![0];
       assert.equal(
         text(conversation(context)[1]!),
-        `[${handleOf}: earlier responses of mine stood here, with the tool calls I made (t1-t3) and the outputs they returned. I read those outputs, and then I folded all of it out of this conversation: that is why no call and no output is shown here. The note in the result of the fold call below is my own record of what the outputs showed, written with them in view; recall with this handle reads them back.]`
+        `[Earlier responses of mine stood here, with the tool calls I made (t1-t3) and the outputs they returned. I read those outputs, and then I folded all of it out of this conversation as ${handleOf}: that is why no call and no output is shown here. The note in the result of the fold call below is my own record of what the outputs showed, written with them in view; recall with that handle reads them back.]`
       );
       assert.match(note, /Build passes after regenerating the client\./);
       assert.doesNotMatch(note, /TS2322/);
@@ -220,11 +219,18 @@ test('fold, recall, ask and fork in a live session', async () => {
   }
 });
 
+// The line does not go by the model: the same for one called Claude and for any other.
 for (const [name, foldLine, model, lined] of [
-  ['left to the model, a fold leaves its line for a Claude model', 'auto', 'claude-test-1', true],
-  ['left to the model, a fold leaves no line for another model', 'auto', undefined, false],
-  ['a setting that is no boolean leaves it to the model', 'yes', undefined, false],
-  ['set on, a fold leaves its line for any model', true, undefined, true],
+  ['with no setting, a fold leaves its line', undefined, undefined, true],
+  [
+    'with no setting, a fold leaves its line for a Claude model too',
+    undefined,
+    'claude-test-1',
+    true
+  ],
+  ['a setting that is no boolean counts as none', 0, undefined, true],
+  ['set on, a fold leaves its line', true, undefined, true],
+  ['set off, a fold leaves no line', false, undefined, false],
   ['set off, a fold leaves no line for a Claude model either', false, 'claude-test-1', false]
 ] as const) {
   test(`the line of a fold: ${name}`, async () => {
@@ -245,7 +251,7 @@ for (const [name, foldLine, model, lined] of [
               : ['user', 'assistant', 'toolResult']
           );
           assert.equal(
-            shown.some((message) => /earlier responses of mine stood here/.test(text(message))),
+            shown.some((message) => /Earlier responses of mine stood here/.test(text(message))),
             lined
           );
           return fauxAssistantMessage('Done.');
@@ -1089,12 +1095,12 @@ test('a fork running next to another does not reach the folds the other made', a
   }
 });
 
-// Left to the model, the line goes by the model the fork runs on.
 for (const [name, foldLine, model, line] of [
+  ['with the line when nothing is set', undefined, undefined, true],
+  ['with the line when nothing is set, for a Claude model too', undefined, 'claude-test-1', true],
   ['with the line as set', true, undefined, true],
   ['without the line as set', false, undefined, false],
-  ['with the line for a Claude model', 'auto', 'claude-test-1', true],
-  ['without the line for another model', 'auto', undefined, false]
+  ['without the line as set, for a Claude model either', false, 'claude-test-1', false]
 ] as const) {
   test(`a fork folds with until and keeps its later work, ${name}`, async () => {
     let stamp = '';
@@ -1118,7 +1124,7 @@ for (const [name, foldLine, model, line] of [
           );
           // The fork's folds leave their line as the session's do.
           assert.equal(
-            messages.some((message) => /earlier responses of mine stood here/.test(text(message))),
+            messages.some((message) => /Earlier responses of mine stood here/.test(text(message))),
             line
           );
           return fauxAssistantMessage('Build passes.\n- Open: none.');

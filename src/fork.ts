@@ -24,7 +24,7 @@ import { ForkFolds } from './fork-fold.js';
 import type { ForkRegistry, LiveFork } from './forks-view.js';
 import { readOnlyPaths, textOf, touchedPaths } from './messages.js';
 import { addUsage, emptyUsage, requestOptions } from './requests.js';
-import { episodesSettings, writesFoldLine } from './settings.js';
+import { episodesSettings } from './settings.js';
 import type { DiskChange } from './snapshots.js';
 import type { EpisodeState } from './state.js';
 import { forkRenderers, refreshStatus } from './ui.js';
@@ -215,7 +215,7 @@ export function registerFork(pi: ExtensionAPI, state: EpisodeState, registry: Fo
         prefixLength: prefix.length,
         siblings: siblings.length,
         archiveDir: archiveDir(ctx.sessionManager),
-        line: writesFoldLine(episodesSettings(pi.getSettings()).foldLine, model)
+        line: episodesSettings(pi.getSettings()).foldLine
       });
       const leaf = ctx.sessionManager.getLeafId();
       // The transcript as it stands: what is written after every turn, and what a call of the

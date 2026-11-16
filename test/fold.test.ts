@@ -40,7 +40,7 @@ import {
 import { carriedMediaBlocks, holdsCarriedMedia } from '../src/images.js';
 import { messageText, skillPaths, touchedPaths } from '../src/messages.js';
 import { nudgeGrowth, tokensBehindNote } from '../src/nudge.js';
-import { episodesSettings, writesFoldLine } from '../src/settings.js';
+import { episodesSettings } from '../src/settings.js';
 import { readStamp } from '../src/stamps.js';
 import { assistant, call, result, session, user } from './helpers.js';
 
@@ -926,7 +926,9 @@ function applyFold(
 function markersIn(manager: SessionManager): string[] {
   return manager.buildSessionProjection().messages.flatMap((message) => {
     const block = message.role === 'assistant' ? message.content[0] : undefined;
-    return block?.type === 'text' && block.text.startsWith('[ep-') ? [block.text] : [];
+    return block?.type === 'text' && block.text.startsWith('[Earlier responses of mine')
+      ? [block.text]
+      : [];
   });
 }
 
@@ -1286,8 +1288,10 @@ test('the line goes where the first response stood that is sent again, and claim
   const words = session([user('first', 1), assistant('An answer.'), assistant(call('f1', 'fold'))]);
   const said = planFold(words.manager.buildSessionProjection().entries, 'f1', 1);
   const line = foldMarker(said.handle, 't1', false);
-  assert.doesNotMatch(line, /tool calls|outputs/);
-  assert.match(line, /^\[ep-[0-9a-f]{8}: earlier responses of mine stood here \(t1\)\. /);
+  assert.equal(
+    line,
+    `[Earlier responses of mine stood here (t1). I folded them out of this conversation as ${said.handle}: that is why they are not shown here. The note in the result of the fold call below is my own record of them, written with them in view; recall with that handle reads them back.]`
+  );
   assert.deepEqual(said.edits, [
     {
       type: 'context_edit',
@@ -1320,8 +1324,8 @@ test('with the line off, a fold removes the first response like the rest and sti
   );
   assert.ok(planFoldBatch(entries, 'f1', [{ since: 1, note: 'n' }]).lineTokens > 0);
 
-  // A line that an earlier fold left, before the setting changed or under another model, is
-  // still the line of that fold: a fold that covers its note takes it away.
+  // A line that an earlier fold left before the setting was turned off is still the line of
+  // that fold: a fold that covers its note takes it away.
   const later = session([
     user('first', 1),
     assistant(call('a', 'bash')),
@@ -1342,26 +1346,20 @@ test('with the line off, a fold removes the first response like the rest and sti
   assert.ok(second.edits.every((edit) => edit.replacement === null));
 });
 
-test('the line is written as set, and left to the model for Claude models only', () => {
-  assert.equal(episodesSettings({}).foldLine, 'auto');
+test('the line is written unless the setting turns it off', () => {
+  assert.equal(episodesSettings({}).foldLine, true);
   assert.equal(episodesSettings({ episodes: { foldLine: false } }).foldLine, false);
   assert.equal(episodesSettings({ episodes: { foldLine: true } }).foldLine, true);
-  assert.equal(episodesSettings({ episodes: { foldLine: 'on' } }).foldLine, 'auto');
-  for (const model of [
-    { provider: 'openai-codex', id: 'gpt-6-luna' },
-    { id: 'gemini-3.8-flash' },
-    undefined
-  ]) {
-    assert.equal(writesFoldLine('auto', model), false);
-    assert.equal(writesFoldLine(true, model), true);
+  for (const foldLine of ['off', '', 0, null]) {
+    assert.equal(episodesSettings({ episodes: { foldLine } }).foldLine, true);
   }
-  for (const model of [
-    { provider: 'anthropic', id: 'haiku-latest' },
-    { provider: 'amazon-bedrock', id: 'us.anthropic.claude-haiku-5-5-v1:0' },
-    { provider: 'google-vertex', id: 'Claude-Sonnet-5-5' }
-  ]) {
-    assert.equal(writesFoldLine('auto', model), true);
-    assert.equal(writesFoldLine(false, model), false);
+});
+
+test('the line stands in brackets and names its fold inside the sentence, not in front', () => {
+  for (const line of [foldMarker('ep-1a2b3c4d', 't2-t4'), foldMarker('ep-1a2b3c4d', 't2', false)]) {
+    assert.match(line, /^\[Earlier responses of mine stood here[^\]]*\]$/);
+    assert.match(line, /folded (all of it|them) out of this conversation as ep-1a2b3c4d: /);
+    assert.equal(line.split('ep-1a2b3c4d').length, 2);
   }
 });
 

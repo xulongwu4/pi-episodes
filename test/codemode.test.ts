@@ -139,8 +139,7 @@ async function createSession(
     settingsManager: SettingsManager.inMemory({
       compaction: { enabled: false, ...compaction },
       // Pi's settings type has no slot for extension keys.
-      // The line a fold leaves is on for these tests, whatever the model is called.
-      ...({ episodes: { foldLine: true, ...settings } } as object),
+      ...({ episodes: settings } as object),
       ...(mode === 'off' ? {} : { codemode: { mode } })
     })
   });
@@ -199,12 +198,13 @@ test('a fold from a codemode script folds the span and leaves the script result 
         messages.map((message) => message.role),
         ['user', 'assistant', 'assistant', 'toolResult']
       );
-      assert.match(
-        text(messages[1]!),
-        /^\[ep-[0-9a-f]{8}: earlier responses of mine stood here, with the tool calls I made \(t1-t2\) and the outputs/
-      );
       const note = text(messages[3]!);
       assert.match(note, /\[fold ep-[0-9a-f]{8}: 2 messages, t1-t2,/);
+      assert.ok(
+        text(messages[1]!).startsWith(
+          `[Earlier responses of mine stood here, with the tool calls I made (t1-t2) and the outputs they returned. I read those outputs, and then I folded all of it out of this conversation as ${/ep-[0-9a-f]{8}/.exec(note)![0]}: `
+        )
+      );
       assert.match(note, /fixed by regenerating the client/);
       // Printed by the script once; not appended a second time.
       assert.equal(note.match(/\[fold ep-/g)?.length, 1);
@@ -2782,7 +2782,7 @@ test('a fold puts its line over a response that an earlier turn-end handler edit
         // The response leaves with its span whatever the handler made of it: the line stands
         // there, and no call is left without its result.
         const sent = conversation(context).map(text);
-        assert.match(sent[1]!, /^\[ep-[0-9a-f]{8}: earlier responses of mine stood here/);
+        assert.match(sent[1]!, /^\[Earlier responses of mine stood here/);
         assert.doesNotMatch(sent.join('\n'), /redacted response/);
         assert.doesNotMatch(sent.join('\n'), /^out$/m);
         return fauxAssistantMessage('done');
@@ -2927,7 +2927,7 @@ for (const foldLine of [true, false]) {
         (context) => {
           const shown = conversation(context).map(text);
           assert.equal(
-            shown.filter((message) => /earlier responses of mine stood here/.test(message)).length,
+            shown.filter((message) => /Earlier responses of mine stood here/.test(message)).length,
             foldLine ? 2 : 0
           );
           assert.ok(shown.some((message) => /two/.test(message)));

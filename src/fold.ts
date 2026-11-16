@@ -54,7 +54,7 @@ import {
 } from './messages.js';
 import { completeReadBlocks } from './output.js';
 import { planFoldTailPruning, type ReadPruneDependency } from './prune.js';
-import { episodesSettings, writesFoldLine } from './settings.js';
+import { episodesSettings } from './settings.js';
 
 export * from './prune.js';
 
@@ -424,14 +424,17 @@ const PREVIEW_WIDTH = 72;
  * its note describes, and one model then told the user that it had never run the commands
  * and that its own note was made up. The line says why nothing is shown, because the fold
  * call can come right after it, and a line that only claimed the work read as the opening
- * of that same response, with no call behind it. MEASUREMENTS.md, section 15, has the
- * wordings and the other forms tried. A span without a tool call gets a line that claims
- * none.
+ * of that same response, with no call behind it. The brackets are needed for the same reason:
+ * without them the sentences read as part of that response. The handle stands inside the
+ * sentence and not in front: a line that opened with it, like the tags the harness writes,
+ * was copied by another model as its whole answer in long sessions. MEASUREMENTS.md,
+ * section 15, has the wordings and the other forms tried. A span without a tool call gets a
+ * line that claims none.
  */
 export function foldMarker(handle: string, turns: string, calls = true): string {
   return calls
-    ? `[${handle}: earlier responses of mine stood here, with the tool calls I made (${turns}) and the outputs they returned. I read those outputs, and then I folded all of it out of this conversation: that is why no call and no output is shown here. The note in the result of the fold call below is my own record of what the outputs showed, written with them in view; recall with this handle reads them back.]`
-    : `[${handle}: earlier responses of mine stood here (${turns}). I folded them out of this conversation: that is why they are not shown here. The note in the result of the fold call below is my own record of them, written with them in view; recall with this handle reads them back.]`;
+    ? `[Earlier responses of mine stood here, with the tool calls I made (${turns}) and the outputs they returned. I read those outputs, and then I folded all of it out of this conversation as ${handle}: that is why no call and no output is shown here. The note in the result of the fold call below is my own record of what the outputs showed, written with them in view; recall with that handle reads them back.]`
+    : `[Earlier responses of mine stood here (${turns}). I folded them out of this conversation as ${handle}: that is why they are not shown here. The note in the result of the fold call below is my own record of them, written with them in view; recall with that handle reads them back.]`;
 }
 
 /**
@@ -2416,7 +2419,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         batch = planFoldBatch(entries, toolCallId, normalizedSpans, {
           latestStamp: state.nextStamp - 1,
           callerId: scriptCall ?? toolCallId,
-          line: writesFoldLine(episodesSettings(pi.getSettings()).foldLine, ctx.model)
+          line: episodesSettings(pi.getSettings()).foldLine
         });
       } catch (error) {
         if (error instanceof FoldError) {

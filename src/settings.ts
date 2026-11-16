@@ -34,11 +34,10 @@ export interface EpisodesSettings {
   snapshots: boolean;
   /**
    * Leave a line where a folded span began, in place of its first response (see foldMarker).
-   * 'auto' writes it for Claude models only. Without it they take the missing calls for a
-   * sign that their own note is made up; with it gpt-6-luna comes to write the line as its
-   * answer in long sessions (MEASUREMENTS.md, section 15).
+   * Without it Claude models take the missing calls for a sign that their own note is made up
+   * (MEASUREMENTS.md, section 15). Off removes the span whole.
    */
-  foldLine: boolean | 'auto';
+  foldLine: boolean;
 }
 
 const DEFAULTS: EpisodesSettings = {
@@ -53,7 +52,7 @@ const DEFAULTS: EpisodesSettings = {
   outputCapChars: 16_000,
   outputCapKeepChars: 6_000,
   snapshots: true,
-  foldLine: 'auto'
+  foldLine: true
 };
 
 function flag(value: unknown, fallback: boolean): boolean {
@@ -78,15 +77,6 @@ export function episodesSettings(settings: object): EpisodesSettings {
     outputCapChars: positive(raw.outputCapChars, DEFAULTS.outputCapChars),
     outputCapKeepChars: positive(raw.outputCapKeepChars, DEFAULTS.outputCapKeepChars),
     snapshots: flag(raw.snapshots, DEFAULTS.snapshots),
-    foldLine: typeof raw.foldLine === 'boolean' ? raw.foldLine : DEFAULTS.foldLine
+    foldLine: flag(raw.foldLine, DEFAULTS.foldLine)
   };
-}
-
-/** Whether a fold made with this model leaves its line: as set, or for Claude models only. */
-export function writesFoldLine(
-  setting: boolean | 'auto',
-  model: { provider?: string; id?: string } | undefined
-): boolean {
-  if (setting !== 'auto') return setting;
-  return model?.provider === 'anthropic' || /claude/i.test(model?.id ?? '');
 }
