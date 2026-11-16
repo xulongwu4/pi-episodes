@@ -423,8 +423,12 @@ Not measured: a session with more than one such merge, and several sessions per 
 | The same | mid-run | 6 | 2 | 1 | 5 |
 | The same, the line saying "this line is not what the call returned ... shown here in full when it ran" | next request | 6 | 2 | 0 | 5 |
 | The same | mid-run | 6 | 2 | 0 | 6 |
-| **A line in place of the first response that also says why nothing is shown; system prompt** (what a fold does now) | next request | 12 | 0 | 4 | 1 |
+| **A line in place of the first response that also says why nothing is shown; system prompt** (the line until 2026-11-16, opening with the handle: "[ep-1a2b3c4d: earlier responses of mine stood here ...") | next request | 12 | 0 | 4 | 1 |
 | **The same** | mid-run | 12 | 0 | 2 | 1 |
+| The same sentences without the brackets, the handle inside the sentence ("... folded all of it out of this conversation as ep-1a2b3c4d: ...") | next request | 6 | 0 | 0 | 4 |
+| The same | mid-run | 6 | 6 | 0 | 5 |
+| **The same sentences in brackets, the handle inside the sentence; system prompt** (what a fold does now, see "One line for every model") | next request | 12 | 0 | 3 | 1 |
+| **The same** | mid-run | 12 | 0 | 0 | 1 |
 
 What the retractions said, with nothing left of the span: "I never ran `cat data/build.log` for your first request", "the fold note I just wrote states an artifact value and log details that I never actually read", "Please don't rely on it." A sentence added to the fold's result, saying that the note was written with the messages in view, changed nothing (6 of 6 retracted, in an earlier set).
 
@@ -455,9 +459,46 @@ Sessions written by the version before, which stripped provider signatures from 
 
 Without the line the retraction happens in long work too, each time at or right after a fold: "Before I answer incident-73, I need to correct my last fold note. [...] The per-incident figures I recorded for 33 to 72 also came from my own notes rather than from output I can show in this session, so I can't vouch for them." In the codemode session one such turn went on to read nine reports again and "corrected" a right figure in the note to a wrong one. With the line there was none; the two caveats read "my digest of the folded span t1-t60 was written from tool outputs that are no longer visible in this context" and "my earlier folded summaries of incidents 45-57 were not re-checked here". The scores do not show any of this: the checks grade the answer to the request at hand, which the agent worked out from the files each time. The cost difference of 15% and 19% is in part the work the retractions caused and in part the spread between sessions, which one session per cell does not separate.
 
-**gpt-6-luna in long sessions.** 2026-11-15/16, pi 1.5.0, commit c835d91, which wrote the line for every model: six 97-turn and two 302-turn sessions on gpt-6-luna at low thinking, plain and under codemode (the comparison of section 12). In three of the eight the agent answered a request with nothing but a line of this form, with a handle and a range of turns of its own making, and stopped. That is 8 turns: 1 in a 97-turn session, 2 and 5 in the 302-turn sessions, four of the five within five turns of each other. Six came right after the result of a fold, two right after the user's message, and one more turn was answered with a bare stamp. Each failed its checks. In the 20 gpt-6-luna sessions of versions without the line, about 9,000 responses, there is no such answer (three turns were answered with a few words after a fold), and none in the claude-haiku-5-5 sessions above. So the line is written for Claude models only unless `episodes.foldLine` says otherwise. The three codemode sessions of section 12 that ran after this change have no line and no such answer.
+**gpt-6-luna in long sessions.** 2026-11-15/16, pi 1.5.0, commit c835d91, which wrote the line for every model: six 97-turn and two 302-turn sessions on gpt-6-luna at low thinking, plain and under codemode (the comparison of section 12). In three of the eight the agent answered a request with nothing but a line of this form, with a handle and a range of turns of its own making, and stopped. That is 8 turns: 1 in a 97-turn session, 2 and 5 in the 302-turn sessions, four of the five within five turns of each other. Six came right after the result of a fold, two right after the user's message, and one more turn was answered with a bare stamp. Each failed its checks. In the 20 gpt-6-luna sessions of versions without the line, about 9,000 responses, there is no such answer (three turns were answered with a few words after a fold), and none in the claude-haiku-5-5 sessions above. The line was then written for Claude models only (commits 5b93597 to 0240684); the three codemode sessions of section 12 that ran in that state have no line and no such answer.
 
-What this does not show: more than one long session per cell, or a session longer than 97 turns, on Claude; folds that cover notes; whether the hedges ("I am going from my note, I cannot re-check it without a tool") would become checks when tools are allowed; any model beyond the four. gpt-6-luna and gemini-3.8-flash did not retract with nothing left either. For gpt-6-luna the line did harm in long sessions (above); gemini-3.8-flash was not run in one, and gets no line by default.
+**One line for every model.** 2026-11-16. A setting that guesses the model is a poor answer, so the form of the line was looked at again, with two tests.
+
+*Why gpt-6-luna wrote the line.* In its long sessions each fold starts at the stamp of the note before it, so the line of the next fold stands right after the result of the fold before: fold call, note, line, user messages, fold call, note, line. In the 302-turn codemode session 9 to 12 notes in context were followed by a line when the answers went wrong. When the agent folds at the start of a request and has to go on working, all it has seen follow a fold result is a line and then the user. The line also opened with the handle in brackets, as the tags the harness writes do ("[fold ep-...", "[t315]").
+
+*Replays.* A finished session is copied and cut before one user turn, the lines of its earlier folds are rewritten to the form under test, and the model answers that turn once (gpt-6-luna, low thinking, pi 1.5.0, codemode as in the session). The turns are ones the sessions above had answered with a line: 228, 246 and 249 of the codemode 302-turn session, 112 and 238 of the plain one. Counted: replays whose answer is nothing but a line. These turns were picked because they went wrong, so the shares are not a rate per turn. Set against them, the scripted claude-haiku-5-5 sessions of the table above, both shapes together.
+
+| Form of the line | gpt-6-luna: answer is only a line | claude-haiku-5-5: retracted the note | went back |
+|---|---|---|---|
+| Opening with the handle (until 2026-11-16) | 15 of 34 replays | 0 of 24 | 2 of 24 |
+| No line | 0 of 10 | 17 of 18 | 10 of 18 |
+| No line where the span stood; the words as a text block of the response that called fold, before or after the call | not run | 8 of 12 | 9 of 12 |
+| The line as the text of a response that keeps the span's first call, a mark in place of that call's output | 0 of 10; 2 of 10 opened a response with a line of their own and then called `recall` several times | 1 of 12 | 7 of 12 |
+| No response: a note by the harness added to the message before the span | 0 of 10 | not run | |
+| No response: the words in front of the next response that stays | 0 of 10 | not run | |
+| Prose without brackets, other words ("Earlier in this conversation I made tool calls here ...") | 0 of 34 | 5 of 12, all mid-run | 7 of 12 |
+| The sentences of the line without brackets, the handle inside | 1 of 18 | 6 of 12, all mid-run | 9 of 12 |
+| **The sentences of the line in brackets, the handle inside** | 2 of 42: one in this form, one in the form that opens with the handle, which the session's own earlier answer showed | 0 of 24 | 2 of 24 |
+
+The two models go by different parts of the form. claude-haiku-5-5 needs the brackets: without them the sentences read as the opening of the response that calls fold, as the line that only claimed the work did. gpt-6-luna copies the line that opens with the handle. So the line keeps its sentences and its brackets and names its fold inside the sentence: "[Earlier responses of mine stood here, with the tool calls I made (t13-t27) and the outputs they returned. I read those outputs, and then I folded all of it out of this conversation as ep-1a2b3c4d: that is why no call and no output is shown here. ...]". It is written for every model again; `episodes.foldLine: false` turns it off. Of its two answers that were only a line, one copied the earlier form: at turn 246 the history holds the answer of turn 228, which the session itself had written in that form, and rewriting the lines of the folds does not change it. On other models, one session of each shape: claude-haiku-5-5 at high thinking, claude-sonnet-5-5, gpt-6-luna at medium and gemini-3.8-flash did not retract, and three of the eight went back once. The shorter line of a span without calls has the same form ("[Earlier responses of mine stood here (t1-t2). I folded them out of this conversation as ep-1a2b3c4d: ...]"); in four claude-haiku-5-5 sessions that folded a two-sentence answer and asked for it again, the model restated it as fact each time. That wording was not part of the replays.
+
+*Sessions written with this line from the start*, one each, pi 1.5.0:
+
+| | gpt-6-luna, low, codemode only, 302 turns | claude-haiku-5-5, medium, plain, 97 turns |
+|---|---|---|
+| Folds, each leaving a line | 10 | 5 |
+| Turns answered with nothing but a line | 1 (turn 123, right after a fold; it failed its checks) | 0 |
+| Turns in which the agent took its own note back | 0 | 0 |
+| `recall` calls | about 180 | 0 |
+| Cost | $0.62 | $0.48 |
+| Peak context | 109k | 132k |
+| Quiz, retrieval | 12, 12 | 12, 12 |
+| Checks | 621 of 843 | 228 of 228 |
+
+The gpt-6-luna session has one such answer in 302 turns, against 5 and 2 in the two 302-turn sessions with the line that opened with the handle; replayed 12 times, that turn was not answered with a line again. So the form makes the answer rare and does not rule it out. The claude-haiku-5-5 session costs less than both sessions of the table further up ($0.54 with the earlier line, $0.63 without one), which one session each does not separate from the spread.
+
+The low check score of the gpt-6-luna session has another cause, which this section did not look for. At turns 62 and 136 the agent folded at the start of a request, as the nudge asked, and then looked for that request's data with `recall` instead of reading the report: "I can't verify `reports/incident-54.log`'s requested lines [...] from the available evidence". It kept to that for 33 and 39 turns, 72 of the 76 turns with a failed check. Replayed ten times each with and without the line, turns 62 and 136 were worked from the archive alone in 5 of 20 tries with it and 10 of 20 without it, so the line is not what causes it. It is older than the line. Of the 33 earlier complete codemode sessions on gpt-6-luna of 97 turns or more, leaving out the two quiz turns at the end, 30 have none to three turns of work done from the archive alone, two have five and eight with no more than three in a row, and one has 30: the first session of section 12 without the cap (143 of 228 checks), from before there was a line, where the same thing began at a fold at the start of turn 58 and lasted 27 turns. In both sessions the first `recall` after the fold found the request being answered in the archive, since the span of such a fold runs up to the fold call and so takes in that request's message. It is a fault of folding at the start of a request and is open; whether the archived copy of the request is what misleads the agent has not been tested.
+
+What this does not show: more than one long session per cell; a session longer than 97 turns on Claude; a long session of gemini-3.8-flash or of any model beyond the four; folds that cover notes with this line (the gpt-6-luna session had none); whether the hedges ("I am going from my note, I cannot re-check it without a tool") would become checks when tools are allowed. gpt-6-luna and gemini-3.8-flash did not retract with nothing left either: for them the line costs about 100 tokens a fold and, on gpt-6-luna, the rare answer above.
 
 <br />
 
