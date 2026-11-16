@@ -34,8 +34,10 @@ The terms, as in the post: an **episode** is one span of work around a local que
 1. Install the package:
 
    ```sh
-   pi install npm:pi-episodes
+   pi install git:github.com/xulongwu4/pi-episodes
    ```
+
+   This repository is a fork of [arthurfiorette/pi-episodes](https://github.com/arthurfiorette/pi-episodes). `npm:pi-episodes` is the upstream release and does not have the changes this README describes.
 
 2. Start pi and work as usual. The agent sees five new tools and a short system prompt section that explains when to use them.
 
@@ -50,7 +52,7 @@ The terms, as in the post: an **episode** is one span of work around a local que
 
 4. Then give it a task that depends on something inside the fold, and watch what it does with the note: carry on from it, go back with `recall` or `ask`, or guess. That is the smallest experiment the post suggests, and [MEASUREMENTS.md](MEASUREMENTS.md) builds from there.
 
-If you try it, [open an issue](https://github.com/arthurfiorette/pi-episodes/issues) with what the agent did with its notes. How it feels after a week of real work says more than any benchmark so far.
+If you try it, [open an issue](https://github.com/xulongwu4/pi-episodes/issues) with what the agent did with its notes. How it feels after a week of real work says more than any benchmark so far.
 
 <br />
 

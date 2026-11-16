@@ -10,13 +10,13 @@
     "compaction",
     "fork"
   ],
-  "homepage": "https://github.com/arthurfiorette/pi-episodes#readme",
+  "homepage": "https://github.com/xulongwu4/pi-episodes#readme",
   "bugs": {
-    "url": "https://github.com/arthurfiorette/pi-episodes/issues"
+    "url": "https://github.com/xulongwu4/pi-episodes/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/arthurfiorette/pi-episodes.git"
+    "url": "git+https://github.com/xulongwu4/pi-episodes.git"
   },
   "funding": "https://github.com/arthurfiorette/pi-episodes?sponsor=1",
   "license": "MIT",
@@ -82,7 +82,7 @@
   },
   "pi": {
     "extensions": [
-      "./dist/index.js"
+      "./src/index.ts"
     ]
   }
 }
