@@ -139,7 +139,8 @@ async function createSession(
     settingsManager: SettingsManager.inMemory({
       compaction: { enabled: false, ...compaction },
       // Pi's settings type has no slot for extension keys.
-      ...({ episodes: settings } as object),
+      // The line a fold leaves is on for these tests, whatever the model is called.
+      ...({ episodes: { foldLine: true, ...settings } } as object),
       ...(mode === 'off' ? {} : { codemode: { mode } })
     })
   });
@@ -2856,3 +2857,36 @@ test('under codemode "only" the prompt gives the calls of fold, recall and ask',
     }
   }
 });
+
+for (const foldLine of [true, false]) {
+  test(`a fold with spans from a script leaves ${foldLine ? 'a line for each span' : 'no line'} as set`, async () => {
+    const harness = await createSession(
+      'only',
+      [
+        () => script('text(await tools.bash({ command: "echo one" }));'),
+        () => script('text(await tools.bash({ command: "echo two" }));'),
+        () => script('text(await tools.bash({ command: "echo three" }));'),
+        () =>
+          script(
+            'text(await tools.fold({ spans: [{ since: "t2", until: "t2", note: "one" }, { since: "t4", note: "three" }] }));'
+          ),
+        (context) => {
+          const shown = conversation(context).map(text);
+          assert.equal(
+            shown.filter((message) => /earlier responses of mine stood here/.test(message)).length,
+            foldLine ? 2 : 0
+          );
+          assert.ok(shown.some((message) => /two/.test(message)));
+          return fauxAssistantMessage('ok');
+        }
+      ],
+      [],
+      { foldLine }
+    );
+    try {
+      await harness.run('go');
+    } finally {
+      await harness.cleanup();
+    }
+  });
+}

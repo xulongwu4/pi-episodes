@@ -54,6 +54,7 @@ import {
 } from './messages.js';
 import { completeReadBlocks } from './output.js';
 import { planFoldTailPruning, type ReadPruneDependency } from './prune.js';
+import { episodesSettings, writesFoldLine } from './settings.js';
 
 export * from './prune.js';
 
@@ -991,6 +992,8 @@ export interface FoldOptions {
   lines?: ReadonlyMap<string, string>;
   /** Handles of the folds whose notes the whole call covers, when it folds more than this span. */
   covered?: ReadonlySet<string>;
+  /** False removes the first response of the span like the rest, with no line in its place. */
+  line?: boolean;
 }
 
 /** A fold the tool refused, with why, so rejections can be counted by cause. */
@@ -1211,6 +1214,7 @@ export function planFold(
     // The line goes where the first response stood that is sent again: pi leaves a response
     // that ended in an error or was aborted out of every request, and the line with it.
     if (
+      options.line !== false &&
       message?.role === 'assistant' &&
       message.stopReason !== 'error' &&
       message.stopReason !== 'aborted' &&
@@ -2411,7 +2415,8 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         const normalizedSpans = normalizeFoldSpans(params as Record<string, unknown>);
         batch = planFoldBatch(entries, toolCallId, normalizedSpans, {
           latestStamp: state.nextStamp - 1,
-          callerId: scriptCall ?? toolCallId
+          callerId: scriptCall ?? toolCallId,
+          line: writesFoldLine(episodesSettings(pi.getSettings()).foldLine, ctx.model)
         });
       } catch (error) {
         if (error instanceof FoldError) {

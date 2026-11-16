@@ -40,6 +40,7 @@ import {
 import { carriedMediaBlocks, holdsCarriedMedia } from '../src/images.js';
 import { messageText, skillPaths, touchedPaths } from '../src/messages.js';
 import { nudgeGrowth, tokensBehindNote } from '../src/nudge.js';
+import { episodesSettings, writesFoldLine } from '../src/settings.js';
 import { readStamp } from '../src/stamps.js';
 import { assistant, call, result, session, user } from './helpers.js';
 
@@ -1294,6 +1295,74 @@ test('the line goes where the first response stood that is sent again, and claim
       replacement: { content: [{ type: 'text', text: line }] }
     }
   ]);
+});
+
+test('with the line off, a fold removes the first response like the rest and still takes the line of a fold it covers', () => {
+  const { manager, ids } = session([
+    user('first', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'one', 2),
+    assistant(call('f1', 'fold'))
+  ]);
+  const entries = manager.buildSessionProjection().entries;
+  const plan = planFold(entries, 'f1', 1, { line: false });
+  assert.deepEqual(plan.lines, []);
+  assert.deepEqual(
+    plan.edits.map((edit) => [edit.targetId, edit.replacement]),
+    [
+      [ids[2], null],
+      [ids[1], null]
+    ]
+  );
+  assert.equal(
+    planFoldBatch(entries, 'f1', [{ since: 1, note: 'n' }], { line: false }).lineTokens,
+    0
+  );
+  assert.ok(planFoldBatch(entries, 'f1', [{ since: 1, note: 'n' }]).lineTokens > 0);
+
+  // A line that an earlier fold left, before the setting changed or under another model, is
+  // still the line of that fold: a fold that covers its note takes it away.
+  const later = session([
+    user('first', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'one', 2)
+  ]);
+  const first = applyFold(later.manager, 'f1', 1, 3);
+  later.manager.appendMessage(assistant(call('b', 'bash')));
+  later.manager.appendMessage(result('b', 'bash', 'two', 4));
+  later.manager.appendMessage(assistant(call('f2', 'fold')));
+  const view = later.manager.buildSessionProjection().entries;
+  const second = planFold(view, 'f2', 3, { line: false });
+  assert.deepEqual(
+    second.covers.map((note) => note.handle),
+    [first.handle]
+  );
+  assert.deepEqual(second.lines, []);
+  assert.deepEqual(second.linesRemoved, [later.ids[1]]);
+  assert.ok(second.edits.every((edit) => edit.replacement === null));
+});
+
+test('the line is written as set, and left to the model for Claude models only', () => {
+  assert.equal(episodesSettings({}).foldLine, 'auto');
+  assert.equal(episodesSettings({ episodes: { foldLine: false } }).foldLine, false);
+  assert.equal(episodesSettings({ episodes: { foldLine: true } }).foldLine, true);
+  assert.equal(episodesSettings({ episodes: { foldLine: 'on' } }).foldLine, 'auto');
+  for (const model of [
+    { provider: 'openai-codex', id: 'gpt-6-luna' },
+    { id: 'gemini-3.8-flash' },
+    undefined
+  ]) {
+    assert.equal(writesFoldLine('auto', model), false);
+    assert.equal(writesFoldLine(true, model), true);
+  }
+  for (const model of [
+    { provider: 'anthropic', id: 'haiku-latest' },
+    { provider: 'amazon-bedrock', id: 'us.anthropic.claude-haiku-5-5-v1:0' },
+    { provider: 'google-vertex', id: 'Claude-Sonnet-5-5' }
+  ]) {
+    assert.equal(writesFoldLine('auto', model), true);
+    assert.equal(writesFoldLine(false, model), false);
+  }
 });
 
 test('a fold reaching behind an earlier fold note covers it', () => {

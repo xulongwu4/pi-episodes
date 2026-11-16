@@ -39,6 +39,7 @@ export class ForkFolds {
   private readonly prefixLength: number;
   private readonly siblings: number;
   private readonly archiveDir: string | undefined;
+  private readonly line: boolean;
   private readonly omitted = new Set<AgentMessage>();
   /** Responses that show the marker of a fold in effect, with its text. */
   private readonly marked = new Map<AgentMessage, string>();
@@ -54,6 +55,8 @@ export class ForkFolds {
     prefixLength: number;
     siblings: number;
     archiveDir?: string | undefined;
+    /** Whether a fold of the child leaves its line (see FoldOptions.line). */
+    line?: boolean;
   }) {
     this.forkHandle = options.forkHandle;
     this.state = options.state;
@@ -61,6 +64,7 @@ export class ForkFolds {
     this.prefixLength = options.prefixLength;
     this.siblings = options.siblings;
     this.archiveDir = options.archiveDir;
+    this.line = options.line ?? true;
   }
 
   /** Active folds inside this fork: excludes any that the child unfolded. */
@@ -146,7 +150,8 @@ export class ForkFolds {
       latestStamp: this.state.nextStamp - 1,
       floorIndex: this.parentEntries.length + this.siblings,
       applied: this.applied,
-      lines: this.lines
+      lines: this.lines,
+      line: this.line
     });
 
     // Archive covered-note media once for the combined batch before mutating any ForkFolds

@@ -25,7 +25,7 @@ it: call fold with since set to the stamp of the first message inside the span, 
 note. If the episode began with your response after [t12] and the first tool result in it
 is [t13], since is "t13". The span from there up to the fold leaves your context and is
 archived; the note takes its place. User messages from the span stay, with their stamps.
-A bracketed line with the fold's handle marks where the span began. The note is your own
+A bracketed line with the fold's handle can mark where the span began. The note is your own
 first-hand record of the span, written while you could see it: what it says, you saw.
 State it as fact, and use recall when you need more than the note holds.
 

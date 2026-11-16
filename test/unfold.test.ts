@@ -50,6 +50,7 @@ import {
 import { ForkFolds } from '../src/fork-fold.js';
 import episodes from '../src/index.js';
 import { nudgeGrowth } from '../src/nudge.js';
+import { readStamp } from '../src/stamps.js';
 import { EpisodeState } from '../src/state.js';
 import { episodeStats } from '../src/stats.js';
 import { assistant, call, result, session, user } from './helpers.js';
@@ -1855,6 +1856,42 @@ test('running fork callingFork and prefixEntryId integrate with nested unfold', 
     (await idxAfterUnfold.onBranch()).map((t) => t.handle),
     [parPlan.handle]
   );
+});
+
+test('a fold in a fork that was started without the line removes its span whole', async () => {
+  const { manager } = session([user('root', 1)]);
+  manager.appendMessage(assistant(call('fk_call', 'fork', { task: 'investigate' })));
+  const state = new EpisodeState();
+  state.nextStamp = 10;
+  const prefix = manager.buildSessionProjection().messages;
+  for (const line of [false, true]) {
+    const folds = new ForkFolds({
+      forkHandle: 'fk-line0002',
+      state,
+      parentEntries: manager.buildSessionProjection().entries,
+      prefixLength: prefix.length,
+      siblings: 0,
+      line
+    });
+    const msgs: AgentMessage[] = [...prefix, result('fk_call', 'fork', 'task brief')];
+    msgs.push(assistant(call('a', 'bash', { command: 'echo a' })));
+    const out = result('a', 'bash', 'a');
+    folds.stamp(out);
+    msgs.push(out);
+    const stamp = `t${readStamp(out)}`;
+    msgs.push(assistant(call('f1', 'fold', { since: stamp, note: 'note' })));
+    const done = await folds
+      .tool({ name: 'fold', description: '', parameters: {} as never }, () => msgs)
+      .execute('f1', { since: stamp, note: 'note' });
+    const details = done.details as FoldDetails;
+    const shown = folds.view(msgs).slice(prefix.length + 1);
+    assert.deepEqual(
+      shown.map((message) => message.role),
+      line ? ['assistant', 'assistant'] : ['assistant'],
+      `${line}`
+    );
+    assert.equal(details.lineTokens !== undefined && details.lineTokens > 0, line);
+  }
 });
 
 test('a fold in a fork takes the line of the fold it covers, also of one that an unfold brought back', async () => {

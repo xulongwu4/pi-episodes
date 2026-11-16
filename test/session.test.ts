@@ -49,11 +49,13 @@ async function createSession(
     persist?: boolean;
     keepRecentTokens?: number;
     episodes?: Record<string, unknown>;
+    /** The id of the model the session runs on. */
+    model?: string;
   } = {}
 ) {
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-session-'));
   if (options.git) execFileSync('git', ['init', '-q'], { cwd: dir });
-  const faux = fauxProvider();
+  const faux = fauxProvider(options.model ? { models: [{ id: options.model }] } : {});
   const requests: TranscriptContext[] = [];
   // Assertions inside a step surface as provider errors; keep them to rethrow.
   const failures: unknown[] = [];
@@ -95,7 +97,8 @@ async function createSession(
           ? {}
           : { keepRecentTokens: options.keepRecentTokens })
       },
-      ...(options.episodes ? { episodes: options.episodes } : {})
+      // The line a fold leaves is on for these tests, whatever the model is called.
+      ...{ episodes: { foldLine: true, ...options.episodes } }
     })
   });
   await session.bindExtensions({});
@@ -216,6 +219,49 @@ test('fold, recall, ask and fork in a live session', async () => {
     await harness.cleanup();
   }
 });
+
+for (const [name, foldLine, model, lined] of [
+  ['left to the model, a fold leaves its line for a Claude model', 'auto', 'claude-test-1', true],
+  ['left to the model, a fold leaves no line for another model', 'auto', undefined, false],
+  ['a setting that is no boolean leaves it to the model', 'yes', undefined, false],
+  ['set on, a fold leaves its line for any model', true, undefined, true],
+  ['set off, a fold leaves no line for a Claude model either', false, 'claude-test-1', false]
+] as const) {
+  test(`the line of a fold: ${name}`, async () => {
+    const harness = await createSession(
+      [
+        () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo one' })),
+        () =>
+          fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'One was printed.' }), {
+            stopReason: 'toolUse'
+          }),
+        (context) => {
+          const shown = conversation(context);
+          const roles = shown.map((message) => message.role);
+          assert.deepEqual(
+            roles,
+            lined
+              ? ['user', 'assistant', 'assistant', 'toolResult']
+              : ['user', 'assistant', 'toolResult']
+          );
+          assert.equal(
+            shown.some((message) => /earlier responses of mine stood here/.test(text(message))),
+            lined
+          );
+          return fauxAssistantMessage('Done.');
+        }
+      ],
+      { episodes: { foldLine }, ...(model ? { model } : {}) }
+    );
+    try {
+      await harness.session.prompt('Print one, then fold.');
+      assert.deepEqual(harness.failures, []);
+      assert.equal(harness.pending(), 0);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+}
 
 test('a fold that reaches behind the previous note merges it', async () => {
   const harness = await createSession([
@@ -1043,37 +1089,54 @@ test('a fork running next to another does not reach the folds the other made', a
   }
 });
 
-test('a fork folds with until and keeps its later work', async () => {
-  let stamp = '';
-  const harness = await createSession([
-    () => fauxAssistantMessage(fauxToolCall('fork', { task: 'Make the build pass.' })),
-    () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo "old bulk"' })),
-    (context) => {
-      stamp = /\[(t\d+)\]$/.exec(text(conversation(context).at(-1)!))![1]!;
-      return fauxAssistantMessage(fauxToolCall('bash', { command: 'echo "live work"' }));
-    },
-    () => fauxAssistantMessage(fauxToolCall('fold', { since: stamp, until: stamp, note: 'old' })),
-    (context) => {
-      const messages = conversation(context);
-      assert.ok(!messages.some((message) => /^old bulk/.test(text(message))));
-      assert.ok(messages.some((message) => /^live work/.test(text(message))));
-      assert.match(
-        text(messages.at(-1)!),
-        /The turns from t\d+ on were not folded and stay above\./
-      );
-      return fauxAssistantMessage('Build passes.\n- Open: none.');
-    },
-    () => fauxAssistantMessage('done')
-  ]);
+// Left to the model, the line goes by the model the fork runs on.
+for (const [name, foldLine, model, line] of [
+  ['with the line as set', true, undefined, true],
+  ['without the line as set', false, undefined, false],
+  ['with the line for a Claude model', 'auto', 'claude-test-1', true],
+  ['without the line for another model', 'auto', undefined, false]
+] as const) {
+  test(`a fork folds with until and keeps its later work, ${name}`, async () => {
+    let stamp = '';
+    const harness = await createSession(
+      [
+        () => fauxAssistantMessage(fauxToolCall('fork', { task: 'Make the build pass.' })),
+        () => fauxAssistantMessage(fauxToolCall('bash', { command: 'echo "old bulk"' })),
+        (context) => {
+          stamp = /\[(t\d+)\]$/.exec(text(conversation(context).at(-1)!))![1]!;
+          return fauxAssistantMessage(fauxToolCall('bash', { command: 'echo "live work"' }));
+        },
+        () =>
+          fauxAssistantMessage(fauxToolCall('fold', { since: stamp, until: stamp, note: 'old' })),
+        (context) => {
+          const messages = conversation(context);
+          assert.ok(!messages.some((message) => /^old bulk/.test(text(message))));
+          assert.ok(messages.some((message) => /^live work/.test(text(message))));
+          assert.match(
+            text(messages.at(-1)!),
+            /The turns from t\d+ on were not folded and stay above\./
+          );
+          // The fork's folds leave their line as the session's do.
+          assert.equal(
+            messages.some((message) => /earlier responses of mine stood here/.test(text(message))),
+            line
+          );
+          return fauxAssistantMessage('Build passes.\n- Open: none.');
+        },
+        () => fauxAssistantMessage('done')
+      ],
+      { episodes: { foldLine }, ...(model ? { model } : {}) }
+    );
 
-  try {
-    await harness.session.prompt('make it build in a fork');
-    if (harness.failures[0]) throw harness.failures[0];
-    assert.equal(harness.pending(), 0);
-  } finally {
-    await harness.cleanup();
-  }
-});
+    try {
+      await harness.session.prompt('make it build in a fork');
+      if (harness.failures[0]) throw harness.failures[0];
+      assert.equal(harness.pending(), 0);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+}
 
 test('a fold in a fork keeps the note it covers under its own, and the next one keeps both', async () => {
   const last = (context: Parameters<typeof conversation>[0]) => text(conversation(context).at(-1)!);
