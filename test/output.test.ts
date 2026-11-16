@@ -71,10 +71,327 @@ test('the header of a script result and images stay where they are', async () =>
     assert.ok(cut);
     assert.deepEqual(
       cut.content.map((block) => (block.type === 'text' ? block.text.slice(0, 6) : 'image')),
-      ['Script', 'image', 'line 0', 'image']
+      ['Script', 'image', '[episo', 'image']
     );
     assert.equal(cut.capped.block, 2);
     assert.equal(await readFile(cut.capped.path, 'utf8'), long);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+const scriptHeader = {
+  type: 'text' as const,
+  text: 'Script completed\nWall time 0.1 seconds\nOutput:\n'
+};
+const events = Array.from(
+  { length: 60 },
+  (_, index) => `event=0${200 + index} latency_ms=${100 + index} trace=${'ab'.repeat(32)}`
+).join('\n');
+const source = Array.from(
+  { length: 200 },
+  (_, index) => `  const value${index} = compute(${index});`
+).join('\n');
+// What a script that printed three things returns: the lines asked for with the counts after
+// them, one short line, and a source file.
+const printed = [
+  `==> text 1/3 <==\n${events}\n\n--COUNTS--\nok 342 retry 58`,
+  '==> text 2/3 <==\nTOP event=0249 329',
+  `==> text 3/3 <==\n${source}`
+].join('\n');
+
+test('the output of a script is cut thing by thing it printed, under a line that says so', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    const cut = await capOutput([scriptHeader, { type: 'text', text: printed }], dir, 4000, 1800);
+    assert.ok(cut);
+    assert.deepEqual(cut.content[0], scriptHeader);
+    const block = cut.content[1]!;
+    assert.ok(block.type === 'text' && cut.content.length === 2);
+    const recorded = { [CAPPED_KEY]: { ...cut.capped } };
+    const kept = cut.capped.shown!.reduce((sum, [from, to]) => sum + to - from, 0);
+    // Said first, where a reader starts: that this is a part, and where all of it is.
+    assert.ok(
+      block.text.startsWith(
+        `[episodes] Only part of this output is shown: ${kept} of ${printed.length} characters, with the rest left out at the 2 places marked below. If what you need is not in the part shown, do not answer without it: print less of it (filter in the script), or grep or read a slice of ${cut.capped.path}, which holds all of it. recall searches it once it is folded.\n\n==> text 1/3 <==\nevent=0200 `
+      ),
+      block.text.slice(0, 500)
+    );
+    // The end of the first thing, the short one whole, and the start and end of the third.
+    assert.ok(
+      block.text.includes(
+        '\n\n--COUNTS--\nok 342 retry 58\n==> text 2/3 <==\nTOP event=0249 329\n==> text 3/3 <==\n  const value0 = compute(0);\n'
+      )
+    );
+    assert.ok(block.text.endsWith('\n  const value199 = compute(199);'));
+    assert.doesNotMatch(block.text, /event=0230 |value100 /);
+    const gaps = [...block.text.matchAll(/\n\n\[episodes\] (\d+) characters left out here\.\n\n/g)];
+    assert.equal(gaps.length, 2);
+    assert.equal(
+      gaps.reduce((sum, gap) => sum + Number(gap[1]), 0),
+      printed.length - kept
+    );
+    assert.ok(kept <= 1800 && kept > 1500, `${kept}`);
+    // The two long things share what the short one leaves, and each stretch is whole lines.
+    const [start, middle, end] = cut.capped.shown!;
+    assert.ok(start![1] > 450 && end![1] - end![0] > 200, JSON.stringify(cut.capped.shown));
+    assert.deepEqual(
+      [printed[start![1]], printed[middle![0] - 1], printed[middle![1]], printed[end![0] - 1]],
+      ['\n', '\n', '\n', '\n']
+    );
+    assert.deepEqual(cut.capped, {
+      path: cut.capped.path,
+      chars: printed.length,
+      block: 1,
+      preview: block.text.length,
+      shown: cut.capped.shown
+    });
+    assert.equal(cut.capped.shown!.length, 3);
+    assert.equal(await readFile(cut.capped.path, 'utf8'), printed);
+
+    const full = await withFullOutput(toolResult(withStamp(cut.content, 7), recorded));
+    assert.ok(full.role === 'toolResult');
+    assert.deepEqual(full.content.slice(0, 2), [scriptHeader, { type: 'text', text: printed }]);
+    assert.equal(readStamp(full), 7);
+
+    // Printed as blocks of their own, the things come back as those blocks.
+    const blocks = printed.split(/\n(?===> text)/).map((text) => ({ type: 'text' as const, text }));
+    const several = await capOutput([scriptHeader, ...blocks], dir, 4000, 1800);
+    assert.ok(several && several.content.length === 2);
+    assert.deepEqual(several.content[1], block);
+    assert.deepEqual(
+      several.capped.parts,
+      blocks.map((part) => part.text.length)
+    );
+    const back = await withFullOutput(
+      toolResult(several.content, { [CAPPED_KEY]: { ...several.capped } })
+    );
+    assert.ok(back.role === 'toolResult');
+    assert.deepEqual(back.content, [scriptHeader, ...blocks]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a script that printed one thing, or more things than can each keep a share, has its output cut as one', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    const many = Array.from(
+      { length: 30 },
+      (_, index) => `==> text ${index + 1}/30 <==\n${`row ${index} `.repeat(60)}`
+    ).join('\n');
+    for (const text of [long, many]) {
+      const cut = await capOutput([scriptHeader, { type: 'text', text }], dir, 4000, 1800);
+      assert.ok(cut?.content[1]?.type === 'text');
+      const preview = cut.content[1].text;
+      assert.match(
+        preview,
+        /^\[episodes\] Only part of this output is shown: \d+ of \d+ characters, with the rest left out at the place marked below\. /
+      );
+      assert.equal(preview.split(' characters left out here.').length - 1, 1);
+      assert.deepEqual(
+        cut.capped.shown!.map(([from, to]) => [from === 0, to === text.length]),
+        [
+          [true, false],
+          [false, true]
+        ]
+      );
+      const full = await withFullOutput(
+        toolResult(cut.content, { [CAPPED_KEY]: { ...cut.capped } })
+      );
+      assert.ok(full.role === 'toolResult');
+      assert.deepEqual(full.content[1], { type: 'text', text });
+    }
+    // A line that says the output is cut, longer than what it would leave out, is not worth it.
+    assert.equal(
+      await capOutput([scriptHeader, { type: 'text', text: 'x'.repeat(700) }], dir, 600, 300),
+      undefined
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('only the lines codemode numbers in step start a thing printed, and what stands before the first is one too', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    const places = (preview: string) => preview.split(' characters left out here.').length - 1;
+    const roundTrip = async (text: string, limit: number, keep: number) => {
+      const cut = await capOutput([scriptHeader, { type: 'text', text }], dir, limit, keep);
+      assert.ok(cut?.content[1]?.type === 'text');
+      const full = await withFullOutput(
+        toolResult(cut.content, { [CAPPED_KEY]: { ...cut.capped } })
+      );
+      assert.ok(full.role === 'toolResult');
+      assert.deepEqual(full.content[1], { type: 'text', text });
+      return cut.content[1].text;
+    };
+
+    // A log that holds lines like codemode's own, out of step with the three things printed.
+    // One of them has the next number and another count, in the middle of the first thing.
+    const fake = Array.from(
+      { length: 10 },
+      (_, index) =>
+        `==> text ${index === 5 ? '2/4' : '99/999'} <==\n${`noise ${index} `.repeat(120)}`
+    ).join('\n');
+    const noisy = [
+      `==> text 1/3 <==\n${fake}\n==> text 1/3 <==\n==> text 3/3 <==\nend of the log`,
+      '==> text 2/3 <==\nCOUNT 342',
+      `==> text 3/3 <==\n${source}`
+    ].join('\n');
+    const shown = await roundTrip(noisy, 16_000, 6000);
+    assert.ok(shown.includes('\nend of the log\n==> text 2/3 <==\nCOUNT 342\n==> text 3/3 <==\n'));
+    assert.equal(places(shown), 2);
+    // The same with the right count on every such line and the wrong number: as things printed
+    // they would be too many to keep a share each, and the count would go with the cut as one.
+    const counted = await roundTrip(noisy.replaceAll(/\b(?:99\/999|2\/4)\b/g, '3/3'), 16_000, 6000);
+    assert.ok(
+      counted.includes('\nend of the log\n==> text 2/3 <==\nCOUNT 342\n==> text 3/3 <==\n')
+    );
+    assert.equal(places(counted), 2);
+
+    // Codemode cut the output itself and says so before the first thing.
+    const warned = `Warning: truncated output (original token count: 15455)\nTotal output lines: 4\n\n${printed}`;
+    const after = await roundTrip(warned, 4000, 1800);
+    assert.match(
+      after,
+      /marked below\. [^\n]*\n\nWarning: truncated output \(original token count: 15455\)\nTotal output lines: 4\n\n==> text 1\/3 <==\nevent=0200 /
+    );
+    assert.equal(places(after), 2);
+
+    // A thing that is cut keeps 600 characters of its own, or the output is cut as one.
+    const halves = [`==> text 1/2 <==\n${events}`, `==> text 2/2 <==\n${source}`].join('\n');
+    assert.equal(places(await roundTrip(halves, 4000, 1200)), 2);
+    assert.equal(places(await roundTrip(halves, 4000, 1198)), 1);
+
+    // A cut inside a character: the preview is well formed, and found again all the same.
+    const faces = `==> text 1/2 <==\n${'\u{1F600}'.repeat(2001)}\n==> text 2/2 <==\n${'\u{1F680}'.repeat(2000)}`;
+    for (const keep of [1800, 1801, 1802, 1803]) {
+      const preview = await roundTrip(faces, 4000, keep);
+      assert.ok(preview.isWellFormed(), `${keep}`);
+      assert.equal(places(preview), 2);
+    }
+
+    // With next to nothing to keep, what is left out before the first or after the last
+    // stretch has its line too, and the count is of the lines there are.
+    for (const keep of [1, 2, 3, 40]) {
+      const preview = await roundTrip(`${long}\n`, 4000, keep);
+      const said = /left out at the (?:(\d+) places|place) marked below/.exec(preview)!;
+      assert.equal(Number(said[1] ?? 1), places(preview), `${keep}: ${preview.slice(0, 120)}`);
+      assert.ok(places(preview) >= 1);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the preview of a script output is put back only where it stands as it was written, once', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    const cut = await capOutput([scriptHeader, { type: 'text', text: printed }], dir, 4000, 1800);
+    assert.ok(cut?.content[1]?.type === 'text');
+    const preview = cut.content[1].text;
+    const record = { ...cut.capped };
+    const back = async (content: ToolResult['content'], capped: object = record) => {
+      const message = toolResult(content, { [CAPPED_KEY]: capped as never });
+      const full = await withFullOutput(message);
+      return full === message || full.role !== 'toolResult' ? undefined : full.content;
+    };
+
+    // Inside a block that holds more, as after another cut that joined blocks was undone.
+    assert.deepEqual(
+      await back([scriptHeader, { type: 'text', text: `note\n${preview}\nWARNING` }]),
+      [scriptHeader, { type: 'text', text: `note\n${printed}\nWARNING` }]
+    );
+    // In another block than the one on record, when it is the only one.
+    assert.deepEqual(await back([{ type: 'text', text: preview }]), [
+      { type: 'text', text: printed }
+    ]);
+    // A block that names the file and is not the preview; a preview that was changed.
+    assert.equal(
+      await back([scriptHeader, { type: 'text', text: `see ${cut.capped.path}` }]),
+      undefined
+    );
+    assert.equal(
+      await back([scriptHeader, { type: 'text', text: preview.replace('ok 342', 'ok 343') }]),
+      undefined
+    );
+    assert.equal(
+      await back([
+        scriptHeader,
+        {
+          type: 'text',
+          text: preview.replace(/\d+ characters left out here/, '1 characters left out here')
+        }
+      ]),
+      undefined
+    );
+    // Twice in one block, or in two blocks neither of which is the one on record.
+    assert.equal(
+      await back([scriptHeader, { type: 'text', text: `${preview}\n${preview}` }]),
+      undefined
+    );
+    assert.equal(
+      await back([
+        { type: 'text', text: preview },
+        { type: 'text', text: 'between' },
+        { type: 'text', text: preview }
+      ]),
+      undefined
+    );
+    // A record whose stretches are not those of a preview.
+    const [first, second, third] = cut.capped.shown!;
+    for (const shown of [
+      [first, third, second],
+      [first],
+      [first, [second![0], third![1] + 1]],
+      [[1, first![1]], second, third],
+      [first, [first![1], second![1]], third],
+      [first, [second![1], second![0]], third]
+    ]) {
+      assert.equal(
+        await back([scriptHeader, { type: 'text', text: preview }], { ...record, shown }),
+        undefined,
+        JSON.stringify(shown)
+      );
+    }
+    for (const shown of [[[0, 'x']], [[0, 1, 2]], [0, 1], 'all', [[0, 1.5]]]) {
+      assert.equal(
+        cappedOutput({ [CAPPED_KEY]: { ...record, shown } }),
+        undefined,
+        JSON.stringify(shown)
+      );
+    }
+    assert.ok(cappedOutput({ [CAPPED_KEY]: record }));
+
+    // The other extension cut the preview: its cut is undone first, then this one.
+    const outer = await offloaded(dir, preview, 600);
+    assert.ok(!outer.preview.includes('left out here'));
+    const both = toolResult(withStamp([scriptHeader, { type: 'text', text: outer.preview }], 7), {
+      [CAPPED_KEY]: { ...record },
+      offload: outer.details
+    });
+    const whole = await withFullOutput(both);
+    assert.ok(whole.role === 'toolResult');
+    assert.deepEqual(whole.content.slice(0, 2), [scriptHeader, { type: 'text', text: printed }]);
+    // The other extension first: this one cut its preview.
+    const inner = await offloaded(dir, printed, 6000);
+    const after = await capOutput(
+      [scriptHeader, { type: 'text', text: inner.preview }],
+      dir,
+      4000,
+      1800
+    );
+    assert.ok(after);
+    const reversed = await withFullOutput(
+      toolResult(after.content, { offload: inner.details, [CAPPED_KEY]: { ...after.capped } })
+    );
+    assert.ok(reversed.role === 'toolResult');
+    assert.deepEqual(reversed.content, [scriptHeader, { type: 'text', text: printed }]);
+
+    // The file gone: nothing to put back.
+    await rm(cut.capped.path);
+    assert.equal(await back([scriptHeader, { type: 'text', text: preview }]), undefined);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

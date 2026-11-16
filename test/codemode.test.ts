@@ -680,6 +680,60 @@ test('a note that a handler rewrote is kept as the handler left it', async () =>
   }
 });
 
+test('a script that printed several things gets each cut by itself under a line that says so, and recall reads all of it', async () => {
+  const lines = (name: string) =>
+    `Array.from({ length: 300 }, (_, i) => "${name} " + i + " of the report").join("\\n")`;
+  const harness = await createSession(
+    'only',
+    [
+      () =>
+        script(
+          `text(${lines('event')} + "\\nCOUNT 342 58"); text("TOP 17"); text(${lines('source')});`
+        ),
+      (context) => {
+        const result = text(conversation(context).at(-1)!);
+        assert.match(
+          result,
+          /^Script completed\nWall time [\d.]+ seconds\nOutput:\n\n?\[episodes\] Only part of this output is shown: \d+ of \d+ characters, with the rest left out at the 2 places marked below\. /
+        );
+        // The end of the first thing, the short one whole, the start of the third.
+        assert.match(
+          result,
+          /\nCOUNT 342 58\n+==> text 2\/3 <==\nTOP 17\n+==> text 3\/3 <==\nsource 0 of the report\n/
+        );
+        assert.doesNotMatch(result, /event 150 of|source 150 of/);
+        assert.equal(result.split(' characters left out here.').length - 1, 2);
+        assert.ok(result.length < 3200, `${result.length}`);
+        return script('text(await tools.fold({ since: "t2", note: "Printed the report." }));');
+      },
+      () => script('text(await tools.recall({ query: "\\"source 150 of the report\\"" }));'),
+      (context) => {
+        const found = text(conversation(context).at(-1)!);
+        assert.match(found, /ep-[0-9a-f]{8} t2 toolResult: source 150 of the report/);
+        assert.doesNotMatch(found, /Only part of this output is shown/);
+        return fauxAssistantMessage('ok');
+      }
+    ],
+    [],
+    { outputCapChars: 4000, outputCapKeepChars: 1800 },
+    {},
+    undefined,
+    [],
+    [],
+    true
+  );
+  try {
+    await harness.run('go');
+    const branch = harness.session.sessionManager.getBranch();
+    const stats = episodeStats(branch, harness.dir);
+    assert.equal(stats.outputs.capped, 1);
+    // The line the preview opens with is no cue: nothing here touched a file of a thread.
+    assert.equal(stats.overhead.cues, 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test('the output cap does not cut the note of a script that folded, only what it printed next to it', async () => {
   const note = `Learned a lot. ${'detail '.repeat(600)}end.`;
   for (const beside of [0, 3000]) {

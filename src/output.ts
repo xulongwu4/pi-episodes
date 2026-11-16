@@ -9,6 +9,18 @@ import type { ImageContent, TextContent } from '@earendil-works/pi-ai';
 export const CAPPED_KEY = 'episodesOutput';
 /** The status block that opens a codemode result, as codemode's renderer looks for it. */
 const SCRIPT_HEADER = /^Script (completed|failed)\nWall time [\d.]+ seconds\nOutput:\n$/;
+/** The line codemode puts before each thing a script printed, when it printed several. */
+const SCRIPT_PART = /^==> text (\d+)\/(\d+) <==$/gm;
+/** How the preview of a script's output opens; no other text of this extension does. */
+export const SCRIPT_PREVIEW = '[episodes] Only part of this output is shown: ';
+/**
+ * The least a part of a script's output keeps when it is cut by itself. With parts too many
+ * for that, the output is cut as one text.
+ */
+const MIN_PART_CHARS = 600;
+
+/** A stretch of a text, from an index up to another. */
+type Range = [from: number, to: number];
 
 export interface CappedOutput {
   /** File holding the text the preview was cut from. */
@@ -23,6 +35,12 @@ export interface CappedOutput {
   head?: number;
   /** Lengths of the text blocks the text was joined from, when there were several. */
   parts?: number[];
+  /**
+   * The stretches of the text that the preview of a script's output shows. That preview says
+   * first that it is cut, and can leave out more than one stretch; it is found again by
+   * building it anew from the text and these.
+   */
+  shown?: Range[];
 }
 
 type Block = TextContent | ImageContent;
@@ -38,7 +56,15 @@ export function cappedOutput(details: unknown): CappedOutput | undefined {
     ['undefined', 'number'].includes(typeof capped.preview) &&
     ['undefined', 'number'].includes(typeof capped.head) &&
     (capped.parts === undefined ||
-      (Array.isArray(capped.parts) && capped.parts.every((part) => typeof part === 'number')))
+      (Array.isArray(capped.parts) && capped.parts.every((part) => typeof part === 'number'))) &&
+    (capped.shown === undefined ||
+      (Array.isArray(capped.shown) &&
+        capped.shown.every(
+          (range) =>
+            Array.isArray(range) &&
+            range.length === 2 &&
+            range.every((index) => Number.isInteger(index))
+        )))
     ? (capped as CappedOutput)
     : undefined;
 }
@@ -76,9 +102,11 @@ interface Cut {
   /**
    * The line a preview has in place of the middle, with the blank lines around it. It names
    * the file in the cutter's own words, and its first group is how many characters it says
-   * were left out.
+   * were left out. None for the preview of a script's output, which is found by `shown`.
    */
-  marker: RegExp;
+  marker?: RegExp;
+  /** What the preview of a script's output shows of the text (see CappedOutput.shown). */
+  shown?: readonly Range[] | undefined;
 }
 
 function literal(text: string): string {
@@ -86,24 +114,118 @@ function literal(text: string): string {
 }
 
 // Cut at a line break when one is in the nearer half, so the preview does not end mid-line.
-function head(text: string, chars: number): string {
+function headEnd(text: string, chars: number): number {
   const end = text.lastIndexOf('\n', chars);
-  return text.slice(0, end > chars / 2 ? end : chars).toWellFormed();
+  return end > chars / 2 ? end : chars;
+}
+
+function tailStart(text: string, chars: number): number {
+  const start = text.indexOf('\n', text.length - chars);
+  return start >= 0 && start < text.length - chars / 2 ? start + 1 : text.length - chars;
+}
+
+function head(text: string, chars: number): string {
+  return text.slice(0, headEnd(text, chars)).toWellFormed();
 }
 
 function tail(text: string, chars: number): string {
-  const start = text.indexOf('\n', text.length - chars);
-  return text
-    .slice(start >= 0 && start < text.length - chars / 2 ? start + 1 : text.length - chars)
-    .toWellFormed();
+  return text.slice(tailStart(text, chars)).toWellFormed();
+}
+
+/** `keep` shared out among texts of these lengths: a short one gets all it needs, and what it leaves goes to the longer ones. */
+function shares(lengths: readonly number[], keep: number): number[] {
+  const out = lengths.map(() => 0);
+  const order = lengths.map((_, index) => index).sort((a, b) => lengths[a]! - lengths[b]!);
+  let left = keep;
+  order.forEach((index, position) => {
+    const share = Math.min(lengths[index]!, Math.floor(left / (order.length - position)));
+    out[index] = share;
+    left -= share;
+  });
+  return out;
+}
+
+/**
+ * What the preview of a script's output shows. A script prints several things, and the one the
+ * agent needs is as likely a short one in the middle as the start or the end of them all: so
+ * each thing printed is cut by itself, to its share of `keep`, start and end two to one, and
+ * one within its share stays whole.
+ */
+function scriptRanges(text: string, keep: number): Range[] {
+  // Codemode numbers the things 1/n to n/n. A line of the output itself that reads like one
+  // of those is out of step with them, and starts nothing; one that happens to be in step
+  // cannot be told apart.
+  const starts: number[] = [];
+  let count: string | undefined;
+  for (const match of text.matchAll(SCRIPT_PART)) {
+    if (Number(match[1]) !== starts.length + 1 || (count ?? match[2]) !== match[2]) continue;
+    count = match[2];
+    starts.push(match.index);
+  }
+  // What stands before the first thing, such as codemode's own warning that it cut the output.
+  if (starts[0] !== 0) starts.unshift(0);
+  const parts = starts.map((start, index): Range => [start, starts[index + 1] ?? text.length]);
+  const each = shares(
+    parts.map(([from, to]) => to - from),
+    keep
+  );
+  const tooMany = parts.some(
+    ([from, to], index) => to - from > each[index]! && each[index]! < MIN_PART_CHARS
+  );
+  const pieces: Range[] = tooMany ? [[0, text.length]] : parts;
+  const budgets = tooMany ? [keep] : each;
+  const ranges: Range[] = [];
+  const add = (from: number, to: number) => {
+    const last = ranges.at(-1);
+    if (last && last[1] === from) last[1] = to;
+    else if (to > from) ranges.push([from, to]);
+  };
+  pieces.forEach(([from, to], index) => {
+    const part = text.slice(from, to);
+    const budget = budgets[index]!;
+    const start = headEnd(part, Math.floor((budget * 2) / 3));
+    const end = tailStart(part, Math.floor(budget / 3));
+    if (part.length <= budget || start >= end) add(from, to);
+    else {
+      add(from, from + start);
+      add(from + end, to);
+    }
+  });
+  return ranges;
+}
+
+/**
+ * The preview of a script's output that shows these stretches of it: a line first that says
+ * it is cut and where all of it is, then the stretches, with a line wherever something is left
+ * out: between them, and before the first or after the last when a small `keep` left nothing
+ * of a start or an end. Stretches on record that are not those the preview was made of give a
+ * text that is not the preview, and so is found nowhere.
+ */
+function scriptPreview(text: string, path: string, shown: readonly Range[]): string {
+  const kept = shown.reduce((sum, [from, to]) => sum + to - from, 0);
+  const pieces: string[] = [];
+  let gaps = 0;
+  let at = 0;
+  for (const [from, to] of [...shown, [text.length, text.length] as const]) {
+    if (from > at) {
+      pieces.push(`\n\n[episodes] ${from - at} characters left out here.\n\n`);
+      gaps++;
+    }
+    pieces.push(text.slice(from, to).toWellFormed());
+    at = to;
+  }
+  const places = gaps === 1 ? 'the place' : `the ${gaps} places`;
+  const body = pieces.join('');
+  return `${SCRIPT_PREVIEW}${kept} of ${text.length} characters, with the rest left out at ${places} marked below. If what you need is not in the part shown, do not answer without it: print less of it (filter in the script), or grep or read a slice of ${path}, which holds all of it. recall searches it once it is folded.\n\n${body}`;
 }
 
 /**
  * Cuts a tool result of `limit` characters or more down to about `keep`: the start and the
- * end, two to one, around a line naming the file that holds all of it. The file is written
- * before the result is changed, so a preview never points at text that was not kept.
- * Undefined when the result is under the limit, or has an image between its text blocks:
- * one preview could not keep that order.
+ * end, two to one, around a line naming the file that holds all of it. A script's output is
+ * cut thing by thing that it printed, under a line that says so (see scriptRanges). The file
+ * is written before the result is changed, so a preview never points at text that was not
+ * kept. Undefined when the result is under the limit, or has an image between its text
+ * blocks: one preview could not keep that order.
  */
 export async function capOutput(
   content: readonly Block[],
@@ -129,6 +251,10 @@ export async function capOutput(
 
   const hash = createHash('sha256').update(text).digest('hex').slice(0, 16);
   const path = join(dir, `output-${hash}.txt`);
+  const shown = header === 1 ? scriptRanges(text, keep) : undefined;
+  const script = shown && scriptPreview(text, path, shown);
+  // The line that says it is cut is long next to a small `keep`.
+  if (script !== undefined && script.length >= text.length) return undefined;
   await mkdir(dir, { recursive: true });
   // Parallel results with the same text must not share a temporary file.
   const temporary = `${path}.${randomUUID()}.tmp`;
@@ -140,6 +266,23 @@ export async function capOutput(
     throw error;
   }
 
+  if (shown && script !== undefined) {
+    return {
+      content: [
+        ...content.slice(0, from),
+        { type: 'text', text: script },
+        ...content.slice(to + 1)
+      ],
+      capped: {
+        path,
+        chars: text.length,
+        block: from,
+        preview: script.length,
+        shown,
+        ...(joined.length > 1 ? { parts: joined.map((part) => part.length) } : {})
+      }
+    };
+  }
   const start = head(text, Math.floor((keep * 2) / 3));
   const end = tail(text, Math.floor(keep / 3));
   const omitted = text.length - start.length - end.length;
@@ -240,15 +383,28 @@ async function restored(
   content: readonly Block[],
   cut: Cut
 ): Promise<{ content: Block[]; whole: boolean } | undefined> {
+  const { marker, shown } = cut;
   const marked = content.flatMap((block, index) =>
-    block.type === 'text' && block.text.search(cut.marker) >= 0 ? [{ index, text: block.text }] : []
+    block.type === 'text' &&
+    (marker ? block.text.search(marker) >= 0 : block.text.includes(cut.path))
+      ? [{ index, text: block.text }]
+      : []
   );
   if (marked.length === 0) return undefined;
   const full = await cutText(cut);
   if (full === undefined) return undefined;
+  // The preview of a script's output is known whole from its record: it is looked for as it
+  // was written, and taken only where it stands once.
+  const written = shown && scriptPreview(full, cut.path, shown);
   const fits = marked.flatMap(({ index, text }) => {
-    const whole = putBack(text, cut.marker, full, cut.head);
-    return whole === undefined ? [] : [{ index, text: whole }];
+    if (written === undefined) {
+      const whole = marker && putBack(text, marker, full, cut.head);
+      return whole === undefined ? [] : [{ index, text: whole }];
+    }
+    const at = text.indexOf(written);
+    return at < 0 || at !== text.lastIndexOf(written)
+      ? []
+      : [{ index, text: text.slice(0, at) + full + text.slice(at + written.length) }];
   });
   const fit =
     fits.find(({ index }) => index === cut.block) ?? (fits.length === 1 ? fits[0] : undefined);
@@ -287,10 +443,14 @@ export async function withFullOutput(message: AgentMessage): Promise<AgentMessag
             block: capped.block,
             head: capped.head,
             parts: capped.parts,
-            marker: new RegExp(
-              `\\n\\n\\[episodes\\] (\\d+) of \\d+ characters left out here\\. ${literal(named(capped.path))}[^\\n]*\\n\\n`,
-              'g'
-            )
+            ...(capped.shown
+              ? { shown: capped.shown }
+              : {
+                  marker: new RegExp(
+                    `\\n\\n\\[episodes\\] (\\d+) of \\d+ characters left out here\\. ${literal(named(capped.path))}[^\\n]*\\n\\n`,
+                    'g'
+                  )
+                })
           }
         ]
       : []),

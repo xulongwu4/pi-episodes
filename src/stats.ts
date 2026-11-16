@@ -15,7 +15,7 @@ import { type EpisodeEvent, EVENT_TYPE } from './events.js';
 import { attributeEpisodesEdits } from './fold.js';
 import { absolutePath, messageText } from './messages.js';
 import { NUDGE_TYPE } from './nudge.js';
-import { cappedOutput } from './output.js';
+import { cappedOutput, SCRIPT_PREVIEW } from './output.js';
 import { EPISODES_SECTION } from './prompt.js';
 import { REMINDER_TYPE } from './reminder.js';
 import { isStampBlock } from './stamps.js';
@@ -685,7 +685,11 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
       );
     }
     if (found.role !== 'toolResult') return;
-    stats.overhead.cues += tokensOf(textChars(found, (text) => text.startsWith('[episodes] ')));
+    // The preview of a script's output opens in the same way and is no cue: what it keeps out
+    // of context is counted below.
+    stats.overhead.cues += tokensOf(
+      textChars(found, (text) => text.startsWith('[episodes] ') && !text.startsWith(SCRIPT_PREVIEW))
+    );
     const capped = cappedOutput(found.details);
     const block = capped && found.content[capped.block];
     // The length recorded at the cut: what is there now can be shorter by another cut, or be
