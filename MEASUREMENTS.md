@@ -425,7 +425,22 @@ A span in which the agent called no tool gets a shorter line that speaks of resp
 
 Sessions written by the version before, which stripped provider signatures from the responses a fold kept, still hold those edits. Seven of them (three gpt-6-luna, two claude-haiku-5-5, two gemini-3.8-flash, with 8 to 17 stripped responses in effect each) were continued with this version for three more requests, and no provider rejected one.
 
-What this does not show: sessions longer than a few prompts; folds that cover notes; whether the hedges ("I am going from my note, I cannot re-check it without a tool") would become checks when tools are allowed; any model beyond the four. gpt-6-luna and gemini-3.8-flash did not retract with nothing left either, so for them the line costs about 100 tokens per fold and is not known to change anything.
+**Long sessions.** 2026-11-15, pi 1.5.0, claude-haiku-5-5 at thinking medium, the 97-turn task of section 12 (95 requests of work, a quiz without tools, a retrieval quiz), one session per cell. The agent folds when it chooses to. "Before" is the version without the line (and with the signature stripping the paragraph above describes); cost is pi's estimate from list prices.
+
+| | Plain, before | Plain, with the line | Codemode only, before | Codemode only, with the line |
+| --- | --- | --- | --- | --- |
+| Folds | 5 | 9 | 3 | 3 |
+| Turns in which the agent told the user its own note was wrong, unverified or not to be relied on | 3 | 0 | 3 | 0 |
+| Turns with a caveat only | 0 | 0 | 0 | 2 |
+| `recall` calls | 1 | 0 | 3 | 1 |
+| Cost | $0.634 | $0.539 | $0.426 | $0.344 |
+| Output tokens | 166k | 119k | 178k | 142k |
+| Peak context | 129k | 133k | 121k | 124k |
+| Quiz, retrieval, checks | 12, 12, 228 of 228 | 12, 12, 228 of 228 | 12, 12, 228 of 228 | 12, 12, 228 of 228 |
+
+Without the line the retraction happens in long work too, each time at or right after a fold: "Before I answer incident-73, I need to correct my last fold note. [...] The per-incident figures I recorded for 33 to 72 also came from my own notes rather than from output I can show in this session, so I can't vouch for them." In the codemode session one such turn went on to read nine reports again and "corrected" a right figure in the note to a wrong one. With the line there was none; the two caveats read "my digest of the folded span t1-t60 was written from tool outputs that are no longer visible in this context" and "my earlier folded summaries of incidents 45-57 were not re-checked here". The scores do not show any of this: the checks grade the answer to the request at hand, which the agent worked out from the files each time. The cost difference of 15% and 19% is in part the work the retractions caused and in part the spread between sessions, which one session per cell does not separate.
+
+What this does not show: more than one long session per cell, or a session longer than 97 turns; folds that cover notes; whether the hedges ("I am going from my note, I cannot re-check it without a tool") would become checks when tools are allowed; any model beyond the four. gpt-6-luna and gemini-3.8-flash did not retract with nothing left either, so for them the line costs about 100 tokens per fold and is not known to change anything.
 
 <br />
 
