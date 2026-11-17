@@ -11,8 +11,8 @@ export const CAPPED_KEY = 'episodesOutput';
 const SCRIPT_HEADER = /^Script (completed|failed)\nWall time [\d.]+ seconds\nOutput:\n$/;
 /** The line codemode puts before each thing a script printed, when it printed several. */
 const SCRIPT_PART = /^==> text (\d+)\/(\d+) <==$/gm;
-/** How the preview of a script's output opens; no other text of this extension does. */
-export const SCRIPT_PREVIEW = '[episodes] Only part of this output is shown: ';
+/** How a preview made here opens; no other text of this extension does. */
+export const PREVIEW_OPENS = '[episodes] Only part of this output is shown: ';
 /**
  * The least a part of a script's output keeps when it is cut by itself. With parts too many
  * for that, the output is cut as one text.
@@ -31,8 +31,13 @@ export interface CappedOutput {
   block: number;
   /** Length of the preview when it was made; another extension can cut it further. */
   preview?: number;
-  /** Length of the start of the text that the preview opens with. */
+  /** Length of the start of the text that the preview shows. */
   head?: number;
+  /**
+   * The preview opens with a line that says it is a part (see partLine). Previews made before
+   * that line was written have none, and open with the start of the text.
+   */
+  top?: true;
   /** Lengths of the text blocks the text was joined from, when there were several. */
   parts?: number[];
   /**
@@ -55,6 +60,7 @@ export function cappedOutput(details: unknown): CappedOutput | undefined {
     typeof capped.block === 'number' &&
     ['undefined', 'number'].includes(typeof capped.preview) &&
     ['undefined', 'number'].includes(typeof capped.head) &&
+    (capped.top === undefined || capped.top === true) &&
     (capped.parts === undefined ||
       (Array.isArray(capped.parts) && capped.parts.every((part) => typeof part === 'number'))) &&
     (capped.shown === undefined ||
@@ -95,8 +101,10 @@ interface Cut {
   sha256?: string;
   /** Where the preview was when it was made. */
   block?: number;
-  /** How much of the start of the text the preview opens with, when the record says. */
+  /** How much of the start of the text the preview shows, when the record says. */
   head?: number | undefined;
+  /** The preview opens with the line that says it is a part, when the record says. */
+  top?: true | undefined;
   /** The lengths of the blocks the text was joined from, when the record says. */
   parts?: readonly number[] | undefined;
   /**
@@ -107,6 +115,17 @@ interface Cut {
   marker?: RegExp;
   /** What the preview of a script's output shows of the text (see CappedOutput.shown). */
   shown?: readonly Range[] | undefined;
+}
+
+/**
+ * The line that opens the preview of a text cut as one. The line in place of the middle is
+ * easy to read past: an agent that found no field in the start and the end of a report
+ * answered that the report had none. So the preview says first that it is a part, and what
+ * that means for an answer. A preview is found again by this line as it is written here: when
+ * the words change, the line of before has to stay readable for the sessions that have it.
+ */
+function partLine(kept: number, chars: number, path: string): string {
+  return `${PREVIEW_OPENS}${kept} of ${chars} characters, its start and its end, with the middle left out at the place marked below. If what you need is not in the part shown, do not answer without it, and do not conclude that it is not there: grep ${path}, which holds all of it, or read a slice of that file.\n\n`;
 }
 
 function literal(text: string): string {
@@ -216,13 +235,14 @@ function scriptPreview(text: string, path: string, shown: readonly Range[]): str
   }
   const places = gaps === 1 ? 'the place' : `the ${gaps} places`;
   const body = pieces.join('');
-  return `${SCRIPT_PREVIEW}${kept} of ${text.length} characters, with the rest left out at ${places} marked below. If what you need is not in the part shown, do not answer without it: print less of it (filter in the script), or grep or read a slice of ${path}, which holds all of it. recall searches it once it is folded.\n\n${body}`;
+  return `${PREVIEW_OPENS}${kept} of ${text.length} characters, with the rest left out at ${places} marked below. If what you need is not in the part shown, do not answer without it: print less of it (filter in the script), or grep or read a slice of ${path}, which holds all of it. recall searches it once it is folded.\n\n${body}`;
 }
 
 /**
  * Cuts a tool result of `limit` characters or more down to about `keep`: the start and the
- * end, two to one, around a line naming the file that holds all of it. A script's output is
- * cut thing by thing that it printed, under a line that says so (see scriptRanges). The file
+ * end, two to one, around a line naming the file that holds all of it, under a line that says
+ * it is a part (see partLine). A script's output is cut thing by thing that it printed, under
+ * a line of its own that says so (see scriptRanges). The file
  * is written before the result is changed, so a preview never points at text that was not
  * kept. Undefined when the result is under the limit, or has an image between its text
  * blocks: one preview could not keep that order.
@@ -253,8 +273,12 @@ export async function capOutput(
   const path = join(dir, `output-${hash}.txt`);
   const shown = header === 1 ? scriptRanges(text, keep) : undefined;
   const script = shown && scriptPreview(text, path, shown);
+  const start = head(text, Math.floor((keep * 2) / 3));
+  const end = tail(text, Math.floor(keep / 3));
+  const omitted = text.length - start.length - end.length;
+  const preview = `${partLine(start.length + end.length, text.length, path)}${start}\n\n[episodes] ${omitted} of ${text.length} characters left out here. ${named(path)} grep it or read a slice, not the whole file. recall searches it once it is folded.\n\n${end}`;
   // The line that says it is cut is long next to a small `keep`.
-  if (script !== undefined && script.length >= text.length) return undefined;
+  if ((script ?? preview).length >= text.length) return undefined;
   await mkdir(dir, { recursive: true });
   // Parallel results with the same text must not share a temporary file.
   const temporary = `${path}.${randomUUID()}.tmp`;
@@ -283,10 +307,6 @@ export async function capOutput(
       }
     };
   }
-  const start = head(text, Math.floor((keep * 2) / 3));
-  const end = tail(text, Math.floor(keep / 3));
-  const omitted = text.length - start.length - end.length;
-  const preview = `${start}\n\n[episodes] ${omitted} of ${text.length} characters left out here. ${named(path)} grep it or read a slice, not the whole file. recall searches it once it is folded.\n\n${end}`;
   return {
     content: [...content.slice(0, from), { type: 'text', text: preview }, ...content.slice(to + 1)],
     capped: {
@@ -295,6 +315,7 @@ export async function capOutput(
       block: from,
       preview: preview.length,
       head: start.length,
+      top: true,
       ...(joined.length > 1 ? { parts: joined.map((part) => part.length) } : {})
     }
   };
@@ -310,7 +331,9 @@ function sameCut(shown: string, part: string): boolean {
  * start and the end of the text around the marker, as many characters as the marker says were
  * not left out. With the length of the start on record, only that much is replaced: a block
  * can hold more than the preview, once another cut that took in the preview and a block next
- * to it has been undone. Without it the preview has to be all of the block. Where a preview
+ * to it has been undone. Without it the preview has to be all of the block. A preview that
+ * opens with the line that says it is a part (`top` is then the file it names) is taken only
+ * with that line before its start, as it was written, and the line goes with it. Where a preview
  * stands in a longer block is not searched for: text whose start or end repeats fits in more
  * than one place, and the wrong one would take a handler's line for part of the output.
  * Undefined when the text does not fit.
@@ -319,7 +342,8 @@ function putBackSpan(
   text: string,
   marker: RegExp,
   full: string,
-  head?: number
+  head?: number,
+  top?: string
 ): { whole: string; head: number; tail: number } | undefined {
   for (const match of text.matchAll(marker)) {
     const before = match.index;
@@ -330,8 +354,11 @@ function putBackSpan(
     if (start < 0 || start > before || end < 0 || end > text.length - after) continue;
     if (!sameCut(text.slice(before - start, before), full.slice(0, start))) continue;
     if (!sameCut(text.slice(after, after + end), full.slice(full.length - end))) continue;
+    const line = top === undefined ? '' : partLine(start + end, full.length, top);
+    const opens = before - start - line.length;
+    if (opens < 0 || text.slice(opens, before - start) !== line) continue;
     return {
-      whole: text.slice(0, before - start) + full + text.slice(after + end),
+      whole: text.slice(0, opens) + full + text.slice(after + end),
       head: start,
       tail: end
     };
@@ -339,8 +366,14 @@ function putBackSpan(
   return undefined;
 }
 
-function putBack(text: string, marker: RegExp, full: string, head?: number): string | undefined {
-  return putBackSpan(text, marker, full, head)?.whole;
+function putBack(
+  text: string,
+  marker: RegExp,
+  full: string,
+  head?: number,
+  top?: string
+): string | undefined {
+  return putBackSpan(text, marker, full, head, top)?.whole;
 }
 
 /**
@@ -398,7 +431,7 @@ async function restored(
   const written = shown && scriptPreview(full, cut.path, shown);
   const fits = marked.flatMap(({ index, text }) => {
     if (written === undefined) {
-      const whole = marker && putBack(text, marker, full, cut.head);
+      const whole = marker && putBack(text, marker, full, cut.head, cut.top && cut.path);
       return whole === undefined ? [] : [{ index, text: whole }];
     }
     const at = text.indexOf(written);
@@ -442,6 +475,7 @@ export async function withFullOutput(message: AgentMessage): Promise<AgentMessag
             path: capped.path,
             block: capped.block,
             head: capped.head,
+            top: capped.top,
             parts: capped.parts,
             ...(capped.shown
               ? { shown: capped.shown }
@@ -536,7 +570,7 @@ export function verifyCompleteRead(
   );
   if (marked.length === 0) return undefined;
   const fits = marked.flatMap(({ index, text }) => {
-    const span = putBackSpan(text, marker, full, capped.head);
+    const span = putBackSpan(text, marker, full, capped.head, capped.top && capped.path);
     return span === undefined
       ? []
       : [{ index, text: span.whole, head: span.head, tail: span.tail }];

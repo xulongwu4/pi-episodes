@@ -233,8 +233,8 @@ test('folds applied together share the request after them, and a compaction ends
 });
 
 test('a capped output counts what the cap left out, whatever the block holds now', () => {
-  const kept = (preview?: number) => {
-    const record = { path: '/s/output-1.txt', chars: 40_000, block: 0 };
+  const kept = (preview?: number, more = {}) => {
+    const record = { path: '/s/output-1.txt', chars: 40_000, block: 0, ...more };
     const cut = {
       ...result('a', 'bash', 'x'.repeat(6000), 2),
       details: { episodesOutput: preview === undefined ? record : { ...record, preview } }
@@ -244,6 +244,8 @@ test('a capped output counts what the cap left out, whatever the block holds now
   };
   // Another extension cut the preview of 14,000 characters to 6,000: that is not the cap's.
   assert.deepEqual(kept(14_000), { capped: 1, tokens: 6500 });
+  // The line that opens a preview is part of the length on record, and counted with it.
+  assert.deepEqual(kept(14_000, { head: 9000, top: true }), { capped: 1, tokens: 6500 });
   // A result cut before the length was recorded has only the block to go by.
   assert.deepEqual(kept(), { capped: 1, tokens: 8500 });
 });

@@ -2,10 +2,16 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { test } from 'node:test';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
-import { CAPPED_KEY, capOutput, cappedOutput, withFullOutput } from '../src/output.js';
+import {
+  CAPPED_KEY,
+  capOutput,
+  cappedOutput,
+  verifyCompleteRead,
+  withFullOutput
+} from '../src/output.js';
 import { readStamp, withStamp } from '../src/stamps.js';
 import { result } from './helpers.js';
 
@@ -32,7 +38,11 @@ test('a large result keeps its start and end and names the file with all of it',
     assert.ok(cut);
     const block = cut.content[0]!;
     assert.ok(block.type === 'text');
-    assert.match(block.text, /^line 0 of the build log\n/);
+    const marker = block.text.indexOf('\n\n[episodes] ');
+    const omitted = Number(/\n\n\[episodes\] (\d+) of /.exec(block.text)?.[1]);
+    // It says first that it is a part, how much of the text, and where all of it is.
+    const line = `[episodes] Only part of this output is shown: ${long.length - omitted} of ${long.length} characters, its start and its end, with the middle left out at the place marked below. If what you need is not in the part shown, do not answer without it, and do not conclude that it is not there: grep ${cut.capped.path}, which holds all of it, or read a slice of that file.\n\n`;
+    assert.ok(block.text.startsWith(`${line}line 0 of the build log\n`));
     assert.match(block.text, /\nline 399 of the build log$/);
     assert.doesNotMatch(block.text, /line 200 of/);
     assert.ok(
@@ -40,15 +50,34 @@ test('a large result keeps its start and end and names the file with all of it',
     );
     // Only whole lines are shown.
     assert.ok(block.text.split('\n').every((line) => !/^line \d+ of the build$/.test(line)));
-    assert.ok(block.text.length < 700);
+    assert.ok(block.text.length < 700 + line.length);
     assert.deepEqual(cut.capped, {
       path: cut.capped.path,
       chars: long.length,
       block: 0,
       preview: block.text.length,
-      head: block.text.indexOf('\n\n[episodes] ')
+      head: marker - line.length,
+      top: true
     });
     assert.equal(await readFile(cut.capped.path, 'utf8'), long);
+    assert.deepEqual(await readdir(dir), [basename(cut.capped.path)]);
+
+    // A preview that would not be shorter than the text is not made, and no file is written.
+    const short = long.slice(0, 1050);
+    await rm(cut.capped.path);
+    assert.equal(await capOutput([{ type: 'text', text: short }], dir, 1000, 500), undefined);
+    assert.deepEqual(await readdir(dir), []);
+    assert.ok(await capOutput([{ type: 'text', text: long.slice(0, 1400) }], dir, 1000, 500));
+    // Nor one as long as the text: with no line break to cut at, some length is the preview's.
+    const sizes: boolean[] = [];
+    for (let length = 1000; length < 1400; length++) {
+      const made = await capOutput([{ type: 'text', text: 'x'.repeat(length) }], dir, 1000, 500);
+      const block = made?.content[0];
+      assert.ok(!block || (block.type === 'text' && block.text.length < length), `${length}`);
+      sizes.push(made !== undefined);
+    }
+    assert.deepEqual([sizes[0], sizes.at(-1)], [false, true]);
+    assert.equal(sizes.lastIndexOf(false) + 1, sizes.indexOf(true));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -464,7 +493,14 @@ test('the full text is put back for search, under the stamp', async () => {
       chars,
       block
     });
-    for (const wrong of [{ preview: {} }, { head: '3' }, { parts: 3 }, { parts: ['3'] }]) {
+    for (const wrong of [
+      { preview: {} },
+      { head: '3' },
+      { top: false },
+      { top: 1 },
+      { parts: 3 },
+      { parts: ['3'] }
+    ]) {
       assert.equal(cappedOutput({ [CAPPED_KEY]: { ...cut.capped, ...wrong } }), undefined);
     }
 
@@ -487,6 +523,89 @@ test('the full text is put back for search, under the stamp', async () => {
     // Without the preview nothing is put back.
     const replaced = { ...message, content: withStamp([notice], 7) };
     assert.equal(await withFullOutput(replaced), replaced);
+
+    // The line that opens the preview goes with it only where it stands as it was written:
+    // a handler's words before it in the same block stay, and a preview whose line was
+    // changed, or is missing, is not taken for the one on record.
+    const preview = cut.content[0];
+    assert.ok(preview?.type === 'text' && cut.capped.head !== undefined);
+    const line = preview.text.slice(0, preview.text.indexOf('\n\n') + 2);
+    const shown = (text: string, capped = cut.capped) => ({
+      ...message,
+      content: withStamp([{ type: 'text', text }], 7),
+      details: { exitCode: 0, [CAPPED_KEY]: { ...capped } }
+    });
+    const led = await withFullOutput(shown(`From staging.\n${preview.text}`));
+    assert.ok(led.role === 'toolResult');
+    assert.deepEqual(led.content[0], { type: 'text', text: `From staging.\n${long}` });
+    for (const other of [
+      preview.text.replace('do not answer without it', 'answer without it'),
+      preview.text.replace('do not answer', 'do now answer'),
+      // The line of another file, or of a text of another length, is not this preview's.
+      preview.text.replace('/output-', '/outpux-'),
+      preview.text.replace(
+        ` of ${long.length} characters, its`,
+        ` of ${long.length + 1} characters, its`
+      ),
+      `From staging.\n${preview.text.replace('grep', 'find')}`,
+      preview.text.replace(/shown: \d+ of/, 'shown: 1 of'),
+      preview.text.slice(line.length),
+      preview.text.slice(1)
+    ]) {
+      const changed = shown(other);
+      assert.equal(await withFullOutput(changed), changed);
+      assert.equal(verifyCompleteRead([{ type: 'text', text: other }], changed.details), undefined);
+    }
+    // The line in place of the middle can stand in a block twice: the preview is where the
+    // opening line stands before the start, not at the first one.
+    const unled = preview.text.slice(line.length);
+    const second = await withFullOutput(shown(`${unled}\n${preview.text}`));
+    assert.ok(second.role === 'toolResult');
+    assert.deepEqual(second.content[0], { type: 'text', text: `${unled}\n${long}` });
+    // A preview made before that line was written has none, and none on record.
+    const { top: _, ...before } = cut.capped;
+    const old = await withFullOutput(shown(preview.text.slice(line.length), before));
+    assert.ok(old.role === 'toolResult');
+    assert.deepEqual(old.content[0], { type: 'text', text: long });
+    assert.deepEqual(
+      verifyCompleteRead([{ type: 'text', text: preview.text.slice(line.length) }], old.details)
+        ?.blocks,
+      [{ type: 'text', text: long }]
+    );
+    // With a line that the record does not have, the line is not part of the preview.
+    const kept = await withFullOutput(shown(preview.text, before));
+    assert.ok(kept.role === 'toolResult');
+    assert.deepEqual(kept.content[0], { type: 'text', text: `${line}${long}` });
+    assert.equal(verifyCompleteRead(cut.content, old.details), undefined);
+    // A file that was read is known whole again from its preview, with what the preview kept.
+    assert.deepEqual(verifyCompleteRead(cut.content, message.details), {
+      blocks: [{ type: 'text', text: long }],
+      coverage: {
+        uncapped: false,
+        block: 0,
+        head: cut.capped.head,
+        tail: preview.text.length - preview.text.lastIndexOf('\n\n') - 2
+      }
+    });
+
+    // A preview that kept nothing of the start or the end is the two lines, and is found.
+    const bare = await capOutput([{ type: 'text', text: long }], dir, 1000, 1);
+    assert.ok(bare?.content[0]?.type === 'text');
+    assert.equal(bare.capped.head, 0);
+    assert.match(
+      bare.content[0].text,
+      /^\[episodes\] Only part [^\n]*\n\n\n\n\[episodes\] [^\n]*\n\n$/
+    );
+    const none = shown(bare.content[0].text, bare.capped);
+    const all = await withFullOutput(none);
+    assert.ok(all.role === 'toolResult');
+    assert.deepEqual(all.content[0], { type: 'text', text: long });
+    assert.deepEqual(verifyCompleteRead(bare.content, none.details)?.coverage, {
+      uncapped: false,
+      block: 0,
+      head: 0,
+      tail: 0
+    });
 
     // A file that is gone leaves the preview, which is what the model saw.
     await rm(cut.capped.path);
@@ -590,7 +709,7 @@ test('a result that both extensions cut gets all of its text back, whichever cut
     const cut = await capOutput([{ type: 'text', text: long }], dir, 4000, 3000);
     assert.ok(cut?.content[0]?.type === 'text');
     const outer = await offloaded(dir, cut.content[0].text, 600);
-    assert.doesNotMatch(outer.preview, /\[episodes\]/);
+    assert.doesNotMatch(outer.preview, /characters left out here/);
     const reversed = toolResult(withStamp([{ type: 'text', text: outer.preview }], 7), {
       [CAPPED_KEY]: { ...cut.capped },
       offload: outer.details
@@ -612,7 +731,7 @@ test('what a handler added between two cuts stays when both are put back', async
     const cut = await capOutput([{ type: 'text', text: long }], dir, 4000, 3000);
     assert.ok(cut?.content[0]?.type === 'text');
     const outer = await offloaded(dir, `${cut.content[0].text}\n${warning}`, 600);
-    assert.doesNotMatch(outer.preview, /\[episodes\]/);
+    assert.doesNotMatch(outer.preview, /characters left out here/);
     const message = toolResult(withStamp([{ type: 'text', text: outer.preview }], 7), {
       [CAPPED_KEY]: { ...cut.capped },
       offload: outer.details
@@ -701,7 +820,7 @@ test('a preview of repeated lines is put back where it stands', async () => {
     // start and the end of the output would fit around the line one row further up too.
     const rows = (row: string) => Array.from({ length: 300 }, () => row).join('\n');
     const log = `${rows('PASS head')}\nFAIL the one that matters\n${rows('PASS tail')}`;
-    const first = await offloaded(dir, log, 600);
+    const first = await offloaded(dir, log, 3000);
     const added = { type: 'text' as const, text: 'PASS head' };
     const second = await capOutput([added, { type: 'text', text: first.preview }], dir, 600, 300);
     assert.ok(second);
@@ -718,11 +837,14 @@ test('a preview of repeated lines is put back where it stands', async () => {
 test('a preview cut inside a character still gets its text back', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
   try {
-    const faces = '😀'.repeat(50);
+    const faces = '😀'.repeat(600);
     const cut = await capOutput([{ type: 'text', text: faces }], dir, 10, 5);
     assert.ok(cut?.content[0]?.type === 'text');
     // Half a character was kept at each end, and reads as the replacement character.
-    assert.match(cut.content[0].text, /^😀\uFFFD\n\n\[episodes\] [^\n]*\n\n\uFFFD$/);
+    assert.match(
+      cut.content[0].text,
+      /^\[episodes\] Only part [^\n]*\n\n😀\uFFFD\n\n\[episodes\] [^\n]*\n\n\uFFFD$/
+    );
     const full = await withFullOutput(toolResult(cut.content, { [CAPPED_KEY]: { ...cut.capped } }));
     assert.ok(full.role === 'toolResult');
     assert.deepEqual(full.content, [{ type: 'text', text: faces }]);

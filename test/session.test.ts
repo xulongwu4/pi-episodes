@@ -1236,14 +1236,17 @@ test('a large tool result arrives cut, and recall searches and reads back all of
         ),
       (context) => {
         const output = text(conversation(context).at(-1)!);
-        assert.match(output, /^row 1 of the table\n/);
+        assert.match(
+          output,
+          /^\[episodes\] Only part of this output is shown: \d+ of \d+ characters, [^\n]*\n\nrow 1 of the table\n/
+        );
         assert.match(
           output,
           /\[episodes\] \d+ of \d+ characters left out here\. All of this output is in /
         );
         assert.match(output, /row 600 of the table\n+\[t2\]$/);
         assert.doesNotMatch(output, /row 300 of/);
-        assert.ok(output.length < 1000);
+        assert.ok(output.length < 1700);
         return fauxAssistantMessage(
           fauxToolCall('fold', { since: 't2', note: 'Printed the table.' })
         );
@@ -1289,6 +1292,8 @@ test('a large tool result arrives cut, and recall searches and reads back all of
     const stats = episodeStats(harness.session.sessionManager.getBranch(), harness.dir);
     assert.equal(stats.outputs.capped, 1);
     assert.ok(stats.outputs.tokens > 2000);
+    // The line that opens the preview is part of it, not a cue.
+    assert.equal(stats.overhead.cues, 0);
     assert.equal(stats.recall.count, 2);
     assert.equal(stats.recall.readBack, 1);
     const lines = statsLines(stats);
@@ -1317,14 +1322,17 @@ test('a large read result arrives cut, leaves errors and images whole, and recal
       () => fauxAssistantMessage(fauxToolCall('read', { path: 'table.txt' })),
       (context) => {
         const output = text(conversation(context).at(-1)!);
-        assert.match(output, /^row 1 of the file\n/);
+        assert.match(
+          output,
+          /^\[episodes\] Only part of this output is shown: \d+ of \d+ characters, [^\n]*\n\nrow 1 of the file\n/
+        );
         assert.match(
           output,
           /\[episodes\] \d+ of \d+ characters left out here\. All of this output is in /
         );
         assert.match(output, /row 600 of the file\n+\[t2\]$/);
         assert.doesNotMatch(output, /row 300 of/);
-        assert.ok(output.length < 1000);
+        assert.ok(output.length < 1700);
         return fauxAssistantMessage([
           fauxToolCall('read', { path: 'missing.txt' }),
           fauxToolCall('read', { path: 'tiny.png' })
