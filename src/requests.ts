@@ -1,7 +1,7 @@
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ModelsSimpleStreamOptions, Usage } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
-import { appliedFolds } from './archive.js';
+import { appliedFolds, RUN_END_FOLD_TYPE } from './archive.js';
 import { anchorBreakpoint, cacheAnchor } from './cache.js';
 import { episodesSettings } from './settings.js';
 
@@ -10,6 +10,42 @@ export interface ExtraRequestState {
   extraApplied?: ReadonlySet<string> | (() => ReadonlySet<string>) | undefined;
   /** Whether to add the folds in effect on `ctx.sessionManager.getBranch()`. Default true. */
   includeBranch?: boolean | undefined;
+}
+
+/**
+ * What became of a request for a fold at the end of a run, from the messages after it. It is
+ * answered when a response that was sent stands right behind it, whether that folded or not.
+ * It is open while nothing does. It is stale when something else follows: the run was aborted
+ * on it or the provider failed, both of which leave a response that is not sent again, the
+ * process ended, or a message arrived that the run went on for.
+ */
+export function askState(after: Iterable<AgentMessage>): 'answered' | 'open' | 'stale' {
+  for (const message of after) {
+    // Pi's note on a change of tools or prompt, which the agent did not write and no one asked.
+    if ((message.role as string) === 'system') continue;
+    if (message.role !== 'assistant') return 'stale';
+    if (message.stopReason !== 'error' && message.stopReason !== 'aborted') return 'answered';
+  }
+  return 'open';
+}
+
+/**
+ * The messages without the requests for a fold that got no answer. Left in, such a request
+ * would stand in front of the next request and tell the agent to fold and, under codemode, to
+ * reply with one word. The next boundary removes it from the session (`registerNudge`); until
+ * then, and for a thread whose context was taken before that, this is applied to whatever is
+ * sent: the main agent's requests, the prefix a fork starts from, and what `ask` sends, so
+ * that all three still begin alike.
+ */
+export function withoutStaleAsks(messages: readonly AgentMessage[]): AgentMessage[] {
+  return messages.filter(
+    (message, index) =>
+      !(
+        message.role === 'custom' &&
+        message.customType === RUN_END_FOLD_TYPE &&
+        askState(messages.slice(index + 1)) === 'stale'
+      )
+  );
 }
 
 function resolveSet(

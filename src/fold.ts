@@ -27,6 +27,7 @@ import {
   foldNoteDetails,
   foldSpans,
   formatFoldRange,
+  RUN_END_FOLD_TYPE,
   ThreadIndex,
   UNFOLD_TOOL
 } from './archive.js';
@@ -972,6 +973,45 @@ export function completeCutShortFolds(
   });
 }
 
+/**
+ * What an entry is to a run that goes on from before it: the agent's own response or the
+ * result of one of its calls (`own`), something new to answer (`new`: a message of the user or
+ * of an extension, a shell command the user ran, the summary of a branch or of a compaction),
+ * or neither, such as the entries extensions keep for themselves and pi's notes on a change of
+ * model or tools.
+ */
+export function turnOf(entry: SessionEntry): 'own' | 'new' | undefined {
+  if (entry.type === 'message') {
+    const role: string = entry.message.role;
+    if (role === 'assistant' || role === 'toolResult') return 'own';
+    return role === 'system' ? undefined : 'new';
+  }
+  return entry.type === 'custom_message' ||
+    entry.type === 'branch_summary' ||
+    entry.type === 'compaction'
+    ? 'new'
+    : undefined;
+}
+
+/**
+ * Where the request stands that a fold called at `foldIndex` answers: the message the extension
+ * added once a run had ended, with nothing new shown after it (`turnOf`). -1 when there is
+ * none, or when something new has come since: the request then no longer says what the run is
+ * for.
+ */
+export function runEndRequest(
+  entries: readonly ProjectedSessionEntry[],
+  foldIndex: number
+): number {
+  for (let index = foldIndex - 1; index >= 0; index--) {
+    const source = entries[index]!.sourceEntry;
+    if (entries[index]!.messages.length === 0) continue;
+    if (source.type === 'custom_message' && source.customType === RUN_END_FOLD_TYPE) return index;
+    if (turnOf(source) === 'new') return -1;
+  }
+  return -1;
+}
+
 /** The handle of a fold or unfold that started and has no completion marker; the next turn end completes it. */
 export function cutShortFold(branch: readonly SessionEntry[]): string | undefined {
   return unfinishedBatches(branch)[0]?.handle;
@@ -1102,7 +1142,13 @@ export function planFold(
     throw new FoldError(reason, `A fold cannot reach behind ${what}. ${pick}`);
   }
 
-  let endIndex = foldIndex;
+  // The request for this fold that the extension made once a run had ended stays in view, with
+  // any try at the fold that was refused: it says why this response folds, and where a script
+  // folds, the reply after it answers it. So nothing from the request on is a turn of the span
+  // or a turn that the span leaves.
+  const asking = runEndRequest(entries, foldIndex);
+  const limit = asking > startIndex ? asking : foldIndex;
+  let endIndex = limit;
   let keptFrom: number | undefined;
   if (options.until !== undefined) {
     const until = options.until;
@@ -1129,18 +1175,22 @@ export function planFold(
     if (untilIndex >= foldIndex) {
       throw new FoldError('not-before-call', `${stampLabel(until)} is not before this fold call.`);
     }
-    const next = turnAfter(entries, untilIndex, foldIndex);
-    // The marker of another fold stands for turns after these, which that fold removed: the
-    // span stops before it, as it would before those turns.
-    const marker = entries.findIndex(
-      (entry, index) =>
-        index > untilIndex &&
-        index < (next?.index ?? foldIndex) &&
-        lines.get(entry.sourceEntry.id) !== undefined
-    );
-    if (marker >= 0) endIndex = marker;
-    else if (next) endIndex = next.index;
-    keptFrom = next?.stamp;
+    // A stamp behind the request this fold answers is one of a try that was refused: the
+    // span ends at the request then, as it does without until.
+    if (untilIndex < limit) {
+      const next = turnAfter(entries, untilIndex, limit);
+      // The marker of another fold stands for turns after these, which that fold removed:
+      // the span stops before it, as it would before those turns.
+      const marker = entries.findIndex(
+        (entry, index) =>
+          index > untilIndex &&
+          index < (next?.index ?? limit) &&
+          lines.get(entry.sourceEntry.id) !== undefined
+      );
+      if (marker >= 0) endIndex = marker;
+      else if (next) endIndex = next.index;
+      keptFrom = next?.stamp;
+    }
   }
 
   const span = entries.slice(startIndex, endIndex);
@@ -1252,14 +1302,25 @@ export function planFold(
   // A fold that starts at the note of the fold before it stands behind that fold's line, with
   // at most the user messages that fold kept between them. Its own line says the same for
   // both from now on, so the older one goes: a chain of such folds would otherwise leave a
-  // row of them. A line with a response between it and this span stays where it is.
+  // row of them. A line with a response between it and this span stays where it is. Between
+  // the two can also stand the request that the covered fold answered, when that fold was
+  // asked for at the end of a run and kept nothing: with the call that answered it gone it
+  // asks for nothing, and it goes as well. So does one that got no answer. The request that
+  // this fold answers stays, also when the fold starts behind it, at a try that was refused.
   for (let index = startIndex - 1; index > boundary; index--) {
     const entry = entries[index]!;
     if (entry.messages.length === 0) continue;
-    const owner = lines.get(entry.sourceEntry.id);
+    const source = entry.sourceEntry;
+    const owner = lines.get(source.id);
     if (owner !== undefined && covered.has(owner)) {
-      edits.push({ type: 'context_edit', targetId: entry.sourceEntry.id, replacement: null });
-      linesRemoved.push(entry.sourceEntry.id);
+      edits.push({ type: 'context_edit', targetId: source.id, replacement: null });
+      linesRemoved.push(source.id);
+    } else if (
+      source.type === 'custom_message' &&
+      source.customType === RUN_END_FOLD_TYPE &&
+      index !== asking
+    ) {
+      edits.push({ type: 'context_edit', targetId: source.id, replacement: null });
     } else if (entry.messages[0]!.role !== 'user') break;
   }
 
@@ -2379,7 +2440,7 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
 
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       // A /fold request is used up by this call, whether it succeeds or not.
-      const manual = state.manualFold;
+      const commanded = state.manualFold;
       state.manualFold = undefined;
       // A call from a codemode script is not in the transcript; the response that called the
       // script made it.
@@ -2390,6 +2451,11 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
       const entries = ctx.sessionManager.buildSessionProjection().entries;
       const foldIndex = entries.findIndex((entry) => callsTool(entry, scriptCall ?? toolCallId));
       const caller = foldIndex >= 0 ? entries[foldIndex] : undefined;
+      // Whether this fold answers the request made at the end of the run is read from the
+      // transcript: it holds after a try that was refused and in a resumed session, and it ends
+      // when a message of the user or of another extension has come since.
+      const manual =
+        commanded ?? (runEndRequest(entries, foldIndex) >= 0 ? ('run-end' as const) : undefined);
       let batch: FoldBatchPlan;
       try {
         // The first fold of a response holds it, whether or not it succeeds, as for folds the
@@ -2593,8 +2659,9 @@ export function registerFold(pi: ExtensionAPI, state: EpisodeState): void {
         ...(scriptCall ? { script: { foldCallId: toolCallId, note: text, details } } : {})
       });
 
-      // A /fold request ends the run here; an autonomous fold continues the task. Codemode
-      // does not pass this on from a script, so a /fold done there does not end the run.
+      // A fold asked for by /fold, or by the extension once a run had ended, ends the run here;
+      // an autonomous fold continues the task. Codemode does not pass this on from a script, so
+      // a fold asked for there is followed by one more response.
       const terminate = manual !== undefined;
 
       // A script gets its own note only. The notes it covers are added to the script's result:

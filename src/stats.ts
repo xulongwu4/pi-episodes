@@ -8,7 +8,8 @@ import {
   FORK_TOOL,
   foldNoteDetails,
   foldSpans,
-  isForkDetails
+  isForkDetails,
+  RUN_END_FOLD_TYPE
 } from './archive.js';
 import { COMPACTION_NOTICE_TYPE } from './compaction.js';
 import { type EpisodeEvent, EVENT_TYPE } from './events.js';
@@ -348,6 +349,8 @@ export interface EpisodeStats {
   compactions: number;
   reminders: number;
   nudges: number;
+  /** Folds the extension asked for once a run had ended. */
+  runEndAsks: number;
   /** Estimated tokens the extension added to the transcript, and its prompt section. */
   overhead: { stamps: number; cues: number; notices: number; prompt: number };
 }
@@ -441,6 +444,7 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
     compactions: 0,
     reminders: 0,
     nudges: 0,
+    runEndAsks: 0,
     overhead: { stamps: 0, cues: 0, notices: 0, prompt: tokensOf(EPISODES_SECTION.length) }
   };
 
@@ -626,9 +630,11 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
     if (entry.type === 'custom_message') {
       if (entry.customType === REMINDER_TYPE) stats.reminders++;
       if (entry.customType === NUDGE_TYPE) stats.nudges++;
+      if (entry.customType === RUN_END_FOLD_TYPE) stats.runEndAsks++;
       if (
         entry.customType === REMINDER_TYPE ||
         entry.customType === NUDGE_TYPE ||
+        entry.customType === RUN_END_FOLD_TYPE ||
         entry.customType === COMPACTION_NOTICE_TYPE
       ) {
         const content = entry.content;
@@ -944,6 +950,7 @@ export function statsLines(stats: EpisodeStats): string[] {
   }
   if (stats.reminders > 0) lines.push(`open-item reminders ${stats.reminders}`);
   if (stats.nudges > 0) lines.push(`fold nudges ${stats.nudges}`);
+  if (stats.runEndAsks > 0) lines.push(`folds asked for at the end of a run ${stats.runEndAsks}`);
 
   const overhead = stats.overhead;
   lines.push(

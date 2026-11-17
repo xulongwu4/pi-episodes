@@ -20,6 +20,16 @@ export interface EpisodesSettings {
   foldNudge: boolean;
   foldNudgeTokens: number;
   /**
+   * Ask for that fold when a run has ended, before the next request arrives, rather than with
+   * the next request: a fold made inside a request cost answers (MEASUREMENTS.md, section 16).
+   * The run then ends on the fold and, where the fold is called from a script, on a one-word
+   * reply to it, so by default this is done only in the interactive TUI, where a person reads
+   * the whole transcript: print and JSON mode report the last response as the answer, and an
+   * RPC host may read it as such. `"always"` asks in every mode, for a host that takes the
+   * answer from before the request; `false` leaves the nudge at the next prompt.
+   */
+  foldAfterRun: boolean | 'always';
+  /**
    * Cut a tool result of `outputCapChars` characters or more down to about
    * `outputCapKeepChars` before it enters the context, and keep all of it in a file next to
    * the session.
@@ -48,6 +58,7 @@ const DEFAULTS: EpisodesSettings = {
   cacheAnchor: true,
   foldNudge: true,
   foldNudgeTokens: 50_000,
+  foldAfterRun: true,
   outputCap: true,
   outputCapChars: 16_000,
   outputCapKeepChars: 6_000,
@@ -73,6 +84,7 @@ export function episodesSettings(settings: object): EpisodesSettings {
     cacheAnchor: flag(raw.cacheAnchor, DEFAULTS.cacheAnchor),
     foldNudge: flag(raw.foldNudge, DEFAULTS.foldNudge),
     foldNudgeTokens: positive(raw.foldNudgeTokens, DEFAULTS.foldNudgeTokens),
+    foldAfterRun: raw.foldAfterRun === 'always' ? 'always' : flag(raw.foldAfterRun, true),
     outputCap: flag(raw.outputCap, DEFAULTS.outputCap),
     outputCapChars: positive(raw.outputCapChars, DEFAULTS.outputCapChars),
     outputCapKeepChars: positive(raw.outputCapKeepChars, DEFAULTS.outputCapKeepChars),

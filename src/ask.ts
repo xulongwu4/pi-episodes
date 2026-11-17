@@ -4,7 +4,7 @@ import { Type } from 'typebox';
 import { callingFork, ThreadIndex } from './archive.js';
 import { textOf } from './messages.js';
 import { staleness } from './recall.js';
-import { requestOptions } from './requests.js';
+import { requestOptions, withoutStaleAsks } from './requests.js';
 import type { EpisodeState } from './state.js';
 import { type AskDetails, askRenderers } from './ui.js';
 
@@ -59,7 +59,8 @@ export function registerAsk(pi: ExtensionAPI, state: EpisodeState): void {
 
       // The thread's own system messages carry its prompt and tools, so the request repeats
       // its prefix byte for byte and can read it from the cache while it is alive.
-      const messages = [...thread.context(), question(params.question)];
+      // A request for a fold that the thread ends on was never answered: the question follows it.
+      const messages = withoutStaleAsks([...thread.context(), question(params.question)]);
       const response = await ctx.modelRegistry
         .streamSimple(
           model,

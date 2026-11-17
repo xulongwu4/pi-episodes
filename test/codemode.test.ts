@@ -7,6 +7,7 @@ import {
   type AssistantMessage,
   fauxAssistantMessage,
   fauxProvider,
+  fauxText,
   fauxToolCall,
   getCurrentTools,
   getSystemMessageText,
@@ -19,7 +20,9 @@ import {
   createCodemodeExtension,
   DefaultResourceLoader,
   type ExtensionFactory,
+  type ExtensionUIContext,
   ModelRuntime,
+  type SessionEntry,
   SessionManager,
   SettingsManager
 } from '@earendil-works/pi-coding-agent';
@@ -37,8 +40,8 @@ import { cacheAnchor } from '../src/cache.js';
 import { foldableTurns, foldStart, USER_TEXT_CAP } from '../src/fold.js';
 import episodes from '../src/index.js';
 import { FILES_KEY } from '../src/messages.js';
-import { nudgeGrowth, nudgeThreshold } from '../src/nudge.js';
-import { episodeStats } from '../src/stats.js';
+import { AFTER_RUN_END_FOLD, nudgeGrowth, nudgeThreshold } from '../src/nudge.js';
+import { episodeStats, statsLines } from '../src/stats.js';
 
 type Step = (context: TranscriptContext) => AssistantMessage | Promise<AssistantMessage>;
 type Mode = 'off' | 'on' | 'only';
@@ -83,7 +86,9 @@ async function createSession(
   /** Tools of `extensions` to make active. */
   tools: string[] = [],
   /** A session with a file, next to which large outputs are kept. */
-  persist = false
+  persist = false,
+  /** A host with a UI, as the terminal and RPC mode are; false is print and JSON mode. */
+  ui: 'tui' | 'rpc' | false = false
 ) {
   const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-codemode-'));
   const faux = fauxProvider();
@@ -143,7 +148,20 @@ async function createSession(
       ...(mode === 'off' ? {} : { codemode: { mode } })
     })
   });
-  await session.bindExtensions({});
+  // Pi runs without a UI in print mode, which is what a session bound to nothing reports.
+  // Own properties: pi copies the object, which a proxy with nothing of its own does not survive.
+  const nothing = () => undefined;
+  const anyUi = {
+    notify: nothing,
+    setStatus: nothing,
+    setWidget: nothing,
+    setWorkingMessage: nothing,
+    requestRender: nothing,
+    select: nothing,
+    custom: nothing,
+    theme: { fg: (_color: string, shown: string) => shown, bold: (shown: string) => shown }
+  } as unknown as ExtensionUIContext;
+  await session.bindExtensions(ui ? { uiContext: anyUi, mode: ui } : {});
 
   return {
     dir,
@@ -164,6 +182,20 @@ async function createSession(
       await rm(dir, { recursive: true, force: true });
     }
   };
+}
+
+/** The edits that take a request for a fold at the end of a run out of the context. */
+function askRemovals(branch: readonly SessionEntry[]) {
+  const asks = new Set(
+    branch
+      .filter(
+        (entry) => entry.type === 'custom_message' && entry.customType === 'episodes-fold-run-end'
+      )
+      .map((entry) => entry.id)
+  );
+  return branch.filter(
+    (entry) => entry.type === 'context_edit' && asks.has(entry.targetId) && !entry.replacement
+  ) as Extract<SessionEntry, { type: 'context_edit' }>[];
 }
 
 test('fold and fork stay declared next to codemode; the other tools follow the mode', async () => {
@@ -2944,3 +2976,1450 @@ for (const foldLine of [true, false]) {
     }
   });
 }
+
+for (const mode of ['off', 'only'] as const) {
+  const call = (tool: string, args: Record<string, string>) =>
+    mode === 'only'
+      ? script(`text(await tools.${tool}(${JSON.stringify(args)}));`)
+      : fauxAssistantMessage(fauxToolCall(tool, args), { stopReason: 'toolUse' });
+  const answer = (said: string) => fauxAssistantMessage(said);
+  const how =
+    mode === 'only'
+      ? /make one codemode call whose script calls only fold and prints its result/
+      : /call only fold in this response/;
+  const ending = mode === 'only' ? /reply with the one word "Folded\."/ : /the fold ends it/;
+  // Where a script folds, the run goes on for one more response; a direct fold ends it.
+  const reply = (check: (shown: string) => void): Step[] =>
+    mode === 'only'
+      ? [
+          (context) => {
+            check(conversation(context).map(text).join('\n'));
+            return answer('Folded.');
+          }
+        ]
+      : [];
+
+  test(`a run that ends over the threshold is asked to fold all but its last request, and the next such fold takes that in (codemode ${mode})`, async () => {
+    const [x, y, z, w] = ['x', 'y', 'z', 'w'].map((letter, index) =>
+      letter.repeat(index % 2 === 0 ? 2800 : 600)
+    ) as [string, string, string, string];
+    const harness = await createSession(
+      mode,
+      [
+        () => call('bash', { command: `echo ${x}` }),
+        () => answer('first answer'),
+        // About 1400 tokens so far: under the threshold. The second request takes it over.
+        () => call('bash', { command: `echo ${y}` }),
+        () => answer('second answer'),
+        (context) => {
+          const shown = conversation(context);
+          const asked = text(shown.at(-1)!);
+          assert.match(asked, /^The request above is answered\. About 1k tokens of finished work/);
+          assert.match(asked, how);
+          assert.match(asked, ending);
+          assert.equal(text(shown.at(-2)!), 'second answer');
+          // The count is of what the fold removes, without the request it keeps.
+          // From the first stamp to the last one before the request just answered.
+          assert.match(asked, /with since "t1" and until "t2" \(the turns after it stay in view/);
+          assert.match(asked, /a note covering everything between them\. /);
+          return call('fold', { since: 't1', until: 't2', note: 'Printed a long line of x.' });
+        },
+        ...reply((shown) => {
+          assert.doesNotMatch(shown, /xxxx/);
+          assert.match(shown, /yyyy/);
+          assert.match(shown, /The request above is answered/);
+        }),
+        (context) => {
+          const shown = conversation(context);
+          // No nudge comes with the prompt: the fold is made.
+          assert.match(text(shown.at(-1)!), /^third/);
+          const all = shown.map(text).join('\n');
+          assert.doesNotMatch(all, /xxxx/);
+          assert.match(all, /yyyy/);
+          assert.match(all, /second answer/);
+          assert.match(all, /Printed a long line of x\./);
+          return call('bash', { command: `echo ${z}` });
+        },
+        () => answer('third answer'),
+        () => call('bash', { command: `echo ${w}` }),
+        () => answer('fourth answer'),
+        (context) => {
+          const asked = text(conversation(context).at(-1)!);
+          // From the request the first fold kept, behind its note, to before the last request.
+          assert.match(asked, /with since "t4" and until "t7" \(the turns after it stay in view/);
+          assert.match(
+            asked,
+            /a note covering everything between them that your notes do not say already: the fold keeps each note of earlier folds there under the new one as you wrote it\. /
+          );
+          return call('fold', { since: 't4', until: 't7', note: 'Printed a long line of z.' });
+        },
+        ...reply((shown) => {
+          assert.doesNotMatch(shown, /yyyy|zzzz/);
+          assert.match(shown, /wwww/);
+        }),
+        (context) => {
+          const all = conversation(context).map(text).join('\n');
+          assert.doesNotMatch(all, /xxxx|yyyy|zzzz|second answer|third answer/);
+          assert.match(all, /wwww/);
+          assert.match(all, /fourth answer/);
+          // The first note stands once, under the second.
+          assert.equal(all.split('Printed a long line of x.').length - 1, 1);
+          assert.equal(all.split('Printed a long line of z.').length - 1, 1);
+          return answer('fifth answer');
+        }
+      ],
+      [],
+      // With the terminal UI the fold is asked for by default, and applied with that UI bound.
+      mode === 'off'
+        ? { foldNudgeTokens: 1600 }
+        : { foldNudgeTokens: 1600, foldAfterRun: 'always' },
+      {},
+      undefined,
+      [],
+      [],
+      false,
+      mode === 'off' ? 'tui' : false
+    );
+    try {
+      await harness.run('first', 'second', 'third', 'fourth', 'fifth');
+      const branch = harness.session.sessionManager.getBranch();
+      const records = threadRecords(branch) as {
+        handle: string;
+        manual?: string;
+        keptFrom?: string;
+        covers?: string[];
+      }[];
+      assert.deepEqual(
+        records.map((record) => [record.manual, record.keptFrom, record.covers ?? []]),
+        [
+          ['run-end', 't3', []],
+          ['run-end', 't8', [records[0]!.handle]]
+        ]
+      );
+      const stats = episodeStats(branch, harness.dir);
+      assert.equal(stats.runEndAsks, 2);
+      assert.equal(stats.nudges, 0);
+      // The one word a script's fold is followed by is no final reply the agent chose to give.
+      assert.equal(stats.folds.beforeFinal, 0);
+      for (const type of ['episodes-nudge', 'episodes-fold-run-end']) {
+        assert.ok(harness.session.extensionRunner.getMessageRenderer(type), type);
+      }
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test(`a last request too large to keep is folded with the rest, and the request for the fold stays in view (codemode ${mode})`, async () => {
+    // One request over the threshold; a second one that is over a quarter of it; and, close
+    // to compaction, where a quarter is enough, a second one larger than what stands before it:
+    // its long answer takes the run over, with no nudge inside the run before it.
+    for (const sizes of [[2200], [1800, 800], [300, 100]]) {
+      const prints = sizes.map((size, index) => 'xy'[index]!.repeat(size));
+      const pressed = sizes[0]! < 1000;
+      const harness = await createSession(
+        mode,
+        [
+          ...prints.flatMap((print, index): Step[] => [
+            () => call('bash', { command: `echo ${print}` }),
+            () => answer(`answer ${index + 1}${pressed && index === 1 ? ' z'.repeat(500) : ''}`)
+          ]),
+          (context) => {
+            const asked = text(conversation(context).at(-1)!);
+            assert.match(asked, /with since "t1", and a note covering everything from there\. /);
+            return call('fold', { since: 't1', note: 'Printed long lines.' });
+          },
+          ...reply((shown) => {
+            assert.doesNotMatch(shown, /xxxx|yyyy|answer \d/);
+            assert.match(shown, /The request above is answered/);
+          }),
+          (context) => {
+            const all = conversation(context).map(text).join('\n');
+            assert.doesNotMatch(all, /xxxx|yyyy|answer \d/);
+            // What asked for the fold is still there, and so is every request of the user.
+            assert.match(all, /The request above is answered/);
+            for (const index of sizes.keys()) assert.match(all, new RegExp(`request ${index + 1}`));
+            return answer('last answer');
+          }
+        ],
+        [],
+        { foldNudgeTokens: pressed ? 1600 : 1000, foldAfterRun: 'always' },
+        pressed ? { reserveTokens: 127_000 } : {}
+      );
+      try {
+        await harness.run(...sizes.map((_, index) => `request ${index + 1}`), 'last');
+        const records = threadRecords(harness.session.sessionManager.getBranch()) as {
+          keptFrom?: string;
+        }[];
+        assert.equal(records.length, 1, String(sizes));
+        assert.equal(records[0]!.keptFrom, undefined);
+      } finally {
+        await harness.cleanup();
+      }
+    }
+  });
+}
+
+test('the fold at the end of a run is asked for where there is a UI or the setting says always, once, and the nudge at the next prompt is what is left elsewhere', async () => {
+  const cases: [settings: Record<string, unknown>, ui: 'tui' | 'rpc' | false, asked: boolean][] = [
+    [{}, 'tui', true],
+    // An RPC host has a UI too, and may still take the last response of a run for its answer.
+    [{}, 'rpc', false],
+    [{}, false, false],
+    [{ foldAfterRun: 'always' }, false, true],
+    [{ foldAfterRun: 'always' }, 'rpc', true],
+    [{ foldAfterRun: false }, 'tui', false],
+    [{ foldAfterRun: 'no' }, 'tui', true],
+    [{ foldNudge: false }, 'tui', false]
+  ];
+  for (const [settings, ui, asked] of cases) {
+    const label = JSON.stringify([settings, ui]);
+    const nudged = !asked && settings.foldNudge !== false;
+    const harness = await createSession(
+      'off',
+      [
+        () =>
+          fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(800)}` }), {
+            stopReason: 'toolUse'
+          }),
+        () => fauxAssistantMessage('done'),
+        // Asked, the agent does not fold: it is not asked again when this response ends the run.
+        ...(asked
+          ? [
+              (context: TranscriptContext) => {
+                assert.match(
+                  text(conversation(context).at(-1)!),
+                  /^The request above is answered/,
+                  label
+                );
+                return fauxAssistantMessage('Not now.');
+              }
+            ]
+          : []),
+        (context: TranscriptContext) => {
+          const last = text(conversation(context).at(-1)!);
+          if (nudged) {
+            assert.match(last, /tokens of work built up since the last fold/, label);
+            assert.match(last, /the work before it would stay in your context\.$/, label);
+          } else {
+            // Nor with the next prompt: growth is counted from where it was asked.
+            assert.match(last, /^second/, label);
+          }
+          return fauxAssistantMessage('done');
+        }
+      ],
+      [],
+      { foldNudgeTokens: 300, ...settings },
+      {},
+      undefined,
+      [],
+      [],
+      false,
+      ui
+    );
+    try {
+      await harness.run('first', 'second');
+      const stats = episodeStats(harness.session.sessionManager.getBranch(), harness.dir);
+      assert.equal(stats.runEndAsks, asked ? 1 : 0, label);
+      assert.equal(stats.nudges, nudged ? 1 : 0, label);
+      // Either message is counted with what the extension adds to the context.
+      assert.equal(stats.overhead.notices > 0, asked || nudged, label);
+      assert.equal(
+        statsLines(stats).includes('folds asked for at the end of a run 1'),
+        asked,
+        label
+      );
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+test('after the fold a script made at the end of a run, no call runs until the next message of the user', async () => {
+  const x = 'x'.repeat(4000);
+  let ran = 0;
+  let ended = 0;
+  const counts: ExtensionFactory = (pi) => {
+    pi.on('tool_execution_start', (event) => {
+      if (event.toolName === 'bash') ran++;
+    });
+    pi.on('agent_before_settle', () => {
+      ended++;
+      return undefined;
+    });
+  };
+  const harness = await createSession(
+    'only',
+    [
+      () => script(`text(JSON.stringify(await tools.bash({ command: "echo ${x}" })));`),
+      () => fauxAssistantMessage('first answer'),
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /^The request above is answered/);
+        // A call made next to the fold, before it is applied, runs as it did.
+        return script(
+          `text(await tools.fold({ since: "t1", note: "Printed x." })); await tools.bash({ command: "echo beside" });`
+        );
+      },
+      // The agent goes on instead of ending the run: on the request it kept, or on one to come.
+      // Its calls are not run, and the run ends there, with no further response.
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxText('Folded.'),
+            fauxToolCall('codemode', {
+              code: 'text(await tools.bash({ command: "echo ahead" }));'
+            }),
+            fauxToolCall('codemode', { code: 'text(await tools.bash({ command: "echo more" }));' })
+          ],
+          { stopReason: 'toolUse' }
+        ),
+      // The next message of the user ends that: its calls run.
+      (context) => {
+        const shown = conversation(context).map(text);
+        assert.match(shown.at(-1)!, /^second/);
+        assert.ok(shown.at(-2)!.startsWith(AFTER_RUN_END_FOLD), shown.at(-2));
+        assert.ok(shown.at(-3)!.startsWith(AFTER_RUN_END_FOLD), shown.at(-3));
+        assert.equal(ran, 2);
+        return script('text(JSON.stringify(await tools.bash({ command: "echo next" })));');
+      },
+      (context) => {
+        assert.match(conversation(context).map(text).join('\n'), /next/);
+        assert.equal(ran, 3);
+        return fauxAssistantMessage('second answer');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always' },
+    {},
+    undefined,
+    [counts]
+  );
+  try {
+    await harness.run('first', 'second');
+    const branch = harness.session.sessionManager.getBranch();
+    const stats = episodeStats(branch, harness.dir);
+    assert.equal(stats.runEndAsks, 1);
+    assert.equal(stats.folds.count, 1);
+    // Pi ended the run by itself, as it ends any run: once after the answer, where the fold
+    // was asked for, once after the calls that were not run, and once for the second request.
+    // A run that is stopped does not come by there.
+    assert.equal(ended, 3);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a fold asked for at the end of a run ends it also after a try that was refused', async () => {
+  const fold = (since: string) =>
+    fauxAssistantMessage(fauxToolCall('fold', { since, note: 'Printed x.' }), {
+      stopReason: 'toolUse'
+    });
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(4000)}` }), {
+          stopReason: 'toolUse'
+        }),
+      () => fauxAssistantMessage('first answer'),
+      () => fold('t9'),
+      (context) => {
+        assert.doesNotMatch(text(conversation(context).at(-1)!), /^\[fold /);
+        return fold('t1');
+      },
+      // That fold ended the run: this is the answer to the next prompt. The request and the
+      // try that was refused are still in view.
+      (context) => {
+        const shown = conversation(context).map(text);
+        assert.match(shown.at(-1)!, /^second/);
+        assert.match(shown.join('\n'), /The request above is answered/);
+        assert.doesNotMatch(shown.join('\n'), /xxxx/);
+        return fauxAssistantMessage('second answer');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+  );
+  try {
+    await harness.run('first', 'second');
+    const records = threadRecords(harness.session.sessionManager.getBranch()) as {
+      manual?: string;
+    }[];
+    assert.deepEqual(
+      records.map((record) => record.manual),
+      ['run-end']
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a message that arrives while the fold at the end of a run is asked for gets its answer', async () => {
+  // Sent from the same boundary, by an extension loaded before or after this one: pi has not
+  // queued it yet when the request for the fold is made.
+  for (const where of ['before', 'after'] as const) {
+    for (const kind of ['steer', 'followUp'] as const) {
+      const label = `${where} ${kind}`;
+      let sent = false;
+      const sends: ExtensionFactory = (pi) => {
+        pi.on('agent_before_settle', () => {
+          if (!sent) pi.sendUserMessage('steered', { deliverAs: kind });
+          sent = true;
+          return undefined;
+        });
+      };
+      const harness = await createSession(
+        'off',
+        [
+          () =>
+            fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(4000)}` }), {
+              stopReason: 'toolUse'
+            }),
+          () => fauxAssistantMessage('first answer'),
+          (context) => {
+            const shown = conversation(context).map(text);
+            // A steering message is delivered before this response, a follow-up after it.
+            assert.equal(shown.at(-1)!.startsWith('steered'), kind === 'steer', label);
+            // With the message behind it the request is not sent: it would stand in front of
+            // new work and ask for a fold first.
+            assert.equal(
+              shown.some((said) => said.startsWith('The request above is answered')),
+              kind === 'followUp',
+              label
+            );
+            return fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'Printed x.' }), {
+              stopReason: 'toolUse'
+            });
+          },
+          // The run goes on to the message, whether the fold came before it or after.
+          (context) => {
+            const shown = conversation(context).map(text).join('\n');
+            assert.match(shown, /steered/, label);
+            assert.match(shown, /Printed x\./, label);
+            return fauxAssistantMessage('steered answer');
+          }
+        ],
+        where === 'after' ? [sends] : [],
+        { foldNudgeTokens: 1600, foldAfterRun: 'always' },
+        {},
+        undefined,
+        where === 'before' ? [sends] : []
+      );
+      try {
+        await harness.run('first');
+        const records = threadRecords(harness.session.sessionManager.getBranch()) as {
+          manual?: string;
+        }[];
+        // With the message in front of it, the fold no longer answers the request alone.
+        assert.deepEqual(
+          records.map((record) => record.manual),
+          [kind === 'steer' ? undefined : 'run-end'],
+          label
+        );
+        // That fold removed the request with its span, once; the fold that answered the
+        // request left it in view.
+        assert.equal(
+          askRemovals(harness.session.sessionManager.getBranch()).length,
+          kind === 'steer' ? 1 : 0,
+          label
+        );
+      } finally {
+        await harness.cleanup();
+      }
+    }
+  }
+});
+
+test('a message another extension adds behind the request for the fold is what the run goes on for, and the fold is asked for after that', async () => {
+  let added = false;
+  const adds: ExtensionFactory = (pi) => {
+    pi.on('agent_before_settle', (event) => {
+      const asked = event.entries.some(
+        (entry) => entry.type === 'custom_message' && entry.customType === 'episodes-fold-run-end'
+      );
+      if (added || !asked) return undefined;
+      added = true;
+      const more = { type: 'custom_message' as const, customType: 'other', content: 'Check it.' };
+      return { entries: [...event.entries, { ...more, display: true }], continue: true };
+    });
+  };
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(4000)}` }), {
+          stopReason: 'toolUse'
+        }),
+      () => fauxAssistantMessage('first answer'),
+      (context) => {
+        const shown = conversation(context).map(text);
+        // The request is not sent with the other message behind it.
+        assert.equal(shown.at(-1), 'Check it.');
+        assert.equal(shown.at(-2), 'first answer');
+        return fauxAssistantMessage('checked');
+      },
+      // That request counts for nothing: with the other message answered, the fold is asked for.
+      (context) => {
+        const shown = conversation(context).map(text);
+        assert.match(shown.at(-1)!, /^The request above is answered/);
+        assert.equal(shown.at(-2), 'checked');
+        assert.equal(shown.filter((said) => said.startsWith('The request above')).length, 1);
+        return fauxAssistantMessage(fauxToolCall('fold', { since: 't1', note: 'Printed x.' }), {
+          stopReason: 'toolUse'
+        });
+      }
+    ],
+    [adds],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+  );
+  try {
+    await harness.run('first');
+    const branch = harness.session.sessionManager.getBranch();
+    const records = threadRecords(branch) as { manual?: string }[];
+    assert.deepEqual(
+      records.map((record) => record.manual),
+      ['run-end']
+    );
+    assert.equal(episodeStats(branch, harness.dir).runEndAsks, 2);
+    // The first request left the session when the response to the other message ended, so
+    // nothing built from the session later holds it; the second was answered and stays.
+    const asks = branch.filter(
+      (entry) => entry.type === 'custom_message' && entry.customType === 'episodes-fold-run-end'
+    );
+    assert.deepEqual(
+      askRemovals(branch).map((edit) => edit.targetId),
+      [asks[0]!.id]
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('work that an extension continues the run with after the fold at its end is not refused, nor what follows a fold made in it', async () => {
+  let ran = 0;
+  let continued = false;
+  const continues: ExtensionFactory = (pi) => {
+    pi.on('tool_execution_start', (event) => {
+      if (event.toolName === 'bash') ran++;
+    });
+    // Once the fold is made and answered, the same run goes on for a message of this extension.
+    pi.on('agent_before_settle', (event) => {
+      const folded = event.context.contextEntries.some(
+        ({ sourceEntry: source }) =>
+          source.type === 'custom' && source.customType === FOLD_APPLIED_TYPE
+      );
+      if (continued || !folded) return undefined;
+      continued = true;
+      const more = { type: 'custom_message' as const, customType: 'other', content: 'Check it.' };
+      return { entries: [...event.entries, { ...more, display: true }], continue: true };
+    });
+  };
+  const harness = await createSession(
+    'only',
+    [
+      () =>
+        script(`text(JSON.stringify(await tools.bash({ command: "echo ${'x'.repeat(4000)}" })));`),
+      () => fauxAssistantMessage('first answer'),
+      () => script('text(await tools.fold({ since: "t1", note: "Printed x." }));'),
+      () => fauxAssistantMessage('Folded.'),
+      () => script('text(JSON.stringify(await tools.bash({ command: "echo check" })));'),
+      // A fold the agent makes by itself in that work is not one asked for at the end of a run.
+      (context) => {
+        const stamp = /\[(t\d+)\]\s*$/.exec(text(conversation(context).at(-1)!))![1];
+        return script(`text(await tools.fold({ since: "${stamp}", note: "Checked." }));`);
+      },
+      () => script('text(JSON.stringify(await tools.bash({ command: "echo goes-on" })));'),
+      (context) => {
+        assert.match(conversation(context).map(text).join('\n'), /goes-on/);
+        return fauxAssistantMessage('checked');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always' },
+    {},
+    undefined,
+    [continues]
+  );
+  try {
+    await harness.run('first');
+    assert.equal(ran, 3);
+    const records = threadRecords(harness.session.sessionManager.getBranch()) as {
+      manual?: string;
+    }[];
+    assert.deepEqual(
+      records.map((record) => record.manual),
+      ['run-end', undefined]
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('turns a fold kept that the agent was asked about at the end of the run and left are not asked about again with the next prompt', async () => {
+  const bash = (print: string) =>
+    fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${print}` }), {
+      stopReason: 'toolUse'
+    });
+  const harness = await createSession(
+    'off',
+    [
+      () => bash('y'.repeat(200)),
+      () => bash('z'.repeat(3400)),
+      // The agent keeps the second command in view; it comes to more than the threshold.
+      () =>
+        fauxAssistantMessage(
+          fauxToolCall('fold', { since: 't1', until: 't2', note: 'Printed y.' }),
+          { stopReason: 'toolUse' }
+        ),
+      () => fauxAssistantMessage('first answer'),
+      (context) => {
+        const asked = text(conversation(context).at(-1)!);
+        assert.match(asked, /^The request above is answered\. About 2k tokens of finished work/);
+        assert.match(asked, /with since "t3", and a note covering everything from there that/);
+        return fauxAssistantMessage('Not now.');
+      },
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /^second/);
+        return fauxAssistantMessage('second answer');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+  );
+  try {
+    await harness.run('first', 'second');
+    const stats = episodeStats(harness.session.sessionManager.getBranch(), harness.dir);
+    assert.equal(stats.runEndAsks, 1);
+    assert.equal(stats.nudges, 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a fold at the end of a run starts at what the last one kept, and at an earlier note once what stands around the notes it would leave takes up room', async () => {
+  const bash = (print: string) =>
+    fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${print}` }), {
+      stopReason: 'toolUse'
+    });
+  const fold = (args: Record<string, string>) =>
+    fauxAssistantMessage(fauxToolCall('fold', args), { stopReason: 'toolUse' });
+  const done = () => fauxAssistantMessage('done');
+  // A fold the user asked for comes first, with a note whose call takes up room at once,
+  // none to speak of, or enough together with what the next fold keeps. The two requests at
+  // the end of a run that follow name an earlier note or do not. The requests themselves
+  // take up room behind the notes too, about 150 tokens each.
+  for (const [detail, named] of [
+    [600, [true, false]],
+    [0, [false, false]],
+    [400, [false, true]]
+  ] as const) {
+    const asked: string[] = [];
+    const answer = (context: TranscriptContext) => {
+      asked.push(text(conversation(context).at(-1)!));
+      const [, since, until] = /with since "(t\d+)"[^"]* and until "(t\d+)"/.exec(asked.at(-1)!)!;
+      return fold({ since: since!, until: until!, note: `Printed more, ${asked.length}.` });
+    };
+    const harness = await createSession(
+      'off',
+      [
+        () => bash('x'.repeat(7200)),
+        done,
+        () => fold({ since: 't1', note: `Printed x. ${'detail '.repeat(detail)}` }),
+        () => bash('y'.repeat(7400)),
+        done,
+        () => bash('z'.repeat(800)),
+        done,
+        answer,
+        () => bash('v'.repeat(7400)),
+        done,
+        () => bash('w'.repeat(800)),
+        done,
+        answer
+      ],
+      [],
+      { foldNudgeTokens: 4000, foldAfterRun: 'always' }
+    );
+    try {
+      await harness.run('one', '/fold t1', 'two', 'three', 'four', 'five');
+      const records = threadRecords(harness.session.sessionManager.getBranch()) as {
+        handle: string;
+        covers?: string[];
+      }[];
+      const [first, second, third] = records.map((record) => record.handle) as [
+        string,
+        string,
+        string
+      ];
+      const label = String(detail);
+      assert.equal(records.length, 3, label);
+      for (const [index, said] of asked.entries()) {
+        // No nudge would come to ask for the merge: each of these requests counts as one.
+        const note = new RegExp(
+          `with since "t\\d+", the stamp at the end of your note ${first} and until "t\\d+"`
+        );
+        if (named[index]) assert.match(said, note, label);
+        else assert.doesNotMatch(said, /the stamp at the end of your note/, label);
+      }
+      assert.deepEqual(
+        records.slice(1).map((record) => record.covers ?? []),
+        // The second such fold takes in the note of the first and what that kept, whether or
+        // not it reaches back to the note before them. A note kept under one it covers counts.
+        [named[0] ? [first] : [], named[0] || named[1] ? [first, second] : [second]],
+        label
+      );
+      assert.equal(/keeps each note of earlier folds there/.test(asked[0]!), named[0], label);
+      assert.match(asked[1]!, /keeps each note of earlier folds there/, label);
+      if (named[0]) {
+        // What the fold frees, without the note of 1k tokens that it keeps.
+        assert.match(asked[0]!, /^The request above is answered\. About 5k tokens of finished/);
+      }
+      void third;
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+test('a run that did not end in an answer is not asked to fold, and one that another extension continues is asked when that is done', async () => {
+  const bash = () =>
+    fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(800)}` }), {
+      stopReason: 'toolUse'
+    });
+  // Cut off by the length limit: nothing is answered yet.
+  const cut = await createSession(
+    'off',
+    [bash, () => fauxAssistantMessage('partial', { stopReason: 'length' })],
+    [],
+    { foldNudgeTokens: 300, foldAfterRun: 'always' }
+  );
+  try {
+    await cut.run('first');
+    assert.equal(episodeStats(cut.session.sessionManager.getBranch(), cut.dir).runEndAsks, 0);
+  } finally {
+    await cut.cleanup();
+  }
+
+  // Another extension continues the run with a message of its own.
+  {
+    let continued = false;
+    const continues: ExtensionFactory = (pi) => {
+      pi.on('agent_before_settle', (event) => {
+        if (continued) return undefined;
+        continued = true;
+        const more = { type: 'custom_message' as const, customType: 'other', content: 'queued' };
+        return { entries: [...event.entries, { ...more, display: true }], continue: true };
+      });
+    };
+    const harness = await createSession(
+      'off',
+      [
+        bash,
+        () => fauxAssistantMessage('done'),
+        (context) => {
+          const shown = conversation(context).map(text);
+          assert.doesNotMatch(shown.join('\n'), /The request above is answered/);
+          assert.match(shown.at(-1)!, /^queued/);
+          return fauxAssistantMessage('more');
+        },
+        (context) => {
+          assert.match(text(conversation(context).at(-1)!), /^The request above is answered/);
+          return fauxAssistantMessage('Not now.');
+        }
+      ],
+      [],
+      { foldNudgeTokens: 300, foldAfterRun: 'always' },
+      {},
+      undefined,
+      [continues]
+    );
+    try {
+      await harness.run('first');
+      const stats = episodeStats(harness.session.sessionManager.getBranch(), harness.dir);
+      assert.equal(stats.runEndAsks, 1);
+    } finally {
+      await harness.cleanup();
+    }
+  }
+
+  // Another extension writes an entry the agent does not see: the answer is still the last
+  // thing shown, and the entry is written with the request.
+  {
+    const marks: ExtensionFactory = (pi) => {
+      pi.on('agent_before_settle', (event) => ({
+        entries: [...event.entries, { type: 'custom' as const, customType: 'mark', data: {} }]
+      }));
+    };
+    const harness = await createSession(
+      'off',
+      [bash, () => fauxAssistantMessage('done'), () => fauxAssistantMessage('Not now.')],
+      [],
+      { foldNudgeTokens: 300, foldAfterRun: 'always' },
+      {},
+      undefined,
+      [marks]
+    );
+    try {
+      await harness.run('first');
+      const branch = harness.session.sessionManager.getBranch();
+      assert.equal(episodeStats(branch, harness.dir).runEndAsks, 1);
+      const types = branch.map((entry) =>
+        entry.type === 'custom' || entry.type === 'custom_message' ? entry.customType : entry.type
+      );
+      assert.deepEqual(types.slice(-4), ['mark', 'episodes-fold-run-end', 'message', 'mark']);
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+test('a request for the fold that the provider failed on leaves the session when its run ends, so a fork does not start from it', async () => {
+  let child = '';
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(4000)}` }), {
+          stopReason: 'toolUse'
+        }),
+      () => fauxAssistantMessage('first answer'),
+      () => fauxAssistantMessage('', { stopReason: 'error', errorMessage: 'boom' }),
+      () =>
+        fauxAssistantMessage(fauxToolCall('fork', { task: 'Report what was printed.' }), {
+          stopReason: 'toolUse'
+        }),
+      (context) => {
+        child = conversation(context).map(text).join('\n');
+        return fauxAssistantMessage('child report');
+      },
+      () => fauxAssistantMessage('second answer')
+    ],
+    [],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+  );
+  try {
+    await harness.session.prompt('first');
+    await harness.session.waitForIdle();
+    // Removed once, when the run that failed on it ended, and not again later.
+    assert.equal(askRemovals(harness.session.sessionManager.getBranch()).length, 1);
+    await harness.run('second');
+    assert.match(child, /xxxx/);
+    assert.doesNotMatch(child, /The request above is answered/);
+    assert.equal(askRemovals(harness.session.sessionManager.getBranch()).length, 1);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a session that ended on the request for the fold sends it to no one when it goes on: not to the agent, a fork or ask', async () => {
+  const settings = { foldNudgeTokens: 1600, foldAfterRun: 'always' };
+  const source = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(4000)}` }), {
+          stopReason: 'toolUse'
+        }),
+      () => fauxAssistantMessage('first answer'),
+      () => fauxAssistantMessage('', { stopReason: 'error', errorMessage: 'boom' })
+    ],
+    [],
+    settings
+  );
+  try {
+    await source.run('first');
+    // As the file stood when the process ended: the request is its last entry.
+    const all = source.session.sessionManager.getEntries();
+    const cut = all.slice(
+      0,
+      all.findLastIndex(
+        (entry) => entry.type === 'custom_message' && entry.customType === 'episodes-fold-run-end'
+      ) + 1
+    );
+    const sent: string[] = [];
+    const see = (context: TranscriptContext) => {
+      sent.push(conversation(context).map(text).join('\n'));
+    };
+    const call = (tool: string, args: Record<string, string>) =>
+      fauxAssistantMessage(fauxToolCall(tool, args), { stopReason: 'toolUse' });
+
+    // The first response starts a fork: the removal is not written yet.
+    const forks = await createSession(
+      'off',
+      [
+        (context) => {
+          see(context);
+          return call('fork', { task: 'Report what was printed.' });
+        },
+        (context) => {
+          see(context);
+          return fauxAssistantMessage('child report');
+        },
+        (context) => {
+          see(context);
+          // Written when the first response ended, not only when the run does.
+          assert.equal(askRemovals(forks.session.sessionManager.getBranch()).length, 1);
+          return fauxAssistantMessage('second answer');
+        }
+      ],
+      [],
+      settings,
+      {},
+      cut
+    );
+    try {
+      await forks.run('second');
+      // The nudge is the question about that work now.
+      assert.match(sent[0]!, /tokens of work built up since the last fold/);
+      assert.match(sent[1]!, /xxxx/);
+      assert.equal(askRemovals(forks.session.sessionManager.getBranch()).length, 1);
+    } finally {
+      await forks.cleanup();
+    }
+
+    // The first response folds up to the last stamp before the request, so the thread of that
+    // fold ends on the request, and the second asks the thread. No nudge here: what the nudge
+    // adds would stand behind the request in the thread.
+    const asks = await createSession(
+      'off',
+      [
+        (context) => {
+          see(context);
+          return call('fold', { since: 't1', until: 't2', note: 'Printed x.' });
+        },
+        (context) => {
+          see(context);
+          const handle = /ep-[0-9a-f]{8}/.exec(text(conversation(context).at(-1)!))![0];
+          return call('ask', { handle, question: 'What was printed?' });
+        },
+        (context) => {
+          see(context);
+          assert.match(sent.at(-1)!, /What was printed\?/);
+          assert.match(sent.at(-1)!, /xxxx/);
+          return fauxAssistantMessage('A line of x.');
+        },
+        (context) => {
+          see(context);
+          return fauxAssistantMessage('second answer');
+        }
+      ],
+      [],
+      { ...settings, foldNudge: false },
+      {},
+      cut
+    );
+    try {
+      await asks.run('second');
+      // The fold removed the request with its span, and nothing removed it a second time.
+      assert.equal(askRemovals(asks.session.sessionManager.getBranch()).length, 1);
+    } finally {
+      await asks.cleanup();
+    }
+    assert.equal(sent.length, 7);
+    for (const shown of sent) assert.doesNotMatch(shown, /The request above is answered/);
+  } finally {
+    await source.cleanup();
+  }
+});
+
+test('a call after the fold at the end of a run is not run, also next to calls that pi refused, and a message that came in gets its answer', async () => {
+  const more = { code: 'text(await tools.bash({ command: "echo more" }));' };
+  const calls = (...args: Record<string, string>[]) =>
+    fauxAssistantMessage(
+      args.map((arg) => fauxToolCall('codemode', arg)),
+      { stopReason: 'toolUse' }
+    );
+  // A call whose arguments do not validate never comes by the extension: pi answers it and
+  // sends the next request. Nothing is run in between, and the run ends with the first
+  // response that makes no such call.
+  const cases = [
+    { name: 'next to one', after: [() => calls(more, {}), () => fauxAssistantMessage('Folded.')] },
+    { name: 'after one', after: [() => calls({}), () => calls(more)] },
+    { name: 'alone', after: [() => calls(more)] }
+  ];
+  for (const { name, after } of cases) {
+    const harness = await createSession(
+      'only',
+      [
+        () => script(`text(await tools.bash({ command: "echo ${'x'.repeat(4000)}" }));`),
+        () => fauxAssistantMessage('first answer'),
+        () => script('text(await tools.fold({ since: "t1", note: "Printed x." }));'),
+        ...after
+      ],
+      [],
+      { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+    );
+    try {
+      await harness.run('first');
+      assert.equal(harness.requests.length, 3 + after.length, name);
+      const results = harness.session.messages.filter((message) => message.role === 'toolResult');
+      assert.equal(
+        results.filter((result) => text(result).startsWith(AFTER_RUN_END_FOLD)).length,
+        1,
+        name
+      );
+      assert.doesNotMatch(JSON.stringify(harness.session.messages), /"more\\n/, name);
+      // No response was cut off.
+      for (const entry of harness.session.sessionManager.getBranch()) {
+        if (entry.type !== 'message' || entry.message.role !== 'assistant') continue;
+        assert.match(entry.message.stopReason, /^(stop|toolUse)$/, name);
+      }
+    } finally {
+      await harness.cleanup();
+    }
+  }
+
+  // A message that arrives during that response is answered, sent either way.
+  for (const deliverAs of ['steer', 'followUp'] as const) {
+    let api: Parameters<ExtensionFactory>[0] | undefined;
+    const answers = (context: TranscriptContext) =>
+      fauxAssistantMessage(
+        conversation(context).some((message) => text(message).includes('one more thing'))
+          ? 'answered that'
+          : 'Folded.'
+      );
+    const harness = await createSession(
+      'only',
+      [
+        () => script(`text(await tools.bash({ command: "echo ${'x'.repeat(4000)}" }));`),
+        () => fauxAssistantMessage('first answer'),
+        () => script('text(await tools.fold({ since: "t1", note: "Printed x." }));'),
+        () => {
+          api!.sendUserMessage('one more thing', { deliverAs });
+          return calls(more, {});
+        },
+        answers,
+        ...(deliverAs === 'followUp' ? [answers] : [])
+      ],
+      [
+        (pi) => {
+          api = pi;
+        }
+      ],
+      { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+    );
+    try {
+      await harness.run('first');
+      assert.equal(text(harness.session.messages.at(-1) as Message), 'answered that', deliverAs);
+      assert.equal(harness.session.pendingMessageCount, 0, deliverAs);
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+test('a fold at the end of a run that did not take effect is not taken for made: the agent can try again', async () => {
+  // A later handler takes the note out of the result of the first try, so that fold is not
+  // applied, though its record says what it was asked for. Another fold was applied before.
+  let redacted = false;
+  const redact: ExtensionFactory = (pi) => {
+    pi.on('tool_result', (event) => {
+      const holds = event.content.some(
+        (block) => block.type === 'text' && block.text.includes('Secret note.')
+      );
+      if (redacted || event.toolName !== 'codemode' || event.parentToolCallId || !holds) {
+        return undefined;
+      }
+      redacted = true;
+      return {
+        content: event.content.map((block) =>
+          block.type === 'text'
+            ? { ...block, text: block.text.replace('Secret note.', 'redacted') }
+            : block
+        )
+      };
+    });
+  };
+  const harness = await createSession(
+    'only',
+    [
+      () => script('text(await tools.bash({ command: "echo old" }));'),
+      () => script('text(await tools.fold({ since: "t1", note: "An earlier fold." }));'),
+      () => fauxAssistantMessage('old answer'),
+      () => script(`text(await tools.bash({ command: "echo ${'x'.repeat(4000)}" }));`),
+      () => fauxAssistantMessage('first answer'),
+      () => script('text(await tools.fold({ since: "t4", note: "Secret note." }));'),
+      (context) => {
+        assert.equal(appliedFolds(harness.session.sessionManager.getBranch()).size, 1);
+        assert.match(conversation(context).map(text).join('\n'), /xxxx/);
+        return script('text(await tools.fold({ since: "t4", note: "Printed x." }));');
+      },
+      () => fauxAssistantMessage('Folded.')
+    ],
+    [redact],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+  );
+  try {
+    await harness.run('old', 'first');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(appliedFolds(branch).size, 2);
+    assert.doesNotMatch(JSON.stringify(harness.session.messages), /Not run: the fold/);
+    assert.equal(
+      (threadRecords(branch).at(-1) as { manual?: string } | undefined)?.manual,
+      'run-end'
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('work that an extension continues the run with behind the fold at its end gets the nudge of a long run', async () => {
+  const direct = (name: string, args: Record<string, string>) =>
+    fauxAssistantMessage(fauxToolCall(name, args), { stopReason: 'toolUse' });
+  let continued = false;
+  const more: ExtensionFactory = (pi) => {
+    pi.on('agent_before_settle', (event, ctx) => {
+      if (continued || appliedFolds(ctx.sessionManager.getBranch()).size === 0) return undefined;
+      continued = true;
+      return {
+        entries: [
+          ...event.entries,
+          {
+            type: 'custom_message' as const,
+            customType: 'more-work',
+            content: 'Do the next check.',
+            display: true
+          }
+        ],
+        continue: true
+      };
+    });
+  };
+  const harness = await createSession(
+    'off',
+    [
+      () => direct('bash', { command: `echo ${'x'.repeat(4000)}` }),
+      () => fauxAssistantMessage('first answer'),
+      // The request for the fold stays in view behind the fold that answers it.
+      () => direct('fold', { since: 't1', note: 'Printed x.' }),
+      () => direct('bash', { command: `echo ${'z'.repeat(8000)}` }),
+      (context) => {
+        const shown = conversation(context).map(text);
+        assert.match(shown.join('\n'), /The request above is answered/);
+        assert.match(shown.at(-1)!, /tokens of work built up/);
+        return fauxAssistantMessage('checked');
+      }
+    ],
+    [more],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+  );
+  try {
+    await harness.run('first');
+    assert.equal(episodeStats(harness.session.sessionManager.getBranch(), harness.dir).nudges, 1);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a request for the fold whose answer another handler removes when the run ends leaves the session there, with nothing to ask', async () => {
+  const seed = SessionManager.inMemory();
+  seed.appendMessage({ role: 'user', content: [{ type: 'text', text: 'old' }], timestamp: 0 });
+  seed.appendMessage(fauxAssistantMessage('old answer'));
+  const ask = seed.appendCustomMessageEntry('episodes-fold-run-end', 'Fold that work now.', true);
+  const denial = seed.appendMessage(fauxAssistantMessage('Not now.'));
+  // Registered before this extension: its edit is in the preview this one sees.
+  const trims: ExtensionFactory = (pi) => {
+    pi.on('agent_before_settle', (event) => ({
+      entries: [
+        ...event.entries,
+        { type: 'context_edit' as const, targetId: denial, replacement: null }
+      ]
+    }));
+  };
+  const harness = await createSession(
+    'off',
+    [() => fauxAssistantMessage('new answer')],
+    [],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always', foldNudge: false },
+    {},
+    seed.getEntries(),
+    [trims]
+  );
+  try {
+    await harness.run('new');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.deepEqual(
+      askRemovals(branch).map((edit) => edit.type === 'context_edit' && edit.targetId),
+      [ask]
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a call next to the direct fold at the end of a run runs, and what comes after the fold is applied does not', async () => {
+  const bash = (print: string) => fauxToolCall('bash', { command: `echo ${print}` });
+  const fold = fauxToolCall('fold', { since: 't1', note: 'Printed x.' });
+  // Asked to call only fold, the agent adds a call, behind the fold or in front of it. The
+  // fold is not applied before the response ends, so that call runs and the run goes on; the
+  // call of the next response is not run, and the run ends.
+  for (const first of ['fold', 'bash'] as const) {
+    const harness = await createSession(
+      'off',
+      [
+        () => fauxAssistantMessage(bash('x'.repeat(4000)), { stopReason: 'toolUse' }),
+        () => fauxAssistantMessage('first answer'),
+        () =>
+          fauxAssistantMessage(first === 'fold' ? [fold, bash('beside')] : [bash('beside'), fold], {
+            stopReason: 'toolUse'
+          }),
+        () => fauxAssistantMessage(bash('after'), { stopReason: 'toolUse' })
+      ],
+      [],
+      { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+    );
+    try {
+      await harness.run('first');
+      // The command of the first request went with the fold.
+      const results = (harness.session.messages as Message[])
+        .filter((message) => message.role === 'toolResult' && message.toolName === 'bash')
+        .map(text);
+      assert.equal(results.length, 2, first);
+      assert.match(results[0]!, /^beside\n/, first);
+      assert.ok(results[1]!.startsWith(AFTER_RUN_END_FOLD), first);
+      assert.equal(harness.requests.length, 4, first);
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+test('no nudge comes between the request for the fold at the end of a run and the fold, however large a try that was refused', async () => {
+  const fold = (since: string, note: string) =>
+    fauxAssistantMessage(fauxToolCall('fold', { since, note }), { stopReason: 'toolUse' });
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(4000)}` }), {
+          stopReason: 'toolUse'
+        }),
+      () => fauxAssistantMessage('first answer'),
+      // Refused, and by itself twice the threshold: what a nudge inside a run waits for.
+      () => fold('t99', 'word '.repeat(4000)),
+      (context) => {
+        assert.doesNotMatch(conversation(context).map(text).join('\n'), /tokens of work built up/);
+        return fold('t1', 'Printed x.');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+  );
+  try {
+    await harness.run('first');
+    const branch = harness.session.sessionManager.getBranch();
+    // The fold that was made answers the request, so it ended the run.
+    assert.equal((threadRecords(branch).at(-1) as { manual?: string }).manual, 'run-end');
+    assert.equal(harness.requests.length, 4);
+    const stats = episodeStats(branch, harness.dir);
+    assert.equal(stats.nudges, 0);
+    assert.equal(stats.runEndAsks, 1);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a request for the fold stays for the try that pi makes again after a failure of the provider', async () => {
+  const harness = await createSession(
+    'only',
+    [
+      () => script(`text(await tools.bash({ command: "echo ${'x'.repeat(4000)}" }));`),
+      () => fauxAssistantMessage('first answer'),
+      () =>
+        fauxAssistantMessage('', { stopReason: 'error', errorMessage: '429 rate limit exceeded' }),
+      (context) => {
+        assert.match(conversation(context).map(text).join('\n'), /The request above is answered/);
+        return script('text(await tools.fold({ since: "t1", note: "Printed x." }));');
+      },
+      () => fauxAssistantMessage('Folded.')
+    ],
+    [],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+  );
+  harness.session.settingsManager.applyOverrides({
+    retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 }
+  });
+  try {
+    await harness.run('first');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(askRemovals(branch).length, 0);
+    assert.equal((threadRecords(branch)[0] as { manual?: string }).manual, 'run-end');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a request for the fold that got no answer leaves the session also when the setting was turned off since, with what an earlier handler queued', async () => {
+  const settings = { foldNudgeTokens: 1600, foldAfterRun: 'always' };
+  const mark: ExtensionFactory = (pi) => {
+    pi.on('agent_before_settle', (event) => ({
+      entries: [...event.entries, { type: 'custom' as const, customType: 'mark', data: {} }]
+    }));
+  };
+  const harness = await createSession(
+    'only',
+    [
+      () => script(`text(await tools.bash({ command: "echo ${'x'.repeat(4000)}" }));`),
+      () => fauxAssistantMessage('first answer'),
+      () => {
+        harness.session.settingsManager.applyOverrides({
+          episodes: { ...settings, foldAfterRun: false }
+        } as object);
+        return fauxAssistantMessage('', { stopReason: 'error', errorMessage: 'boom' });
+      }
+    ],
+    [],
+    settings,
+    {},
+    undefined,
+    [mark]
+  );
+  try {
+    await harness.run('first');
+    const branch = harness.session.sessionManager.getBranch();
+    assert.equal(askRemovals(branch).length, 1);
+    // One mark for the end of the answer, one for the end of the response that failed.
+    const marks = branch.filter((entry) => entry.type === 'custom' && entry.customType === 'mark');
+    assert.equal(marks.length, 2);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('the summary of a branch behind the fold at the end of a run is something new: calls run again', async () => {
+  const harness = await createSession(
+    'only',
+    [
+      () => script(`text(await tools.bash({ command: "echo ${'x'.repeat(4000)}" }));`),
+      () => fauxAssistantMessage('first answer'),
+      () => script('text(await tools.fold({ since: "t1", note: "Printed x." }));'),
+      () => fauxAssistantMessage('Folded.'),
+      () => script('text(await tools.bash({ command: "echo went-on" }));'),
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /went-on/);
+        return fauxAssistantMessage('done');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+  );
+  try {
+    await harness.session.prompt('first');
+    await harness.session.waitForIdle();
+    const manager = harness.session.sessionManager;
+    manager.branchWithSummary(manager.getLeafId(), 'The other branch asked for one more check.');
+    harness.session.agent.state.messages = manager.buildSessionProjection().messages;
+    await harness.session.agent.continue();
+    await harness.run();
+    assert.equal(harness.requests.length, 6);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a fold that covered the request of one made at the end of a run gives it back when it is unfolded', async () => {
+  let covering = '';
+  const shown = (context: TranscriptContext) => conversation(context).map(text).join('\n');
+  const harness = await createSession(
+    'only',
+    [
+      () => script(`text(await tools.bash({ command: "echo ${'x'.repeat(4000)}" }));`),
+      () => fauxAssistantMessage('first answer'),
+      () => script('text(await tools.fold({ since: "t1", note: "Printed x." }));'),
+      () => fauxAssistantMessage('Folded.'),
+      (context) => {
+        const note = conversation(context).find(
+          (message) => message.role === 'toolResult' && /\[fold ep-/.test(text(message))
+        )!;
+        const stamp = /\[(t\d+)\]\s*$/.exec(text(note))![1];
+        return script(`text(await tools.fold({ since: "${stamp}", note: "Covering note." }));`);
+      },
+      (context) => {
+        covering = /ep-[0-9a-f]{8}/.exec(text(conversation(context).at(-1)!))![0];
+        assert.doesNotMatch(shown(context), /The request above is answered/);
+        return fauxAssistantMessage('covered');
+      },
+      () => script(`text(await tools.unfold({ handle: "${covering}" }));`),
+      (context) => {
+        assert.match(shown(context), /The request above is answered/);
+        return fauxAssistantMessage('restored');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+  );
+  try {
+    await harness.run('first', 'cover the old note', 'unfold the covering note');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('after a new request the block is over for good: a fold the agent makes in it does not bring it back', async () => {
+  const harness = await createSession(
+    'only',
+    [
+      () => script(`text(await tools.bash({ command: "echo ${'x'.repeat(4000)}" }));`),
+      () => fauxAssistantMessage('first answer'),
+      () => script('text(await tools.fold({ since: "t1", note: "Printed x." }));'),
+      () => fauxAssistantMessage('Folded.'),
+      () => script('text(await tools.bash({ command: "echo second" }));'),
+      () => script('text(await tools.fold({ since: "t4", note: "Second task, first step." }));'),
+      () => script('text(await tools.bash({ command: "echo goes-on" }));'),
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /goes-on/);
+        return fauxAssistantMessage('second answer');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+  );
+  try {
+    await harness.run('first', 'second');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a request for the fold that got no answer is not sent again, and the nudge comes with the next prompt', async () => {
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('bash', { command: `echo ${'x'.repeat(4000)}` }), {
+          stopReason: 'toolUse'
+        }),
+      () => fauxAssistantMessage('first answer'),
+      // The provider fails on the request for the fold.
+      (context) => {
+        assert.match(text(conversation(context).at(-1)!), /^The request above is answered/);
+        return fauxAssistantMessage('', { stopReason: 'error', errorMessage: 'boom' });
+      },
+      (context) => {
+        const shown = conversation(context).map(text);
+        assert.doesNotMatch(shown.join('\n'), /The request above is answered/);
+        // No decision was made about that work: the nudge that is the fallback is due.
+        assert.match(shown.join('\n'), /tokens of work built up since the last fold/);
+        assert.match(shown.join('\n'), /second/);
+        return fauxAssistantMessage('second answer');
+      },
+      // The nudge was the question about that work: nothing is asked when its run ends, nor
+      // with the next prompt.
+      (context) => {
+        const shown = conversation(context).map(text);
+        assert.match(shown.at(-1)!, /^third/);
+        assert.doesNotMatch(shown.join('\n'), /The request above is answered/);
+        assert.equal(shown.filter((said) => /tokens of work built up/.test(said)).length, 1);
+        return fauxAssistantMessage('third answer');
+      }
+    ],
+    [],
+    { foldNudgeTokens: 1600, foldAfterRun: 'always' }
+  );
+  try {
+    await harness.run('first', 'second', 'third');
+    const stats = episodeStats(harness.session.sessionManager.getBranch(), harness.dir);
+    assert.equal(stats.runEndAsks, 1);
+    assert.equal(stats.nudges, 1);
+  } finally {
+    await harness.cleanup();
+  }
+});

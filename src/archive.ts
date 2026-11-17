@@ -21,6 +21,8 @@ export const UNFOLD_TOOL = 'unfold';
 export const FORK_TOOL = 'fork';
 /** The message /fold sends to ask for a fold. */
 export const FOLD_REQUEST_TYPE = 'episodes-fold-request';
+/** The extension's own request for a fold once a run has ended; see registerNudge. */
+export const RUN_END_FOLD_TYPE = 'episodes-fold-run-end';
 /**
  * Appended after a fold's context edits, in the same boundary batch. Pi checks the batch as a
  * whole but writes it one entry at a time, so a fold result without the marker either never took
@@ -134,7 +136,7 @@ export interface FoldDetails {
    * Set when the user asked for the fold with /fold: `since` when they picked where the span
    * starts, `request` when the agent picked. Absent for folds the agent chose on its own.
    */
-  manual?: 'since' | 'request';
+  manual?: 'since' | 'request' | 'run-end';
   /**
    * The cache anchor on the request that called fold: whether it was placed (absent for
    * providers without breakpoints), and the tokens between it and the span start, which the

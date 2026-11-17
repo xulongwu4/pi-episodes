@@ -5,7 +5,11 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { Message } from '@earendil-works/pi-ai';
-import { convertToLlm, type SessionManager } from '@earendil-works/pi-coding-agent';
+import {
+  convertToLlm,
+  type SessionEntry,
+  type SessionManager
+} from '@earendil-works/pi-coding-agent';
 import {
   callingFork,
   FOLD_APPLIED_TYPE,
@@ -15,6 +19,7 @@ import {
   type ForkArchive,
   type ForkCall,
   foldRecords,
+  RUN_END_FOLD_TYPE,
   runningFork,
   ThreadIndex
 } from '../src/archive.js';
@@ -32,6 +37,8 @@ import {
   planUnfold,
   renderCovered,
   renderNote,
+  runEndRequest,
+  turnOf,
   USER_TEXT_CAP,
   unfoldedBehindNote,
   workSince,
@@ -39,7 +46,8 @@ import {
 } from '../src/fold.js';
 import { carriedMediaBlocks, holdsCarriedMedia } from '../src/images.js';
 import { messageText, skillPaths, touchedPaths } from '../src/messages.js';
-import { nudgeGrowth, tokensBehindNote } from '../src/nudge.js';
+import { afterRunEndFold, keptTail, nudgeGrowth, tokensBehindNote } from '../src/nudge.js';
+import { askState } from '../src/requests.js';
 import { episodesSettings } from '../src/settings.js';
 import { readStamp } from '../src/stamps.js';
 import { assistant, call, result, session, user } from './helpers.js';
@@ -548,6 +556,314 @@ test('a fold from the message being answered names the stamp that folds the work
   );
 });
 
+test('the last request is kept in view only when the fold removes more than it, the notes it keeps aside', () => {
+  const build = (last: number) => {
+    const { manager } = session([
+      user('one', 1),
+      assistant(call('a', 'bash')),
+      result('a', 'bash', 'a'.repeat(400), 2),
+      assistant('answer one'),
+      user('two', 3),
+      assistant(call('b', 'bash')),
+      result('b', 'bash', 'b'.repeat(2000), 4),
+      assistant('answer two'),
+      assistant(call('f', 'fold'))
+    ]);
+    const entries = () => manager.buildSessionProjection().entries;
+    // A fold that kept the second request, with a long note.
+    const plan = planFold(entries(), 'f', 1, { until: 2 });
+    manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+      handle: plan.handle,
+      edits: plan.edits,
+      lines: plan.lines
+    });
+    apply(manager, plan.edits);
+    manager.appendMessage({
+      ...result('f', 'fold', 'n'.repeat(8000), 5),
+      details: { kind: 'fold', handle: plan.handle, headline: 'note' }
+    } as Message);
+    manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
+    manager.appendMessage(user('three', 6));
+    manager.appendMessage(assistant(call('c', 'bash')));
+    manager.appendMessage(result('c', 'bash', 'c'.repeat(last), 7));
+    const three = manager
+      .getBranch()
+      .findLast((entry) => entry.type === 'message' && entry.message.role === 'user')!.id;
+    return { manager, entries, three };
+  };
+  const tail = (made: ReturnType<typeof build>, threshold: number) =>
+    keptTail(made.entries(), unfoldedBehindNote(made.entries())!, threshold);
+
+  // The fold removes the second request's 500 tokens and keeps the note of 2,000: a last
+  // request of 100 tokens is kept, one of 800 is not, though the span holds 2,500.
+  const small = build(400);
+  assert.equal(tail(small, 4000)?.until, 5);
+  assert.equal(tail(build(3200), 4000), undefined);
+  // Nor one over a quarter of the threshold.
+  assert.equal(tail(small, 300), undefined);
+  // A last request of exactly a quarter of the threshold is kept: the smallest threshold
+  // that keeps this one is four times its tokens.
+  let least = 1;
+  while (!tail(small, least)) least++;
+  assert.equal(least % 4, 0);
+  assert.equal(tail(small, least - 1), undefined);
+  // A message of the user that is no longer shown is not the last request.
+  apply(small.manager, [{ type: 'context_edit', targetId: small.three, replacement: null }]);
+  assert.equal(tail(small, 4000), undefined);
+});
+
+test('no last request is kept when no message of the user is shown, or no response stands before it', () => {
+  const start = { stamp: 1, index: 0 };
+  {
+    const { manager } = session([
+      user('one', 1),
+      assistant(call('a', 'bash')),
+      result('a', 'bash', 'a'.repeat(4000), 2),
+      assistant('answer')
+    ]);
+    const one = manager.getBranch()[0]!.id;
+    assert.equal(keptTail(manager.buildSessionProjection().entries, start, 4000), undefined);
+    apply(manager, [{ type: 'context_edit', targetId: one, replacement: null }]);
+    assert.equal(keptTail(manager.buildSessionProjection().entries, start, 4000), undefined);
+  }
+  {
+    // Before the last request stand a message of the user and one of an extension, which a
+    // fold would remove: there is still no response, and a fold of that span is refused.
+    const { manager } = session([user('one', 1)]);
+    manager.appendCustomMessageEntry('other', 'o'.repeat(4000), true);
+    manager.appendMessage(user('two', 2));
+    manager.appendMessage(assistant('answer'));
+    assert.equal(keptTail(manager.buildSessionProjection().entries, start, 4000), undefined);
+  }
+  {
+    // Nor is the line of an earlier fold a response.
+    const { manager } = session([
+      user('one', 1),
+      assistant(call('a', 'bash')),
+      result('a', 'bash', 'a'.repeat(4000), 2),
+      assistant('answer one'),
+      user('two', 3),
+      assistant(call('f', 'fold'))
+    ]);
+    const entries = () => manager.buildSessionProjection().entries;
+    const plan = planFold(entries(), 'f', 1, { until: 2 });
+    manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+      handle: plan.handle,
+      edits: plan.edits,
+      lines: plan.lines
+    });
+    apply(manager, plan.edits);
+    manager.appendMessage({
+      ...result('f', 'fold', 'note', 4),
+      details: { kind: 'fold', handle: plan.handle, headline: 'note' }
+    } as Message);
+    manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
+    assert.equal(plan.lines.length, 1);
+    assert.equal(keptTail(entries(), start, 4000), undefined);
+  }
+});
+
+test('a request for a fold is answered by a response that was sent, open with none, and stale with anything else behind it', () => {
+  const failed = { ...assistant('partial'), stopReason: 'error' } as Message;
+  const aborted = { ...assistant(''), stopReason: 'aborted' } as Message;
+  const other = { role: 'custom', customType: 'other', content: 'x', display: true, timestamp: 0 };
+  assert.equal(askState([]), 'open');
+  assert.equal(askState([assistant('Folded.')]), 'answered');
+  assert.equal(askState([assistant(call('f', 'fold')), user('next', 1)]), 'answered');
+  // A response the provider failed on or the user stopped is not sent again.
+  assert.equal(askState([failed, aborted]), 'open');
+  assert.equal(askState([failed, assistant('Folded.')]), 'answered');
+  assert.equal(askState([aborted, user('next', 1)]), 'stale');
+  assert.equal(askState([user('next', 1), assistant('answer')]), 'stale');
+  assert.equal(askState([other as AgentMessage, assistant('answer')]), 'stale');
+});
+
+test('the request at the end of a run is found from the fold that answers it, and a fold from before it stops there', () => {
+  const { manager } = session([
+    user('one', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'out', 2),
+    assistant('answer')
+  ]);
+  const entries = () => manager.buildSessionProjection().entries;
+  const calling = (id: string) =>
+    entries().findIndex((entry) =>
+      entry.messages.some(
+        (message) =>
+          message.role === 'assistant' &&
+          message.content.some((block) => block.type === 'toolCall' && block.id === id)
+      )
+    );
+  const answer = manager.getBranch().at(-1)!.id;
+  const request = manager.appendCustomMessageEntry(RUN_END_FOLD_TYPE, 'Fold that work now.', true);
+  // A shell command the user ran since is something new as well.
+  const shell = session([user('one', 1), assistant('answer')]).manager;
+  shell.appendCustomMessageEntry(RUN_END_FOLD_TYPE, 'Fold that work now.', true);
+  shell.appendMessage({
+    role: 'bashExecution',
+    command: 'ls',
+    output: '',
+    exitCode: 0,
+    cancelled: false,
+    truncated: false,
+    timestamp: 0
+  } as unknown as Message);
+  shell.appendMessage(assistant(call('f', 'fold')));
+  const ran = shell.buildSessionProjection().entries;
+  assert.equal(runEndRequest(ran, ran.length - 1), -1);
+  const asking = entries().findIndex((entry) => entry.sourceEntry.id === request);
+  // An entry of another extension that is no message stands between; then a try that the
+  // tool refused, and the fold.
+  manager.appendCustomEntry('other', {});
+  manager.appendMessage(assistant(call('f1', 'fold')));
+  manager.appendMessage({ ...result('f1', 'fold', 'refused', 3), isError: true } as Message);
+  manager.appendMessage(assistant(call('f2', 'fold')));
+  assert.equal(runEndRequest(entries(), calling('f1')), asking);
+  assert.equal(runEndRequest(entries(), calling('f2')), asking);
+  // The span ends before the request, which stays in view.
+  const plan = planFold(entries(), 'f2', 1);
+  assert.equal(plan.lastEntryId, answer);
+  assert.ok(!plan.edits.some((edit) => edit.targetId === request));
+  // A fold that starts behind the request, at the try that failed, is not cut at it, and
+  // leaves the request it answers.
+  const later = planFold(entries(), 'f2', 3);
+  assert.equal(later.edits.length, 2);
+  // With until at the last stamp before the request no turn is left over: the try that was
+  // refused is none.
+  const bounded = planFold(entries(), 'f2', 1, { until: 2 });
+  assert.equal(bounded.keptFrom, undefined);
+  assert.equal(bounded.lastEntryId, answer);
+  // With until at the stamp of a try that was refused, behind the request, the span ends at
+  // the request all the same: the request stays, and so do the tries.
+  const tries = session([
+    user('one', 1),
+    assistant(call('a', 'bash')),
+    result('a', 'bash', 'out', 2),
+    assistant('answer')
+  ]).manager;
+  const answered = tries.getLeafId();
+  const wanted = tries.appendCustomMessageEntry(RUN_END_FOLD_TYPE, 'Fold that work now.', true);
+  for (const [id, stamp] of [
+    ['r1', 3],
+    ['r2', 4]
+  ] as const) {
+    tries.appendMessage(assistant(call(id, 'fold')));
+    tries.appendMessage({ ...result(id, 'fold', 'refused', stamp), isError: true } as Message);
+  }
+  tries.appendMessage(assistant(call('r3', 'fold')));
+  const behind = planFold(tries.buildSessionProjection().entries, 'r3', 1, { until: 3 });
+  assert.equal(behind.keptFrom, undefined);
+  assert.equal(behind.lastEntryId, answered);
+  assert.ok(!behind.edits.some((edit) => edit.targetId === wanted));
+
+  // With a message of the user in between, the fold answers that message, not the request.
+  manager.appendMessage({ ...result('f2', 'fold', 'refused', 4), isError: true } as Message);
+  manager.appendMessage(user('two', 5));
+  manager.appendMessage(assistant(call('f3', 'fold')));
+  assert.equal(runEndRequest(entries(), calling('f3')), -1);
+  assert.ok(planFold(entries(), 'f3', 1).edits.some((edit) => edit.targetId === request));
+
+  // So does a fold with a message of another extension in between.
+  const other = session([user('one', 1), assistant('answer')]).manager;
+  other.appendCustomMessageEntry(RUN_END_FOLD_TYPE, 'Fold that work now.', true);
+  other.appendCustomMessageEntry('other', 'Check it.', true);
+  other.appendMessage(assistant(call('f', 'fold')));
+  const shown = other.buildSessionProjection().entries;
+  assert.equal(runEndRequest(shown, shown.length - 1), -1);
+
+  // And one with the summary of another branch in between, which is no message of the user
+  // and still something new to answer.
+  const branched = session([user('one', 1), assistant('answer')]).manager;
+  branched.appendCustomMessageEntry(RUN_END_FOLD_TYPE, 'Fold that work now.', true);
+  branched.branchWithSummary(branched.getLeafId(), 'Another branch brought new work.');
+  branched.appendMessage(assistant(call('f', 'fold')));
+  const after = branched.buildSessionProjection().entries;
+  assert.equal(runEndRequest(after, after.length - 1), -1);
+
+  // A message of the user that is not shown is nothing the agent could answer.
+  const hidden = session([user('one', 1), assistant('answer')]).manager;
+  const asked = hidden.appendCustomMessageEntry(RUN_END_FOLD_TYPE, 'Fold that work now.', true);
+  apply(hidden, [
+    { type: 'context_edit', targetId: hidden.appendMessage(user('two', 2)), replacement: null }
+  ]);
+  hidden.appendMessage(assistant(call('f', 'fold')));
+  const left = hidden.buildSessionProjection().entries;
+  assert.equal(left[runEndRequest(left, left.length - 1)]?.sourceEntry.id, asked);
+});
+
+test('what is new to a run is told from what is its own and from what is neither', () => {
+  const entry = (fields: object) =>
+    ({ id: 'x', parentId: null, timestamp: '', ...fields }) as SessionEntry;
+  const message = (role: string) => entry({ type: 'message', message: { role } });
+  assert.equal(turnOf(message('assistant')), 'own');
+  assert.equal(turnOf(message('toolResult')), 'own');
+  for (const role of ['user', 'bashExecution', 'custom'])
+    assert.equal(turnOf(message(role)), 'new');
+  for (const type of ['custom_message', 'branch_summary', 'compaction']) {
+    assert.equal(turnOf(entry({ type })), 'new', type);
+  }
+  // Pi's own note on a change of tools is a message, and no one's request.
+  assert.equal(turnOf(message('system')), undefined);
+  for (const type of ['custom', 'context_edit', 'model_change', 'thinking_level_change', 'label']) {
+    assert.equal(turnOf(entry({ type })), undefined, type);
+  }
+});
+
+test('a fold that covers one made at the end of a run takes its request with its line, and leaves its own', () => {
+  for (const refused of [false, true]) {
+    const { manager } = session([
+      user('one', 1),
+      assistant(call('a', 'bash')),
+      result('a', 'bash', 'out', 2),
+      assistant('answer')
+    ]);
+    const entries = () => manager.buildSessionProjection().entries;
+    const first = manager.appendCustomMessageEntry(RUN_END_FOLD_TYPE, 'Fold that work now.', true);
+    // The fold may come after a try that was refused, whose stamp the next fold then starts at.
+    if (refused) {
+      manager.appendMessage(assistant(call('r', 'fold')));
+      manager.appendMessage({ ...result('r', 'fold', 'refused', 3), isError: true } as Message);
+    }
+    manager.appendMessage(assistant(call('f1', 'fold')));
+    // Nothing is kept, so the request stands between the line and the call.
+    const plan = planFold(entries(), 'f1', 1);
+    manager.appendCustomEntry(FOLD_STARTED_TYPE, {
+      handle: plan.handle,
+      edits: plan.edits,
+      lines: plan.lines
+    });
+    apply(manager, plan.edits);
+    manager.appendMessage({
+      ...result('f1', 'fold', 'note', 4),
+      details: { kind: 'fold', handle: plan.handle, headline: 'note', manual: 'run-end' }
+    } as Message);
+    manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
+    manager.appendMessage(user('two', 5));
+    manager.appendMessage(assistant('answer two'));
+    const second = manager.appendCustomMessageEntry(RUN_END_FOLD_TYPE, 'Fold again.', true);
+    manager.appendMessage(assistant(call('f2', 'fold')));
+
+    const start = mergeStart(entries())!;
+    assert.equal(start.stamp, refused ? 3 : 4);
+    const next = planFold(entries(), 'f2', start.stamp);
+    const removed = new Set(next.edits.map((edit) => edit.targetId));
+    assert.deepEqual(next.linesRemoved, plan.lines, String(refused));
+    assert.ok(removed.has(first), String(refused));
+    assert.ok(!removed.has(second), String(refused));
+  }
+});
+
+test('a note of pi on a change of tools behind a request for a fold does not make it stale', () => {
+  const system = {
+    role: 'system',
+    content: 'tools changed',
+    timestamp: 0
+  } as unknown as AgentMessage;
+  assert.equal(askState([system, assistant('Not now.')]), 'answered');
+  assert.equal(askState([system]), 'open');
+  assert.equal(askState([system, user('next', 1)]), 'stale');
+});
+
 test('work behind the latest note that no fold removed is found, with the stamp it starts at', () => {
   const { manager } = session([
     user('go', 1),
@@ -921,6 +1237,57 @@ function applyFold(
   manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: plan.handle });
   return plan;
 }
+
+test('calls are held back behind the fold at the end of a run only: once it took effect, and until anything new', () => {
+  const made = (manual: FoldDetails['manual'], applied = true): SessionManager => {
+    const { manager } = session([user('one', 1), assistant('answer')]);
+    manager.appendCustomMessageEntry(RUN_END_FOLD_TYPE, 'Fold that work now.', true);
+    manager.appendMessage(assistant(call('f', 'fold')));
+    manager.appendMessage({
+      ...result('f', 'fold', 'note', 2),
+      details: { kind: 'fold', handle: 'ep-00000001', ...(manual ? { manual } : {}) } as never
+    } as Message);
+    if (applied) manager.appendCustomEntry(FOLD_APPLIED_TYPE, { handle: 'ep-00000001' });
+    return manager;
+  };
+  const held = (manager: SessionManager) => afterRunEndFold(manager.getBranch());
+  assert.equal(held(made('run-end')), true);
+  // The reply of the agent and entries that are no message change nothing.
+  const replied = made('run-end');
+  replied.appendMessage(assistant('Folded.'));
+  replied.appendCustomEntry('other', {});
+  assert.equal(held(replied), true);
+  // Not a fold that did not take effect, one the user asked for with /fold, or one the agent
+  // made by itself.
+  assert.equal(held(made('run-end', false)), false);
+  assert.equal(held(made('since')), false);
+  assert.equal(held(made('request')), false);
+  assert.equal(held(made(undefined)), false);
+  // Anything new ends it: a message of the user, one of an extension, a shell command, the
+  // summary of a branch, a compaction.
+  const news: ((manager: SessionManager) => void)[] = [
+    (manager) => manager.appendMessage(user('two', 3)),
+    (manager) => manager.appendCustomMessageEntry('other', 'Check it.', true),
+    (manager) =>
+      manager.appendMessage({
+        role: 'bashExecution',
+        command: 'ls',
+        output: '',
+        exitCode: 0,
+        cancelled: false,
+        truncated: false,
+        timestamp: 0
+      } as unknown as Message),
+    (manager) => manager.branchWithSummary(manager.getLeafId(), 'What the other branch did.'),
+    (manager) => manager.appendCompaction('What came before.', manager.getLeafId()!, 1000)
+  ];
+  for (const [index, arrive] of news.entries()) {
+    const manager = made('run-end');
+    arrive(manager);
+    manager.appendMessage(assistant(call('b', 'bash')));
+    assert.equal(held(manager), false, String(index));
+  }
+});
 
 /** The fold markers in context, in order. */
 function markersIn(manager: SessionManager): string[] {

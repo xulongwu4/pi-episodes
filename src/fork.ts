@@ -23,7 +23,7 @@ import { changeLines, headline, openItems } from './fold.js';
 import { ForkFolds } from './fork-fold.js';
 import type { ForkRegistry, LiveFork } from './forks-view.js';
 import { readOnlyPaths, textOf, touchedPaths } from './messages.js';
-import { addUsage, emptyUsage, requestOptions } from './requests.js';
+import { addUsage, emptyUsage, requestOptions, withoutStaleAsks } from './requests.js';
 import { episodesSettings } from './settings.js';
 import type { DiskChange } from './snapshots.js';
 import type { EpisodeState } from './state.js';
@@ -187,7 +187,7 @@ export function registerFork(pi: ExtensionAPI, state: EpisodeState, registry: Fo
       // The parent's view is the child's prefix, so every child request starts with the
       // parent's cached bytes; only the task and the child's own work are new.
       const siblings = siblingResults(projection.messages, toolCallId);
-      const prefix = [...projection.messages, ...siblings];
+      const prefix = withoutStaleAsks([...projection.messages, ...siblings]);
       const declared = getCurrentTools(prefix);
       // Declared tools the child cannot run through executeTool, such as model-only ones like
       // codemode. Their declarations stay, so the tools block matches the parent's for the cache.
