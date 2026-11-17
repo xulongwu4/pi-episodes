@@ -267,6 +267,35 @@ What this does not show: a 302-turn session with the cut by parts; whether the f
 
 <br />
 
+**The line at the top of a preview.** 2026-11-17, pi 1.5.2, commit 3b1b928, with the built-in tools, in a comparison with another extension over sessions of 7 to 302 turns. Here a file that is read is cut like any result (since 7e4434e), and the preview of a result that is no script's output had only the line in place of the middle. In the sessions of 13, 49 and 97 turns, 12 of the 13 turns with a failed check were turns where the report had been read and cut: the root cause and the mitigation stand on one line in the middle of a 73 KB report, and the agent, with the start and the end in view, answered that the report "does **not** contain `ROOT_CAUSE` or `MITIGATION` fields". Without this extension pi's `read` returns the first 50 KB, which holds the line.
+
+Two changes were tried.
+
+*Cut after the answer* (branch `read-after-answer`, not merged): the file arrives whole and a context edit puts the preview in its place once the agent has answered. Asked again about a value it had read and given rightly, the agent took the answer back in 26 of 28 sessions (claude-haiku-5-5 16 of 16, gpt-6-luna 7 of 8, claude-sonnet-5-5 3 of 4; claude-haiku-5-5: "my earlier answer was wrong. The read output I got was truncated"), whatever the preview or a line of the agent's own in the calling response said about the file having been in view. A result the agent has seen is not replaced by less: it takes what stands there now for all it ever received.
+
+*A line first* (this commit's form): the cut on arrival stays, and the preview opens with a line that says it is a part and that what is not shown may still be there. Replays of two of the failed turns, gpt-6-luna at low thinking, each replay the turn's prompt sent once to the session as it was before that turn; counted is a replay that passed all checks of its turn.
+
+| Turn | No line first | Line first | Line first, with a sentence on how to search |
+| --- | --- | --- | --- |
+| 5 of the 13-turn session (owner, ticket, root cause, mitigation) | 16 of 20 | 20 of 20: a patch of the words alone 10 of 10, this code 10 of 10 | 10 of 10 |
+| 12 of the 49-turn session (status counts, mitigation, a source file) | 19 of 30 | 29 of 40: the patch 9 of 10, this code 20 of 30 (6 of 10, 14 of 20) | 14 of 20 |
+
+The first ten replays of turn 12 with the line, made with a patch that changed the words of the preview and nothing else, passed in 9; thirty more with this code, which shows the same text, passed in 20, which is what the form without the line does. In the replays that failed with the line the agent did go back to the file, as the line asks, with a search whose pattern matched every event line (`grep -nE 'ROOT_CAUSE|MITIGATION|retry|status=' ... | tail -30`): the one line it wanted was cut out of that result in turn, or dropped by its own `tail`. A sentence added to the line ("for exactly what you need ... A search that matches most lines comes back cut like this") changed nothing and was not kept. Cutting after the answer passed 10 of 10 and 7 of 10 on the same two turns; its three failures counted events from the 50 KB page that was then in view.
+
+Full sessions, one per length, the same three tasks, the cap's default settings, cost includes forks. Before and with the line, `foldAfterRun` was `"always"`, because the harness drives pi over RPC, where the default does not ask for the fold at the end of a run:
+
+| | 13 turns, before | with the line | 49 turns, before | with the line | 97 turns, before | with the line |
+| --- | --- | --- | --- | --- | --- | --- |
+| Checks passed | 10 of 12 | 12 of 12 | 78 of 84 | 84 of 84 | 221 of 228 | 226 of 228 |
+| Turns with a failed check, of them with a cut result | 1, 1 | 0 | 6, 6 | 0 | 6, 5 | 1, 0 |
+| Answers from memory | 10 of 12 | 12 of 12 | 12 of 12 | 12 of 12 | 10 of 12 | 12 of 12 |
+| Cost | $0.019 | $0.023 | $0.080 | $0.080 | $0.212 | $0.195 |
+| Model calls | 35 | 42 | 113 | 119 | 225 | 251 |
+| Peak context | 55k | 55k | 73k | 73k | 95k | 94k |
+| Results cut | 9 | 7 | 52 | 45 | 25 | 42 |
+
+What this shows: with the line no failed check followed a cut result in three sessions, where 12 turns had one before, at about the same cost. What it does not show: one session per cell, one model; the replays say that at a turn of the second kind the line alone changes little. Why the sessions did better at such turns is not established. In the 97-turn session the agent's first searches at turns 12 and 13 were broad and missed the fields, narrower ones in the same turns found them, and from turn 14 on it made the narrower search first; a replay starts instead from the turns of the earlier session. That is a reading of the traces, not a test. A file whose one needed line stands in the middle is still better served by a search than by a read, and the agent still has to make that search well. Under codemode nothing changes: a script's output has had its own opening line since section 12's cut by parts.
+
 ## 13. Which stamp the nudge names
 
 **Question.** When work sits unfolded behind the latest note, does the model fold it when asked, and does it matter which stamp the request names?
