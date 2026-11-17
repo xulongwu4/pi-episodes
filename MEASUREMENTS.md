@@ -1,6 +1,6 @@
 # Measurements
 
-What to measure before believing that folding beats compaction, and how. Only sections 12 to 15 have a result so far.
+What to measure before believing that folding beats compaction, and how. Only sections 12 to 16 have a result so far.
 
 The order follows the post: try the note before asking the model to notice anything. `/fold` separates the two questions, so note quality comes before boundary detection. Cheap scripted checks come first, so a broken mechanism is not mistaken for a bad model.
 
@@ -496,9 +496,100 @@ The two models go by different parts of the form. claude-haiku-5-5 needs the bra
 
 The gpt-6-luna session has one such answer in 302 turns, against 5 and 2 in the two 302-turn sessions with the line that opened with the handle; replayed 12 times, that turn was not answered with a line again. So the form makes the answer rare and does not rule it out. The claude-haiku-5-5 session costs less than both sessions of the table further up ($0.54 with the earlier line, $0.63 without one), which one session each does not separate from the spread.
 
-The low check score of the gpt-6-luna session has another cause, which this section did not look for. At turns 62 and 136 the agent folded at the start of a request, as the nudge asked, and then looked for that request's data with `recall` instead of reading the report: "I can't verify `reports/incident-54.log`'s requested lines [...] from the available evidence". It kept to that for 33 and 39 turns, 72 of the 76 turns with a failed check. Replayed ten times each with and without the line, turns 62 and 136 were worked from the archive alone in 5 of 20 tries with it and 10 of 20 without it, so the line is not what causes it. It is older than the line. Of the 33 earlier complete codemode sessions on gpt-6-luna of 97 turns or more, leaving out the two quiz turns at the end, 30 have none to three turns of work done from the archive alone, two have five and eight with no more than three in a row, and one has 30: the first session of section 12 without the cap (143 of 228 checks), from before there was a line, where the same thing began at a fold at the start of turn 58 and lasted 27 turns. In both sessions the first `recall` after the fold found the request being answered in the archive, since the span of such a fold runs up to the fold call and so takes in that request's message. It is a fault of folding at the start of a request and is open; whether the archived copy of the request is what misleads the agent has not been tested.
+The low check score of the gpt-6-luna session has another cause, which this section did not look for. At turns 62 and 136 the agent folded at the start of a request, as the nudge asked, and then looked for that request's data with `recall` instead of reading the report: "I can't verify `reports/incident-54.log`'s requested lines [...] from the available evidence". It kept to that for 33 and 39 turns, 72 of the 76 turns with a failed check. Replayed ten times each with and without the line, turns 62 and 136 were worked from the archive alone in 5 of 20 tries with it and 10 of 20 without it, so the line is not what causes it. It is older than the line. Of the 33 earlier complete codemode sessions on gpt-6-luna of 97 turns or more, leaving out the two quiz turns at the end, 30 have none to three turns of work done from the archive alone, two have five and eight with no more than three in a row, and one has 30: the first session of section 12 without the cap (143 of 228 checks), from before there was a line, where the same thing began at a fold at the start of turn 58 and lasted 27 turns. In both sessions the first `recall` after the fold found the request being answered in the archive, since the span of such a fold runs up to the fold call and so takes in that request's message. It is a fault of folding at the start of a request. Section 16 takes the archived copy of the request away, which did not help, and measures a fold made between two requests instead.
 
 What this does not show: more than one long session per cell; a session longer than 97 turns on Claude; a long session of gemini-3.8-flash or of any model beyond the four; folds that cover notes with this line (the gpt-6-luna session had none); whether the hedges ("I am going from my note, I cannot re-check it without a tool") would become checks when tools are allowed. gpt-6-luna and gemini-3.8-flash did not retract with nothing left either: for them the line costs about 100 tokens a fold and, on gpt-6-luna, the rare answer above.
+
+<br />
+
+## 16. Where the fold is made: inside a request or between two
+
+**Question.** Does it matter where a fold is made: at the start of a request, where the nudge asked for it, or between two requests?
+
+**Why.** In the 302-turn gpt-6-luna session of section 15 the agent folded at the start of a request twice and then answered from `recall` for 33 and 39 turns instead of reading the files it was asked about. Section 15 left the cause open.
+
+**Method.** Three parts.
+
+1. *Counting*, without model calls. All 62 complete sessions of this extension on gpt-6-luna of 97 turns or more, 34 under `codemode.mode: "only"` and 28 without codemode, the two quiz turns left out. Each turn is put in one of three classes: it begins with a fold; a fold comes after other work in it; no fold. A turn fails when one of the benchmark's checks on its answer fails.
+2. *Replays* at turns 62 and 136 of that session. The session file is cut before the turn and the turn's prompt is sent once, in the benchmark's sandbox. For a fold inside the request, the nudge comes with the prompt as it did; variants change what the fold leaves. For a fold between requests, the session is cut after the answer of the turn before, the fold is asked for there, the run ends, and then the prompt is sent. About half a cent a replay.
+3. *Full sessions* with the fold asked for at the end of a run as built: one of 97 and one of 302 turns, codemode only, gpt-6-luna at low thinking, Pi 1.5.0. The benchmark takes the last response of a turn as its answer, so a copy of it takes the last response before the request for the fold. It drives Pi over RPC, where the fold was then asked for by default; it now takes `"foldAfterRun": "always"` there.
+
+**Report.** The share of turns that fail a check, by class. For replays: tries that read the report asked for, tries that worked from the archive alone, tries with a right answer. For sessions: checks, quiz, cost, peak, turns worked from the archive alone, what followed each request for a fold, and what the provider served from cache after each fold.
+
+**Pass.** Set before the replays, with a second model's review of the plan: a fold between requests is worth building if one form of it gives a right answer in 9 of 10 tries at turn 62 and 4 of 5 at turn 136, with at most one try worked from the archive alone. A full session passes with no run of turns worked from the archive and 95% of its checks.
+
+**Result.**
+
+*Counting.*
+
+| | Turns | Failed a check |
+| --- | ---: | ---: |
+| Codemode only: turn begins with a fold | 739 | 141 (19%) |
+| Codemode only: fold after other work in the turn | 24 | 16 (67%) |
+| Codemode only: no fold | 5,337 | 470 (9%) |
+| No codemode: turn begins with a fold | 374 | 26 (7%) |
+| No codemode: fold after other work in the turn | 41 | 25 (61%) |
+| No codemode: no fold | 4,090 | 179 (4%) |
+
+The requests of this benchmark are short and alike, which makes a fold in the middle of one worse than it would be in long work; the middle rows are few turns. The difference between the first and third row of each mode is the one that the rest of this section is about.
+
+*A fold inside the request.* Tries that read the report asked for, and tries that worked from the archive alone:
+
+| What the fold left | Turn 62 | Turn 136 |
+| --- | --- | --- |
+| As in the session, with the line of section 15 | 5 of 10, 3 | 8 of 10, 2 |
+| As in the session, without the line | 2 of 10, 8 | 6 of 10, 2 |
+| The span ends before the request's own message, so the archive holds no copy of it | 3 of 11, 6 | 9 of 10, 1 |
+| That, and a paragraph in the result saying the request is new work | 10 of 15, 4 | 5 of 5, 0 |
+| A paragraph naming the tools that the folded scripts called | 10 of 15, 5 | not run |
+| That, with the latest working call of each tool | 7 of 15, 8 | not run |
+
+Taking the archived copy of the request away did not help: without it the agent read the report no more often (3 of 11 and 9 of 10, against 5 of 10 and 8 of 10). No wording fixed it either. The two paragraphs raised the count at turn 62 to 10 of 15, which at these numbers may be chance, and the third lowered it again; none is ruled out as part of the cause by so few tries. In tries that failed, the agent knew which request it was answering and still only called `recall`, or answered an earlier request that the fold had kept, or folded again and called the open request done. Under `codemode.mode: "only"` with no nested tools listed in the prompt, as in the benchmark, the calls of `bash` and `read` leave the context with the span, and what stands last is a row of kept requests that look alike, the fold call and the note.
+
+*A fold between two requests.* Tries with a right answer to the turn after it:
+
+| What the fold left | Right | At turn 62, turn 136 | First call of the next turn |
+| --- | --- | --- | --- |
+| Nothing: everything up to the answer folded | 12 of 16 | 8 of 11, 4 of 5 | `recall` in 6, a search for tools in 7, `read` in 2, `bash` in 1. 12 searched for tools at some point; 3 counted events with Pi's `read`, which stops at 50 KB |
+| The last request, with its calls and outputs | 16 of 16 | 11 of 11, 5 of 5 | `bash` on the report in all 16 |
+| Nothing, with a paragraph giving the latest working call of each tool | 15 of 16 | 10 of 11, 5 of 5 | `recall` in 6; one try worked from the archive alone for 39 requests |
+
+By the numbers set above the second form passes and so does the third, with its one try from the archive; the first does not. The third was not built because it still began 6 of 16 turns in the archive and stayed there in one, which is the behaviour this section is about, where the form that keeps the last request began all 16 with `bash` on the report. A right answer here is one that passes the benchmark's checks and gives the right counts. The kept request costs room, 4k to 9k tokens more in the next request, and nothing else measured: the turns after it took half the requests. Where the fold is called from a script the run cannot end on it, so the agent was asked to reply with one word: in 12 of 12 tries the reply was "Folded." and nothing else, and 11 of 12 answers to the next turn were right.
+
+*Full sessions.* With the fold asked for at the end of a run, the last request kept, and each such fold starting at what the one before kept:
+
+| 302 turns, codemode only | Folds inside requests (section 15) | Fold at the end of a run |
+| --- | ---: | ---: |
+| Checks | 621 of 843 | 839 of 843 |
+| Turns worked from the archive alone | 72 | 0 |
+| Quiz from context, retrieval | 12 of 12, 12 of 12 | 12 of 12, 12 of 12 |
+| Folds | 10 | 21 (20 asked for, all made as asked) |
+| Cost | $0.62 | $0.92 |
+| Peak context | 109k | 146k |
+| Uncached input | 0.96M | 2.43M |
+| Output | 119k | 214k |
+| Model calls | 827 | 809 |
+
+| 97 turns, codemode only | Folds inside requests (three sessions, section 12) | Fold at the end of a run |
+| --- | ---: | ---: |
+| Checks | 206, 214 and 208 of 228 | 149 of 228 |
+| Turns worked from the archive alone | not counted | 0 |
+| Quiz from context, retrieval | 9, 12 and 12 of 12; 12 of 12 | 12 of 12, 12 of 12 |
+| Folds | not counted | 5 (5 asked for, all made as asked) |
+| Cost | $0.18, $0.18, $0.25 | $0.24 |
+| Peak context | 79k, 83k, 84k | 94k |
+
+By the rule set above the 302-turn session passes, with 99.5% of its checks and no turn worked from the archive, and the 97-turn session fails, with 65% of its checks; why is below. One session of each length says little about either number.
+
+In the turn after 18 of the 20 folds of the 302-turn session the first call was `bash` on the report; in one it was `read` and then `bash`, and one was the quiz, where no tool can be called. None failed a check, none called `recall` first. The six earlier 302-turn sessions of this extension under codemode cost $0.59 to $0.95 and passed 621 to 839 checks, so this one is at the top of both: one of the six, with folds inside requests, passed 839 as well. Part of the higher output is the answers themselves: the session it is compared with gave short refusals for 72 turns.
+
+*What a fold at the end of a run costs.* After 18 of the 20 folds the provider served 0 or 2,048 tokens of the next request from cache; that request held 13k to 73k tokens, 11k to 70k of them uncached. The 20 requests after folds took 745k tokens of uncached input, about $0.07 of the $0.92. In the session of section 15 the request after a fold was served from cache up to the fold's first edit (38k of 46k tokens at turn 289). A probe that hashed every item of each request showed that the two requests around the fold at turn 264 began with the same 237 items, about 30k tokens, and 2,048 were served from cache; with the line of the covered fold left in place they began with the same 252 items, and it was 2,048 again. A reading that fits most of it: beyond a short head, this provider serves a prefix from cache only up to a place where an earlier request ended, not any common prefix. That is an inference from these counts and not something the provider documents, and it leaves things unexplained. The 2,048 tokens it served are fewer than any request of the session held, so the head is not a place where a request ended. In the 97-turn session the request after two of the five folds was served 2,816 tokens, and the first request of turn 49, with no fold before it, 2,048 of 14,211. On that reading a fold that starts after the note before it edits the context where an earlier request ended, and from the third on a fold that removes what the one before it kept edits a place that stands before every request since that fold and after that fold's own edits, where no request ended. Keeping the last request in view went with right answers in the replays and in the 302-turn session, and removing it one fold later is what costs the cache; leaving several kept requests to be removed together would re-send less often and carry more at the cached price in between, which comes to about the same on these sessions and was not built.
+
+*One fold was followed by more.* At turn 278 the reply after the fold was "Folded." together with another call: the agent folded the request it had been left, read it back with `recall` twice, and then did the work for the next report, which had not been asked for, in ten requests. The request for a fold at turn 288 then started after that stray note, so its fold covered no earlier note and edited nothing before it; the fold at turn 300 covered the note of turn 288 only. After those two folds the provider served 68k tokens from cache. Since then a call made once such a fold has taken effect, and before anything new arrives, is not run, and the run ends when every call of the response was such a call. Six replays of that turn with an earlier form of the change, which refused the call and let the run go on, gave the one-word reply each time, so neither form has been seen at work with a model.
+
+*The 97-turn session.* $0.24, peak 94k, five requests for a fold, five folds, five replies of the one word, no turn worked from the archive, quiz 12 of 12 — and 149 of 228 checks. From turn 14 to the end the agent counted the events of each report in a script that read it with Pi's `read`, which stops at 50 KB: 281 events of 400, in 76 of the 78 turns that failed. It began three turns after the first fold with the tool's notice "Showing lines 1-285 of 406 (50.0KB limit)" in view. The same miscount runs through 11 stretches of the 63 earlier sessions, one of 112 turns, so it is not new with this change. But what this change does was part of how it lasted here. The first fold removed every `bash` call of turns 1 to 10 and kept turn 11, a comparison of source files done with `read` alone, so that was the one workspace tool in view when the reports began at turn 12, which took 12 requests. Each later fold kept the last turn in view, by then one that counted with `read`, and from the second fold on the notes recorded "281 records, not 400" as a fact about the reports, which every later fold kept as written. So the session fails the rule set above, and the kept request and the kept notes can carry a wrong method as well as a right one.
+
+What this does not show: more than one session of each length; a session without codemode, where the direct fold ends the run and the reply is not needed (one 13-turn session made one such fold); any model but gpt-6-luna; long work in which a run is one long task, where a fold in the middle is the agent's own to make; how often keeping the last request in view, and notes that record a wrong count as fact, make a wrong method last longer than it would have; a person typing while the fold is being made, a run stopped on the request for the fold, and a call after the fold, each of which is tested with the test provider only.
 
 <br />
 
