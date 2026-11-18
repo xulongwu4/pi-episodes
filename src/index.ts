@@ -21,7 +21,7 @@ import { registerFork } from './fork.js';
 import { ForkRegistry, registerForksView } from './forks-view.js';
 import { absolutePath, type FileTouch, fileTouch, withFiles } from './messages.js';
 import { registerNudge } from './nudge.js';
-import { CAPPED_KEY, capOutput } from './output.js';
+import { CAPPED_KEY, capOutput, readSource } from './output.js';
 import { CODEMODE_CALLS, EPISODES_SECTION } from './prompt.js';
 import { UNCAPPED_TOOLS } from './prune.js';
 import { registerRecall } from './recall.js';
@@ -218,13 +218,15 @@ export default function episodes(pi: ExtensionAPI): void {
       return undefined;
     }
     try {
-      // The details name the file of what codemode cut to its own budget first.
+      // The details name the file of what codemode cut to its own budget first. The preview
+      // of a file that was read names that file, when the path of the call can stand for it.
       const cut = await capOutput(
         event.content,
         dir,
         settings.outputCapChars,
         settings.outputCapKeepChars,
-        details
+        details,
+        event.toolName === 'read' ? readSource(event.input?.path) : undefined
       );
       return cut && { content: cut.content, details: { ...details, [CAPPED_KEY]: cut.capped } };
     } catch {

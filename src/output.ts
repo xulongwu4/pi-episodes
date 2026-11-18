@@ -50,6 +50,14 @@ export interface CappedOutput {
    * that line was written have none, and open with the start of the text.
    */
   top?: true;
+  /**
+   * The file a `read` returned this text of, as the call named it. The preview then points at
+   * that file and not at `path`: the copy kept there is what the read returned, which is less
+   * than the file when the read was a slice of it or stopped at its size limit.
+   */
+  source?: string;
+  /** The tool had cut its output itself before it arrived, and the preview says so. */
+  stopped?: true;
   /** Lengths of the text blocks the text was joined from, when there were several. */
   parts?: number[];
   /**
@@ -74,6 +82,8 @@ export function cappedOutput(details: unknown): CappedOutput | undefined {
     ['undefined', 'number'].includes(typeof capped.arrived) &&
     ['undefined', 'number'].includes(typeof capped.head) &&
     (capped.top === undefined || capped.top === true) &&
+    ['undefined', 'string'].includes(typeof capped.source) &&
+    (capped.stopped === undefined || capped.stopped === true) &&
     (capped.parts === undefined ||
       (Array.isArray(capped.parts) && capped.parts.every((part) => typeof part === 'number'))) &&
     (capped.shown === undefined ||
@@ -102,9 +112,26 @@ function offloadedOutput(details: unknown): { path: string; sha256: string } | u
     : undefined;
 }
 
-/** How a preview made here names its file; a preview is found again by it. */
-function named(path: string): string {
-  return `All of this output is in ${path};`;
+/**
+ * How the line in place of the middle says where the rest is; a preview is found again by it.
+ * For a file that was read that is the file, and for other output the copy kept of it.
+ */
+function named(path: string, source?: string): string {
+  return source === undefined
+    ? `All of this output is in ${path};`
+    : `They are in ${source}, the file that was read;`;
+}
+
+/** What a preview says about where the rest of its text is (see CappedOutput). */
+interface Rest {
+  path: string;
+  source?: string | undefined;
+  stopped?: true | undefined;
+}
+
+/** What the opening line of a recorded preview was written from; none when it has no such line. */
+function opening(cut: Rest & { top?: true | undefined }): Rest | undefined {
+  return cut.top && { path: cut.path, source: cut.source, stopped: cut.stopped };
 }
 
 /** One cut of a result: the file with the text, and how to find the preview made from it. */
@@ -118,6 +145,10 @@ interface Cut {
   head?: number | undefined;
   /** The preview opens with the line that says it is a part, when the record says. */
   top?: true | undefined;
+  /** The file that was read, when the preview names that and not `path`. */
+  source?: string | undefined;
+  /** The preview says that the tool had cut the output first, when the record says. */
+  stopped?: true | undefined;
   /** The lengths of the blocks the text was joined from, when the record says. */
   parts?: readonly number[] | undefined;
   /**
@@ -136,9 +167,68 @@ interface Cut {
  * answered that the report had none. So the preview says first that it is a part, and what
  * that means for an answer. A preview is found again by this line as it is written here: when
  * the words change, the line of before has to stay readable for the sessions that have it.
+ *
+ * Where it sends the agent for the rest depends on what the text is. The copy kept of a tool's
+ * output holds all of that output. Of a file that was read it holds what the read returned,
+ * which pi stops at a size limit: an agent sent to the copy of such a read took it for the
+ * file and counted 281 of its 400 records, in 36 turns running. So a read is sent to the file
+ * itself, and a text that its tool had cut first is said to be less than the whole.
  */
-function partLine(kept: number, chars: number, path: string): string {
-  return `${PREVIEW_OPENS}${kept} of ${chars} characters, its start and its end, with the middle left out at the place marked below. If what you need is not in the part shown, do not answer without it, and do not conclude that it is not there: grep ${path}, which holds all of it, or read a slice of that file.\n\n`;
+function partLine(kept: number, chars: number, rest: Rest): string {
+  const part = `${PREVIEW_OPENS}${kept} of ${chars} characters, its start and its end, with the middle left out at the place marked below. If what you need is not in the part shown, do not answer without it, and do not conclude that it is not there: `;
+  if (rest.source === undefined) {
+    // The copy holds what arrived. That is all of the output, unless the tool left some out.
+    return rest.stopped
+      ? `${part}grep ${rest.path}, which holds all that arrived, or read a slice of that file. The tool had cut its output itself before it arrived, and what it left out is not in that file.\n\n`
+      : `${part}grep ${rest.path}, which holds all of it, or read a slice of that file.\n\n`;
+  }
+  const cut = rest.stopped
+    ? ' The read tool stopped at its size limit before the end of that file, so this output is not all of the file either.'
+    : '';
+  return `${part}grep ${rest.source}, the file that was read, or read a slice of it.${cut}\n\n`;
+}
+
+/**
+ * The path a `read` was called with, when the preview can name it for the file that was read.
+ * It is named as the call gave it and no other way, and the agent goes to it with whatever
+ * tool it has. So a path is not named when pi's `read`, the `read` of pi-hashline-edit-pro
+ * and a shell are known to take it for different files, or when it does not fit in a line:
+ * - a blank at either end (pi keeps it as part of the name);
+ * - an @ in front (pi drops it, the other read looks for a file of that name);
+ * - one of the spaces pi turns into a plain one (U+00A0 and the like);
+ * - `file:` in front, whatever follows: pi resolves a URL, the others take it for a relative
+ *   path;
+ * - a `..` step: pi drops it with the step before it, and so does the other read in a
+ *   relative path, where a shell follows a link;
+ * - a `/` or `/.` at the end, which pi drops and a shell does not take for a file;
+ * - a `~` in front other than `~` alone or `~/`, which only a shell expands;
+ * - a line break or other control character; more than 1,024 characters.
+ * The copy is named for those. Not seen: pi finds a file whose name is spelled another way
+ * (composed or decomposed accents, a curly apostrophe) when the name as given is not there.
+ */
+export function readSource(path: unknown): string | undefined {
+  return typeof path === 'string' &&
+    path.length > 0 &&
+    path.length <= 1024 &&
+    path === path.trim() &&
+    !path.startsWith('@') &&
+    !/[\p{Cc}\u2028\u2029\u00A0\u2000-\u200A\u202F\u205F\u3000]/u.test(path) &&
+    !/^file:/i.test(path) &&
+    !/(^|[\\/])\.\.([\\/]|$)/.test(path) &&
+    !/[\\/]\.?$/.test(path) &&
+    !/^~(?!\/|$)/.test(path)
+    ? path
+    : undefined;
+}
+
+/** True when the details of a result say that its tool cut the output before returning it. */
+function cutByTool(details: unknown): boolean {
+  const truncation = (details as { truncation?: unknown } | null | undefined)?.truncation;
+  return (
+    typeof truncation === 'object' &&
+    truncation !== null &&
+    (truncation as { truncated?: unknown }).truncated === true
+  );
 }
 
 function literal(text: string): string {
@@ -342,10 +432,12 @@ export async function capOutput(
   dir: string,
   limit: number,
   keep: number,
-  details?: unknown
+  details?: unknown,
+  source?: string
 ): Promise<{ content: Block[]; capped: CappedOutput } | undefined> {
   // A preview at least half the size of the original would save little and can outgrow it.
   const least = Math.max(limit, 2 * keep);
+  const rest = { source, stopped: cutByTool(details) };
   // What codemode cut to its own budget first is cut from all of it (see scriptOutput), when
   // what arrived is over the limit and that preview is shorter than what arrived: a result is
   // never made longer here, and one that a script asked to be small is left as it is.
@@ -354,10 +446,12 @@ export async function capOutput(
       ? undefined
       : await scriptOutput(content, details, CODEMODE_FULL_BYTES, least);
   if (whole) {
-    const cut = await cutOutput(whole.content, dir, 0, keep, whole.arrived);
+    // All that the script printed is there: no file was read, and nothing is cut any more.
+    const all = { source: undefined, stopped: false };
+    const cut = await cutOutput(whole.content, dir, 0, keep, whole.arrived, all);
     if (cut) return { content: cut.content, capped: { ...cut.capped, arrived: whole.arrived } };
   }
-  return cutOutput(content, dir, least, keep, Number.POSITIVE_INFINITY);
+  return cutOutput(content, dir, least, keep, Number.POSITIVE_INFINITY, rest);
 }
 
 /** Cuts a text of `least` characters or more to a preview shorter than it and than `under`. */
@@ -366,7 +460,8 @@ async function cutOutput(
   dir: string,
   least: number,
   keep: number,
-  under: number
+  under: number,
+  rest: { source: string | undefined; stopped: boolean }
 ): Promise<{ content: Block[]; capped: CappedOutput } | undefined> {
   const first = content[0];
   // That block stays where the renderer looks for it; it is not part of the output.
@@ -390,7 +485,12 @@ async function cutOutput(
   const start = head(text, Math.floor((keep * 2) / 3));
   const end = tail(text, Math.floor(keep / 3));
   const omitted = text.length - start.length - end.length;
-  const preview = `${partLine(start.length + end.length, text.length, path)}${start}\n\n[episodes] ${omitted} of ${text.length} characters left out here. ${named(path)} grep it or read a slice, not the whole file. recall searches it once it is folded.\n\n${end}`;
+  const said: Rest = { path, source: rest.source, stopped: rest.stopped || undefined };
+  const where =
+    rest.source === undefined
+      ? 'grep it or read a slice, not the whole file. recall searches it once it is folded.'
+      : 'grep it or read a slice of it, not the whole file again. recall searches this output once it is folded.';
+  const preview = `${partLine(start.length + end.length, text.length, said)}${start}\n\n[episodes] ${omitted} of ${text.length} characters left out here. ${named(path, rest.source)} ${where}\n\n${end}`;
   // The line that says it is cut is long next to a small `keep`.
   if ((script ?? preview).length >= Math.min(text.length, under)) return undefined;
   await mkdir(dir, { recursive: true });
@@ -430,6 +530,8 @@ async function cutOutput(
       preview: preview.length,
       head: start.length,
       top: true,
+      ...(rest.source === undefined ? {} : { source: rest.source }),
+      ...(rest.stopped ? { stopped: true as const } : {}),
       ...(joined.length > 1 ? { parts: joined.map((part) => part.length) } : {})
     }
   };
@@ -446,7 +548,7 @@ function sameCut(shown: string, part: string): boolean {
  * not left out. With the length of the start on record, only that much is replaced: a block
  * can hold more than the preview, once another cut that took in the preview and a block next
  * to it has been undone. Without it the preview has to be all of the block. A preview that
- * opens with the line that says it is a part (`top` is then the file it names) is taken only
+ * opens with the line that says it is a part (`top` is then what the line was written from) is taken only
  * with that line before its start, as it was written, and the line goes with it. Where a preview
  * stands in a longer block is not searched for: text whose start or end repeats fits in more
  * than one place, and the wrong one would take a handler's line for part of the output.
@@ -457,7 +559,7 @@ function putBackSpan(
   marker: RegExp,
   full: string,
   head?: number,
-  top?: string
+  top?: Rest
 ): { whole: string; head: number; tail: number } | undefined {
   for (const match of text.matchAll(marker)) {
     const before = match.index;
@@ -485,7 +587,7 @@ function putBack(
   marker: RegExp,
   full: string,
   head?: number,
-  top?: string
+  top?: Rest
 ): string | undefined {
   return putBackSpan(text, marker, full, head, top)?.whole;
 }
@@ -545,7 +647,7 @@ async function restored(
   const written = shown && scriptPreview(full, cut.path, shown);
   const fits = marked.flatMap(({ index, text }) => {
     if (written === undefined) {
-      const whole = marker && putBack(text, marker, full, cut.head, cut.top && cut.path);
+      const whole = marker && putBack(text, marker, full, cut.head, opening(cut));
       return whole === undefined ? [] : [{ index, text: whole }];
     }
     const at = text.indexOf(written);
@@ -590,12 +692,14 @@ export async function withFullOutput(message: AgentMessage): Promise<AgentMessag
             block: capped.block,
             head: capped.head,
             top: capped.top,
+            source: capped.source,
+            stopped: capped.stopped,
             parts: capped.parts,
             ...(capped.shown
               ? { shown: capped.shown }
               : {
                   marker: new RegExp(
-                    `\\n\\n\\[episodes\\] (\\d+) of \\d+ characters left out here\\. ${literal(named(capped.path))}[^\\n]*\\n\\n`,
+                    `\\n\\n\\[episodes\\] (\\d+) of \\d+ characters left out here\\. ${literal(named(capped.path, capped.source))}[^\\n]*\\n\\n`,
                     'g'
                   )
                 })
@@ -675,7 +779,7 @@ export function verifyCompleteRead(
   if (!digest.startsWith(nameMatch[1]!)) return undefined;
   const marker = new RegExp(
     '\\n\\n\\[episodes\\] (\\d+) of \\d+ characters left out here\\. ' +
-      literal(named(capped.path)) +
+      literal(named(capped.path, capped.source)) +
       '[^\\n]*\\n\\n',
     'g'
   );
@@ -684,7 +788,7 @@ export function verifyCompleteRead(
   );
   if (marked.length === 0) return undefined;
   const fits = marked.flatMap(({ index, text }) => {
-    const span = putBackSpan(text, marker, full, capped.head, capped.top && capped.path);
+    const span = putBackSpan(text, marker, full, capped.head, opening(capped));
     return span === undefined
       ? []
       : [{ index, text: span.whole, head: span.head, tail: span.tail }];

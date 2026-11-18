@@ -24,6 +24,7 @@ import {
 } from '@earendil-works/pi-coding-agent';
 import { EVENT_TYPE, META_TYPE } from '../src/events.js';
 import episodes from '../src/index.js';
+import { cappedOutput } from '../src/output.js';
 import { readStamp } from '../src/stamps.js';
 import { episodeStats, statsLines } from '../src/stats.js';
 
@@ -1326,10 +1327,16 @@ test('a large read result arrives cut, leaves errors and images whole, and recal
           output,
           /^\[episodes\] Only part of this output is shown: \d+ of \d+ characters, [^\n]*\n\nrow 1 of the file\n/
         );
+        // The file that was read is named, and the copy kept of the result is not.
         assert.match(
           output,
-          /\[episodes\] \d+ of \d+ characters left out here\. All of this output is in /
+          /^[^\n]*: grep table\.txt, the file that was read, or read a slice of it\.\n\nrow 1 /
         );
+        assert.match(
+          output,
+          /\[episodes\] \d+ of \d+ characters left out here\. They are in table\.txt, the file that was read; /
+        );
+        assert.doesNotMatch(output, /output-[0-9a-f]{16}\.txt|size limit/);
         assert.match(output, /row 600 of the file\n+\[t2\]$/);
         assert.doesNotMatch(output, /row 300 of/);
         assert.ok(output.length < 1700);
@@ -1381,6 +1388,112 @@ test('a large read result arrives cut, leaves errors and images whole, and recal
     const stats = episodeStats(harness.session.sessionManager.getBranch(), harness.dir);
     assert.equal(stats.outputs.capped, 1);
     assert.ok(stats.outputs.tokens > 2000);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a read that pi stopped at its size limit says so first, and so does output that bash had cut', async () => {
+  let handle = '';
+  const copy = /output-[0-9a-f]{16}\.txt/;
+  const harness = await createSession(
+    [
+      () => fauxAssistantMessage(fauxToolCall('read', { path: 'big.txt' })),
+      (context) => {
+        const output = text(conversation(context).at(-1)!);
+        // Nothing in the preview names the copy kept of the 2,000 lines that came back.
+        assert.match(
+          output,
+          /^\[episodes\] Only part of this output is shown: [^\n]*: grep big\.txt, the file that was read, or read a slice of it\. The read tool stopped at its size limit before the end of that file, so this output is not all of the file either\.\n\nentry 1 of the log\n/
+        );
+        assert.match(output, /left out here\. They are in big\.txt, the file that was read; /);
+        assert.match(output, /\[Showing lines 1-2000 of 2601[^\n]*Use offset=\d+ to continue\.\]/);
+        assert.doesNotMatch(output, copy);
+        return fauxAssistantMessage(
+          fauxToolCall('bash', { command: 'seq -f "row %g of the output" 1 4000' })
+        );
+      },
+      (context) => {
+        const output = text(conversation(context).at(-1)!);
+        // What a command printed has no file of its own: the copy is named, and said to be
+        // what arrived, which bash had cut.
+        assert.match(
+          output,
+          /^\[episodes\] Only part of this output is shown: [^\n]*: grep \S+output-[0-9a-f]{16}\.txt, which holds all that arrived, or read a slice of that file\. The tool had cut its output itself before it arrived, and what it left out is not in that file\.\n\n/
+        );
+        assert.match(
+          output,
+          /left out here\. All of this output is in \S+output-[0-9a-f]{16}\.txt; /
+        );
+        assert.match(output, /Full output: /);
+        return fauxAssistantMessage([
+          fauxToolCall('read', { path: 'odd\nname.txt' }),
+          fauxToolCall('read', { path: '@table.txt' }),
+          // pi reads `my table.txt` for this, with a plain space.
+          fauxToolCall('read', { path: 'my\u00a0table.txt' }),
+          fauxToolCall('read', { path: `file://${join(harness.dir, 'table.txt')}` }),
+          fauxToolCall('read', { path: 'sub/../table.txt' })
+        ]);
+      },
+      (context) => {
+        // A path that would break the line is not put in it, nor one of a form that tools are
+        // known to take for different files: the copy is named.
+        for (const result of conversation(context).slice(-5)) {
+          const output = text(result);
+          assert.match(
+            output,
+            /^[^\n]*: grep \S+output-[0-9a-f]{16}\.txt, which holds all of it, [^\n]*\n\nrow 1 /
+          );
+          assert.doesNotMatch(output, /the file that was read|size limit/);
+        }
+        return fauxAssistantMessage(fauxToolCall('fold', { since: 't2', note: 'Read big.txt.' }));
+      },
+      (context) => {
+        handle = /ep-[0-9a-f]{8}/.exec(text(conversation(context).at(-1)!))![0];
+        return fauxAssistantMessage(fauxToolCall('recall', { query: '"entry 1000 of the log"' }));
+      },
+      (context) => {
+        assert.equal(
+          text(conversation(context).at(-1)!).split('\n')[0],
+          `${handle} t2 toolResult: entry 1000 of the log`
+        );
+        return fauxAssistantMessage('done');
+      }
+    ],
+    { persist: true, episodes: { outputCapChars: 2000, outputCapKeepChars: 600 } }
+  );
+
+  try {
+    const entries = Array.from({ length: 2600 }, (_, i) => `entry ${i + 1} of the log`).join('\n');
+    await writeFile(join(harness.dir, 'big.txt'), `${entries}\n`);
+    const rows = Array.from({ length: 600 }, (_, i) => `row ${i + 1} of the file`).join('\n');
+    await writeFile(join(harness.dir, 'odd\nname.txt'), `${rows}\n`);
+    await writeFile(join(harness.dir, 'table.txt'), `${rows}\n`);
+    await writeFile(join(harness.dir, 'my table.txt'), `${rows}\n`);
+    await mkdir(join(harness.dir, 'sub'));
+    await harness.session.prompt('read the files');
+    if (harness.failures[0]) throw harness.failures[0];
+    assert.equal(harness.pending(), 0);
+    const kept = harness.session.sessionManager
+      .getBranch()
+      .flatMap((entry) =>
+        entry.type === 'message' && entry.message.role === 'toolResult'
+          ? [cappedOutput(entry.message.details)]
+          : []
+      )
+      .filter((capped) => capped !== undefined);
+    assert.deepEqual(
+      kept.map(({ source, stopped }) => [source, stopped]),
+      [
+        ['big.txt', true],
+        [undefined, true],
+        [undefined, undefined],
+        [undefined, undefined],
+        [undefined, undefined],
+        [undefined, undefined],
+        [undefined, undefined]
+      ]
+    );
   } finally {
     await harness.cleanup();
   }

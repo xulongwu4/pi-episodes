@@ -11,6 +11,7 @@ import {
   CODEMODE_FULL_BYTES,
   capOutput,
   cappedOutput,
+  readSource,
   scriptOutput,
   verifyCompleteRead,
   withFullOutput
@@ -83,6 +84,184 @@ test('a large result keeps its start and end and names the file with all of it',
     assert.equal(sizes.lastIndexOf(false) + 1, sizes.indexOf(true));
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the preview of a file that was read points at that file, and a text its tool had cut says so', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  const cutFirst = { truncation: { truncated: true, truncatedBy: 'bytes' } };
+  const cases: [source: string | undefined, details: unknown, stopped: boolean][] = [
+    [undefined, undefined, false],
+    ['reports/a.log', undefined, false],
+    ['reports/a.log', cutFirst, true],
+    [undefined, cutFirst, true],
+    // A name is looked for as it is written, whatever signs it holds.
+    ['logs [a] (1)+$&.*\\n{2}|^x/my report.log', cutFirst, true],
+    // Only details that say the tool cut its output count.
+    ['reports/a.log', { truncation: { truncated: false } }, false],
+    ['reports/a.log', { truncation: { truncated: 'yes' } }, false],
+    ['reports/a.log', { truncation: null }, false],
+    ['reports/a.log', { truncation: true }, false],
+    [undefined, { truncated: true }, false],
+    [undefined, 'truncated', false]
+  ];
+  try {
+    for (const [source, details, stopped] of cases) {
+      const label = JSON.stringify([source, details]);
+      const cut = await capOutput([{ type: 'text', text: long }], dir, 1000, 300, details, source);
+      assert.ok(cut, label);
+      const block = cut.content[0]!;
+      assert.ok(block.type === 'text');
+      const { path } = cut.capped;
+      const omitted = Number(/\n\n\[episodes\] (\d+) of /.exec(block.text)?.[1]);
+      const part = `[episodes] Only part of this output is shown: ${long.length - omitted} of ${long.length} characters, its start and its end, with the middle left out at the place marked below. If what you need is not in the part shown, do not answer without it, and do not conclude that it is not there: `;
+      // A file that was read is where the rest is looked for, not the copy kept of what the
+      // read returned: that copy is less than the file when the read stopped early.
+      const line =
+        source === undefined
+          ? stopped
+            ? `${part}grep ${path}, which holds all that arrived, or read a slice of that file. The tool had cut its output itself before it arrived, and what it left out is not in that file.\n\n`
+            : `${part}grep ${path}, which holds all of it, or read a slice of that file.\n\n`
+          : `${part}grep ${source}, the file that was read, or read a slice of it.${stopped ? ' The read tool stopped at its size limit before the end of that file, so this output is not all of the file either.' : ''}\n\n`;
+      assert.ok(block.text.startsWith(`${line}line 0 of the build log\n`), label);
+      const middle =
+        source === undefined
+          ? `\n\n[episodes] ${omitted} of ${long.length} characters left out here. All of this output is in ${path}; grep it or read a slice, not the whole file. recall searches it once it is folded.\n\n`
+          : `\n\n[episodes] ${omitted} of ${long.length} characters left out here. They are in ${source}, the file that was read; grep it or read a slice of it, not the whole file again. recall searches this output once it is folded.\n\n`;
+      assert.equal(block.text.split(middle).length, 2, label);
+      assert.equal(block.text.includes(path), source === undefined, label);
+      assert.deepEqual(
+        cut.capped,
+        {
+          path,
+          chars: long.length,
+          block: 0,
+          preview: block.text.length,
+          head: block.text.indexOf(middle) - line.length,
+          top: true,
+          ...(source === undefined ? {} : { source }),
+          ...(stopped ? { stopped: true } : {})
+        },
+        label
+      );
+      assert.deepEqual(cappedOutput({ [CAPPED_KEY]: { ...cut.capped } }), cut.capped, label);
+
+      // All of it comes back for recall and for the check of a repeated read, by the record.
+      const back = await withFullOutput(
+        toolResult(cut.content, { [CAPPED_KEY]: { ...cut.capped } })
+      );
+      assert.deepEqual(
+        back.role === 'toolResult' && back.content,
+        [{ type: 'text', text: long }],
+        label
+      );
+      assert.deepEqual(
+        verifyCompleteRead(cut.content, { [CAPPED_KEY]: { ...cut.capped } })?.blocks,
+        [{ type: 'text', text: long }],
+        label
+      );
+      // A record that says otherwise of the lines is not the record of this preview.
+      const { source: _named, stopped: _cut, ...bare } = cut.capped;
+      const others = [
+        {
+          ...bare,
+          ...(source === undefined ? { source: 'reports/a.log' } : {}),
+          ...(stopped ? { stopped: true } : {})
+        },
+        {
+          ...bare,
+          ...(source === undefined ? {} : { source }),
+          ...(stopped ? {} : { stopped: true })
+        },
+        ...(source === undefined ? [] : [{ ...cut.capped, source: 'reports/b.log' }])
+      ];
+      for (const other of others) {
+        const message = toolResult(cut.content, { [CAPPED_KEY]: other });
+        assert.equal(await withFullOutput(message), message, `${label} ${JSON.stringify(other)}`);
+        assert.equal(verifyCompleteRead(cut.content, { [CAPPED_KEY]: other }), undefined, label);
+      }
+      await rm(path);
+    }
+    // What the record says of the lines has to be of the right kind.
+    const cut = await capOutput([{ type: 'text', text: long }], dir, 1000, 300, cutFirst, 'a.log');
+    assert.ok(cut);
+    for (const wrong of [{ source: 7 }, { source: null }, { stopped: false }, { stopped: 'yes' }]) {
+      assert.equal(cappedOutput({ [CAPPED_KEY]: { ...cut.capped, ...wrong } }), undefined);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a read is named by its path only when no tool is known to take that path for another file', () => {
+  for (const path of [
+    'reports/a.log',
+    '/tmp/reports/a.log',
+    '~/notes.md',
+    'my reports/a b.log',
+    'données/été.log',
+    'a@b.log',
+    '~',
+    'reports/a~1.log',
+    '.../a..b/..c/d...log',
+    './reports/./a.log.',
+    'profile:/a.log',
+    'dir/file:/a.log',
+    'x'.repeat(1024),
+    // The length is counted in characters as a string has them.
+    'é'.repeat(1024)
+  ]) {
+    assert.equal(readSource(path), path);
+  }
+  for (const path of [
+    // pi takes a blank at either end as part of the name, and a line break too.
+    ' a.log',
+    'a.log ',
+    'a.log\n',
+    '\ta.log',
+    // pi drops an @ in front, and another read tool looks for a file of that name.
+    '@a.log',
+    // Nothing that would break the line, or a search for it.
+    'a\nb.log',
+    'a\rb.log',
+    'a\tb.log',
+    'a\u0000b.log',
+    'a\u0085b.log',
+    'a\u2028b.log',
+    'a\u2029b.log',
+    // The spaces pi turns into a plain one: another tool looks for the name as given.
+    ...[0xa0, ...Array.from({ length: 11 }, (_, i) => 0x2000 + i), 0x202f, 0x205f, 0x3000].map(
+      (code) => `my${String.fromCharCode(code)}report.log`
+    ),
+    'a\u007fb.log',
+    'a\u0090b.log',
+    // pi resolves the URL, another tool takes it for a relative path.
+    'file:///tmp/a.log',
+    'FILE:/tmp/a.log',
+    // The reads drop a .. with the step before it, a shell follows a link at that step.
+    '../a.log',
+    'reports/../a.log',
+    '/tmp/link/..',
+    'reports\\..\\a.log',
+    'reports/..\\a.log',
+    '..\\a.log',
+    '..',
+    // pi drops a slash at the end, with a dot behind it or not; a shell wants a directory.
+    'a.log/',
+    'a.log/.',
+    'a.log\\',
+    // Only a shell expands these.
+    '~root/a.log',
+    '~+/a.log',
+    '~-',
+    '',
+    'x'.repeat(1025),
+    7,
+    null,
+    undefined,
+    { path: 'a.log' }
+  ]) {
+    assert.equal(readSource(path), undefined, JSON.stringify(path));
   }
 });
 

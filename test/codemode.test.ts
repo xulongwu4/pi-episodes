@@ -1191,6 +1191,53 @@ test('a file under ~ that compacted turns changed cues their thread when it is t
   }
 });
 
+const listing: ExtensionFactory = (pi) => {
+  pi.registerTool({
+    name: 'listing',
+    label: 'listing',
+    description: 'List a directory.',
+    parameters: Type.Object({ path: Type.String() }),
+    async execute() {
+      const entries = Array.from({ length: 300 }, (_, i) => `entry ${i} of the listing`);
+      return { content: [{ type: 'text', text: entries.join('\n') }], details: undefined };
+    }
+  });
+};
+
+test('only a read is sent back to the path it was given: the output of another tool with a path has its copy named', async () => {
+  const harness = await createSession(
+    'off',
+    [
+      () =>
+        fauxAssistantMessage(fauxToolCall('listing', { path: 'reports' }), {
+          stopReason: 'toolUse'
+        }),
+      (context) => {
+        const output = text(conversation(context).at(-1)!);
+        assert.match(output, /: grep \S+output-[0-9a-f]{16}\.txt, which holds all of it, /);
+        assert.match(
+          output,
+          /left out here\. All of this output is in \S+output-[0-9a-f]{16}\.txt; /
+        );
+        assert.doesNotMatch(output, /the file that was read/);
+        return fauxAssistantMessage('ok');
+      }
+    ],
+    [listing],
+    { outputCapChars: 2000, outputCapKeepChars: 600 },
+    {},
+    undefined,
+    [],
+    ['listing'],
+    true
+  );
+  try {
+    await harness.run('list it');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 const diffResult: ExtensionFactory = (pi) => {
   pi.on('tool_result', (event) => {
     if (event.toolName !== 'replace' || event.structuredContent === undefined) return undefined;
