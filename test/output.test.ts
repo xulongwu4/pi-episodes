@@ -1,14 +1,17 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import files, { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { test } from 'node:test';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import {
   CAPPED_KEY,
+  CODEMODE_FULL_BYTES,
   capOutput,
   cappedOutput,
+  scriptOutput,
   verifyCompleteRead,
   withFullOutput
 } from '../src/output.js';
@@ -892,6 +895,342 @@ test('a block that only mentions the file of a cut is not taken for its preview'
     const told = await withFullOutput(mention);
     assert.ok(told.role === 'toolResult');
     assert.deepEqual(told.content.slice(0, 2), [quoted, { type: 'text', text: long }]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * The result of a script as codemode gives it when the output is over its budget: the start and
+ * the end around a line with the count, under a line that says so, and all of it in a file that
+ * the last line and the details name.
+ */
+async function byCodemode(dir: string, full: string, budget = 40_000, pairs = true) {
+  const path = join(dir, `pi-codemode-${createHash('sha256').update(full).digest('hex')}.txt`);
+  await writeFile(path, full);
+  const half = Math.floor(budget / 2);
+  const high = (at: number) => full.charCodeAt(at) >= 0xd800 && full.charCodeAt(at) <= 0xdbff;
+  const low = (at: number) => full.charCodeAt(at) >= 0xdc00 && full.charCodeAt(at) <= 0xdfff;
+  // Codemode does not cut inside a character: it steps back by half of one. Before pi 1.5 it
+  // did cut there (`pairs` false).
+  const head = full.slice(0, pairs && high(half - 1) && low(half) ? half - 1 : half);
+  const from = Math.max(0, full.length - (budget - half));
+  const tail = full.slice(pairs && low(from) && high(from - 1) ? from + 1 : from);
+  const tokens = Math.ceil((full.length - budget) / 4);
+  const opening = `Warning: truncated output (original token count: ${Math.ceil(full.length / 4)})\nTotal output lines: ${full.split('\n').length}\n\n`;
+  const text = `${opening}${head}…${tokens} tokens truncated…${tail}\n\n[Full output: ${path} (read with offset/limit)]`;
+  const header = {
+    type: 'text' as const,
+    text: 'Script completed\nWall time 0.1 seconds\nOutput:\n'
+  };
+  return {
+    content: [header, { type: 'text' as const, text }],
+    details: { fullOutputPath: path },
+    header,
+    opening,
+    path,
+    text
+  };
+}
+
+const rows = (name: string, count: number) =>
+  Array.from({ length: count }, (_, index) => `${name} ${index} of the report`).join('\n');
+const threeThings = `==> text 1/3 <==\n${rows('event', 1500)}\n==> text 2/3 <==\nTOP 17\n==> text 3/3 <==\n${rows('source', 1500)}`;
+
+test('the output of a script that codemode cut first is cut from all of it, and all of it comes back', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    const arrived = await byCodemode(dir, threeThings);
+    // What arrived has lost the middle, and with it the whole of the second thing printed.
+    assert.ok(arrived.text.length < 40_300 && threeThings.length > 70_000);
+    assert.doesNotMatch(arrived.text, /TOP 17|event 1400 of/);
+    const whole = await scriptOutput(arrived.content, arrived.details);
+    assert.deepEqual(whole, {
+      content: [arrived.header, { type: 'text', text: threeThings }],
+      arrived: arrived.text.length
+    });
+    const cut = await capOutput(arrived.content, dir, 16_000, 6000, arrived.details);
+    assert.ok(cut?.content[1]?.type === 'text');
+    const preview = cut.content[1].text;
+    assert.ok(
+      preview.startsWith(
+        `[episodes] Only part of this output is shown: ${preview.match(/shown: (\d+) of/)?.[1]} of ${threeThings.length} characters, with the rest left out at the 2 places marked below.`
+      )
+    );
+    // Each thing has its share: the short one in the middle is whole.
+    assert.match(
+      preview,
+      /\n==> text 2\/3 <==\nTOP 17\n==> text 3\/3 <==\nsource 0 of the report\n/
+    );
+    // One file is named, and it holds all of it: nothing of codemode's own cut is left.
+    assert.doesNotMatch(
+      preview,
+      /Warning: truncated output|tokens truncated|pi-codemode|Full output:/
+    );
+    assert.equal(await readFile(cut.capped.path, 'utf8'), threeThings);
+    assert.equal(cut.capped.chars, threeThings.length);
+    const message = toolResult(withStamp(cut.content, 4), {
+      ...arrived.details,
+      [CAPPED_KEY]: { ...cut.capped }
+    });
+    assert.equal(cappedOutput(message.details)?.arrived, arrived.text.length);
+    assert.equal(cappedOutput({ [CAPPED_KEY]: { ...cut.capped, arrived: '3' } }), undefined);
+    const full = await withFullOutput(message);
+    assert.ok(full.role === 'toolResult');
+    assert.deepEqual(full.content.slice(0, 2), [
+      arrived.header,
+      { type: 'text', text: threeThings }
+    ]);
+
+    // Cut as it arrived, the file would hold what codemode passed on, without the middle.
+    const less = await capOutput(arrived.content, dir, 16_000, 6000);
+    assert.doesNotMatch(await readFile(less!.capped.path, 'utf8'), /TOP 17/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("only what is exactly codemode's cut of the file it names is taken from that file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    const made = await byCodemode(dir, threeThings);
+    const { content, details, header, path, text } = made;
+    const block = (other: string) => [header, { type: 'text' as const, text: other }];
+    const ok = async (...args: Parameters<typeof scriptOutput>) =>
+      (await scriptOutput(...args)) !== undefined;
+    assert.ok(await ok(content, details));
+    assert.equal(CODEMODE_FULL_BYTES, 16 * 1024 * 1024);
+    const failed = {
+      type: 'text' as const,
+      text: 'Script failed\nWall time 0.1 seconds\nOutput:\n'
+    };
+    assert.ok(await ok([failed, content[1]!], details));
+    // No file on record, or another one than the result names.
+    for (const other of [undefined, null, 'x', {}, { fullOutputPath: 3 }]) {
+      assert.equal(await ok(content, other), false);
+    }
+    // The same length as the name on record, as the names codemode gives are.
+    const copy = join(dir, `pi-codemode-${'0'.repeat(64)}.txt`);
+    await writeFile(copy, threeThings);
+    assert.equal(await ok(content, { fullOutputPath: copy }), false);
+    // A result that is more or less than the two blocks codemode gives, or not a script\'s.
+    const image = { type: 'image' as const, data: 'aGk=', mimeType: 'image/png' };
+    assert.equal(await ok([...content, image], details), false);
+    assert.equal(await ok([header, image], details), false);
+    assert.equal(await ok([{ type: 'text', text }], details), false);
+    assert.equal(await ok([{ type: 'text', text: 'ok\n' }, content[1]!], details), false);
+    // Words before or after what codemode wrote, or its counts changed.
+    assert.equal(await ok(block(`A note.\n${text}`), details), false);
+    assert.equal(await ok(block(`${text}\n[Image saved to /tmp/x.png]`), details), false);
+    assert.equal(await ok(block(text.replace(/count: (\d+)\)/, 'count: 7)')), details), false);
+    assert.equal(await ok(block(text.replace(/lines: \d+/, 'lines: 7')), details), false);
+    assert.equal(await ok(block(text.replace('…', '')), details), false);
+    // A start or an end that is not the file\'s.
+    assert.equal(await ok(block(text.replace('event 3 of', 'event 4 of')), details), false);
+    assert.equal(await ok(block(text.replace('source 1499 of', 'source 1498 of')), details), false);
+    // A file over the size that is read; one of just that size is.
+    const bytes = Buffer.byteLength(threeThings);
+    assert.equal(await ok(content, details, bytes - 1), false);
+    assert.ok(await ok(content, details, bytes));
+    // A file with other counts than the first line gives, or none.
+    await writeFile(path, threeThings.replace('event 700 of', 'event 700 and a half of'));
+    assert.equal(await ok(content, details), false);
+    await writeFile(
+      path,
+      threeThings.replace('event 700 of the report\n', 'event 700 of the report ')
+    );
+    assert.equal(await ok(content, details), false);
+    await rm(path);
+    assert.equal(await ok(content, details), false);
+    await mkdir(path);
+    assert.equal(await ok(content, details), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('what codemode cut is cut from all of it only when it arrived over the limit, and never to more than arrived', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  const kept = join(dir, 'kept');
+  try {
+    // A script asked for less than the limit: the result is left as it arrived.
+    for (const budget of [0, 4000, 15_000]) {
+      const small = await byCodemode(dir, threeThings, budget);
+      assert.ok(small.text.length < 16_000);
+      assert.ok(await scriptOutput(small.content, small.details));
+      assert.equal(await scriptOutput(small.content, small.details, undefined, 16_000), undefined);
+      assert.equal(await capOutput(small.content, kept, 16_000, 6000, small.details), undefined);
+    }
+    // Just over the limit it is cut, from all of it, to less than arrived.
+    const over = await byCodemode(dir, threeThings, 16_000);
+    assert.ok(over.text.length >= 16_000 && over.text.length < 16_300);
+    const cut = await capOutput(over.content, kept, 16_000, 6000, over.details);
+    assert.ok(cut?.content[1]?.type === 'text');
+    assert.equal(cut.capped.arrived, over.text.length);
+    assert.equal(cut.capped.chars, threeThings.length);
+    assert.ok(cut.content[1].text.length < over.text.length);
+    assert.match(cut.content[1].text, /\nTOP 17\n/);
+    assert.deepEqual(await readdir(kept), [basename(cut.capped.path)]);
+    // What arrived is just the limit, and one under it.
+    const exact = await capOutput(over.content, kept, over.text.length, 6000, over.details);
+    assert.equal(exact?.capped.arrived, over.text.length);
+    assert.equal(
+      await capOutput(over.content, kept, over.text.length + 1, 6000, over.details),
+      undefined
+    );
+    // The limit is twice what is kept when that is more.
+    assert.equal(await capOutput(over.content, kept, 100, 9000, over.details), undefined);
+    // A file shorter than the limit holds all of what arrived over it: that is cut from the file.
+    const short = `==> text 1/2 <==\n${rows('event', 665)}\n==> text 2/2 <==\nTOP 17`;
+    const most = await byCodemode(dir, short, short.length - 40);
+    assert.ok(short.length < 16_000 && most.text.length >= 16_000);
+    const whole = await capOutput(most.content, kept, 16_000, 6000, most.details);
+    assert.equal(whole?.capped.chars, short.length);
+    assert.equal(await readFile(whole!.capped.path, 'utf8'), short);
+    // No preview of all of it is made that is as long as what arrived: with a line that says
+    // it is cut longer than the result, the result stays.
+    const none = await byCodemode(dir, threeThings, 0);
+    const before = await readdir(kept);
+    assert.equal(await capOutput(none.content, kept, 100, 1, none.details), undefined);
+    assert.deepEqual(await readdir(kept), before);
+    // A preview of all of it of just the length that arrived is not used either: the result is
+    // then cut as it arrived, when that makes it shorter.
+    const long = `${'a'.repeat(30_000)}MIDDLE${'z'.repeat(30_000)}`;
+    const all = await byCodemode(dir, long);
+    const length = (await capOutput(all.content, kept, 1, 1, all.details))?.capped.preview;
+    assert.ok(length !== undefined && length < 1000);
+    const same = [];
+    for (let budget = 0; budget < length; budget++) {
+      const some = await byCodemode(dir, long, budget);
+      if (some.text.length === length) same.push(some);
+    }
+    assert.equal(same.length, 1);
+    const fallen = await capOutput(same[0]!.content, kept, 1, 1, same[0]!.details);
+    assert.ok(fallen?.content[1]?.type === 'text' && fallen.content[1].text.length < length);
+    assert.equal(fallen.capped.arrived, undefined);
+    assert.equal(fallen.capped.chars, length);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("codemode's file is not looked at for a result that stays as it arrived, and not read when it is too large", async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  const kept = join(dir, 'kept');
+  const calls: string[] = [];
+  const real = { readFile: files.readFile, stat: files.stat };
+  const spy = <F extends (...args: never[]) => unknown>(name: string, call: F) =>
+    ((...args: Parameters<F>) => {
+      calls.push(name);
+      return call(...args);
+    }) as unknown as F;
+  try {
+    const small = await byCodemode(dir, threeThings, 4000);
+    const over = await byCodemode(dir, threeThings);
+    Object.assign(files, { readFile: spy('read', real.readFile), stat: spy('stat', real.stat) });
+    syncBuiltinESMExports();
+    assert.equal(await capOutput(small.content, kept, 16_000, 6000, small.details), undefined);
+    assert.equal(await capOutput(over.content, kept, 100, 30_000, over.details), undefined);
+    assert.deepEqual(calls, []);
+    assert.equal(await scriptOutput(over.content, over.details, 1000), undefined);
+    assert.deepEqual(calls, ['stat']);
+    // The bash tool of pi names a file with all of its output too: that is no script's result.
+    const bash = [
+      {
+        type: 'text' as const,
+        text: `${rows('event', 1500)}\n\n[Showing lines 100-200 of 400. Full output: ${over.path}]`
+      }
+    ];
+    const cut = await capOutput(bash, kept, 16_000, 6000, over.details);
+    assert.ok(cut && cut.capped.arrived === undefined);
+    assert.deepEqual(calls, ['stat']);
+    const whole = await capOutput(over.content, kept, 16_000, 6000, over.details);
+    assert.equal(whole?.capped.arrived, over.text.length);
+    assert.deepEqual(calls, ['stat', 'stat', 'read']);
+  } finally {
+    Object.assign(files, real);
+    syncBuiltinESMExports();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the place where codemode cut is found by the file, also next to a line that reads like its own or inside a character', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-episodes-output-'));
+  try {
+    // The output quotes codemode\'s line near its start and near its end.
+    const quoting = `seen before: …12 tokens truncated…\n${rows('event', 3000)}\nand again …12 tokens truncated…`;
+    const quoted = await byCodemode(dir, quoting);
+    assert.equal(quoted.text.split(' tokens truncated…').length - 1, 3);
+    const first = await scriptOutput(quoted.content, quoted.details);
+    assert.equal(first?.content[1]?.type === 'text' && first.content[1].text, quoting);
+    // The middle of the budget falls inside a character: codemode kept one half less.
+    const faces = `a${'😀'.repeat(30_000)}`;
+    const split = await byCodemode(dir, faces);
+    assert.equal(
+      split.text.length - split.opening.length,
+      39_999 +
+        `…${Math.ceil(20_001 / 4)} tokens truncated…\n\n[Full output: ${split.path} (read with offset/limit)]`
+          .length
+    );
+    const second = await scriptOutput(split.content, split.details);
+    assert.equal(second?.content[1]?.type === 'text' && second.content[1].text, faces);
+    // An older codemode cut inside a character: each half of it is the file's all the same.
+    const halved = await byCodemode(dir, faces, 40_000, false);
+    assert.equal(halved.text.length - split.text.length, 1);
+    const third = await scriptOutput(halved.content, halved.details);
+    assert.equal(third?.content[1]?.type === 'text' && third.content[1].text, faces);
+    // Half a character that the script itself printed is U+FFFD in the file, which is UTF-8.
+    // The first and the last of the first halves and of the second halves, and a second half
+    // before a first one: the two are no character.
+    for (const [first, last] of [
+      ['\ud800', '\udfff'],
+      ['\udbff', '\udc00'],
+      ['\udc00', '\udbff'],
+      ['\udfff\ud800', '\udc00\udbff']
+    ] as const) {
+      const lone = `start${first}${rows('event', 1500)}\nTOP 17\n${rows('source', 1500)}${last}`;
+      const broken = await byCodemode(dir, lone);
+      assert.ok(broken.text.includes(`start${first}event 0`) && !broken.text.includes('\ufffd'));
+      const fourth = await scriptOutput(broken.content, broken.details);
+      assert.equal(
+        fourth?.content[1]?.type === 'text' && fourth.content[1].text,
+        lone.toWellFormed()
+      );
+      // Any other character in that place is not the file's.
+      const other = [
+        broken.header,
+        {
+          type: 'text' as const,
+          text: broken.text.replace(`start${first}event 0`, 'start?event 0')
+        }
+      ];
+      assert.equal(await scriptOutput(other, broken.details), undefined);
+    }
+    // A whole character is not two U+FFFD of the file: only a half with no other half is one.
+    const twice = await byCodemode(dir, `start\ufffd\ufffd${rows('event', 3000)}\ufffd\ufffd`);
+    assert.ok(await scriptOutput(twice.content, twice.details));
+    for (const [from, to] of [
+      ['start\ufffd\ufffdevent 0', 'start😀event 0'],
+      ['report\ufffd\ufffd\n\n[Full', 'report😀\n\n[Full']
+    ] as const) {
+      const whole = [twice.header, { type: 'text' as const, text: twice.text.replace(from, to) }];
+      assert.notEqual(whole[1]!.text, twice.text);
+      assert.equal(await scriptOutput(whole, twice.details), undefined);
+    }
+    // The line of codemode can go on like the file where it stands, at either end of it.
+    const alike = await byCodemode(dir, '…12 tokens truncated…'.repeat(5000), 8400);
+    assert.ok(await scriptOutput(alike.content, alike.details));
+    // A script can ask for a smaller budget, down to none; the place is found all the same.
+    for (const budget of [4000, 1, 0]) {
+      const small = await byCodemode(dir, threeThings, budget);
+      assert.ok(small.text.length < budget + 300);
+      assert.ok(await scriptOutput(small.content, small.details));
+    }
+    // Many lines that read as codemode's cost no more than one: this took a minute once.
+    const busy = await byCodemode(dir, '…12 tokens truncated…'.repeat(150_000), 1_600_000);
+    const began = performance.now();
+    assert.ok(await scriptOutput(busy.content, busy.details));
+    assert.ok(performance.now() - began < 5000);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

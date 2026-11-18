@@ -246,6 +246,8 @@ test('a capped output counts what the cap left out, whatever the block holds now
   assert.deepEqual(kept(14_000), { capped: 1, tokens: 6500 });
   // The line that opens a preview is part of the length on record, and counted with it.
   assert.deepEqual(kept(14_000, { head: 9000, top: true }), { capped: 1, tokens: 6500 });
+  // What codemode had left out before the result arrived is not what this cut kept out.
+  assert.deepEqual(kept(6000, { chars: 147_000, arrived: 40_000 }), { capped: 1, tokens: 8500 });
   // A result cut before the length was recorded has only the block to go by.
   assert.deepEqual(kept(), { capped: 1, tokens: 8500 });
 });

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -41,6 +41,7 @@ import { foldableTurns, foldStart, USER_TEXT_CAP } from '../src/fold.js';
 import episodes from '../src/index.js';
 import { FILES_KEY } from '../src/messages.js';
 import { AFTER_RUN_END_FOLD, nudgeGrowth, nudgeThreshold } from '../src/nudge.js';
+import { cappedOutput } from '../src/output.js';
 import { episodeStats, statsLines } from '../src/stats.js';
 
 type Step = (context: TranscriptContext) => AssistantMessage | Promise<AssistantMessage>;
@@ -761,6 +762,79 @@ test('a script that printed several things gets each cut by itself under a line 
     assert.equal(stats.outputs.capped, 1);
     // The line the preview opens with is no cue: nothing here touched a file of a thread.
     assert.equal(stats.overhead.cues, 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('a script whose output codemode cut to its own budget gets the cut made from all of it, and recall reads the middle', async () => {
+  const lines = (name: string) =>
+    `Array.from({ length: 1500 }, (_, i) => "${name} " + i + " of the report").join("\\n")`;
+  const harness = await createSession(
+    'only',
+    [
+      () => script(`text(${lines('event')}); text("TOP 17"); text(${lines('source')});`),
+      (context) => {
+        const result = text(conversation(context).at(-1)!);
+        // Over 40,000 characters were printed: codemode kept the start and the end, and the
+        // second thing was in neither. The preview is cut from the file codemode kept.
+        assert.match(
+          result,
+          /^Script completed\nWall time [\d.]+ seconds\nOutput:\n\n?\[episodes\] Only part of this output is shown: \d+ of 7\d{4} characters, with the rest left out at the 2 places marked below\./
+        );
+        assert.match(
+          result,
+          /\nevent 1499 of the report\n+==> text 2\/3 <==\nTOP 17\n+==> text 3\/3 <==\nsource 0 of the report\n/
+        );
+        assert.doesNotMatch(result, /Warning: truncated output|tokens truncated|pi-codemode/);
+        assert.ok(result.length < 3200, `${result.length}`);
+        return script(`// @options: {"max_output_tokens": 500}\ntext(${lines('event')});`);
+      },
+      (context) => {
+        // A script that asked for less than the limit gets what codemode made of it.
+        const result = text(conversation(context).at(-1)!);
+        assert.match(
+          result,
+          /^Script completed\nWall time [\d.]+ seconds\nOutput:\n\n?Warning: truncated output \(original token count: \d+\)/
+        );
+        assert.doesNotMatch(result, /\[episodes\] Only part/);
+        assert.ok(result.length < 2500, `${result.length}`);
+        return script('text(await tools.fold({ since: "t2", note: "Printed the report." }));');
+      },
+      () => script('text(await tools.recall({ query: "\\"event 1400 of the report\\"" }));'),
+      (context) => {
+        const found = text(conversation(context).at(-1)!);
+        assert.match(found, /ep-[0-9a-f]{8} t2 toolResult: event 1400 of the report/);
+        return fauxAssistantMessage('ok');
+      }
+    ],
+    [],
+    { outputCapChars: 4000, outputCapKeepChars: 1800 },
+    {},
+    undefined,
+    [],
+    [],
+    true
+  );
+  try {
+    await harness.run('go');
+    const branch = harness.session.sessionManager.getBranch();
+    const record = branch.flatMap((entry) => {
+      const capped =
+        entry.type === 'message' && entry.message.role === 'toolResult'
+          ? cappedOutput(entry.message.details)
+          : undefined;
+      return capped ? [capped] : [];
+    });
+    assert.equal(record.length, 1);
+    const { chars, arrived, preview, path } = record[0]!;
+    // What arrived was codemode's 40,000 characters and its two lines; the file has all.
+    assert.ok(arrived !== undefined && arrived > 40_000 && arrived < 40_400, `${arrived}`);
+    assert.ok(chars > 70_000 && preview !== undefined);
+    assert.equal((await readFile(path, 'utf8')).length, chars);
+    const stats = episodeStats(branch, harness.dir);
+    assert.equal(stats.outputs.capped, 1);
+    assert.equal(stats.outputs.tokens, Math.ceil((arrived - preview) / 4));
   } finally {
     await harness.cleanup();
   }

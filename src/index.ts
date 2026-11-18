@@ -218,11 +218,13 @@ export default function episodes(pi: ExtensionAPI): void {
       return undefined;
     }
     try {
+      // The details name the file of what codemode cut to its own budget first.
       const cut = await capOutput(
         event.content,
         dir,
         settings.outputCapChars,
-        settings.outputCapKeepChars
+        settings.outputCapKeepChars,
+        details
       );
       return cut && { content: cut.content, details: { ...details, [CAPPED_KEY]: cut.capped } };
     } catch {

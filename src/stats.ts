@@ -703,7 +703,8 @@ export function episodeStats(entries: readonly SessionEntry[], cwd: string): Epi
     const preview = capped?.preview ?? (block?.type === 'text' ? block.text.length : undefined);
     if (capped && preview !== undefined) {
       stats.outputs.capped++;
-      stats.outputs.tokens += tokensOf(Math.max(0, capped.chars - preview));
+      // What codemode had cut out before it arrived was not kept out of context by this cut.
+      stats.outputs.tokens += tokensOf(Math.max(0, (capped.arrived ?? capped.chars) - preview));
     }
 
     const details = found.details;

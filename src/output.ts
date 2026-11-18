@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ImageContent, TextContent } from '@earendil-works/pi-ai';
@@ -13,6 +13,13 @@ const SCRIPT_HEADER = /^Script (completed|failed)\nWall time [\d.]+ seconds\nOut
 const SCRIPT_PART = /^==> text (\d+)\/(\d+) <==$/gm;
 /** How a preview made here opens; no other text of this extension does. */
 export const PREVIEW_OPENS = '[episodes] Only part of this output is shown: ';
+/** How codemode opens the output of a script that it cut to its own budget. */
+const CODEMODE_CUT =
+  /^Warning: truncated output \(original token count: (\d+)\)\nTotal output lines: (\d+)\n\n/;
+/** What codemode puts between the start and the end that it kept. */
+const CODEMODE_GAP = /…\d+ tokens truncated…/g;
+/** The largest file of codemode's that is read to stand for a script's output. */
+export const CODEMODE_FULL_BYTES = 16 * 1024 * 1024;
 /**
  * The least a part of a script's output keeps when it is cut by itself. With parts too many
  * for that, the output is cut as one text.
@@ -31,6 +38,11 @@ export interface CappedOutput {
   block: number;
   /** Length of the preview when it was made; another extension can cut it further. */
   preview?: number;
+  /**
+   * Length of the text as it arrived, when that was less than `chars`: codemode had cut the
+   * output to its own budget first, and the text was taken from the file it kept all of it in.
+   */
+  arrived?: number;
   /** Length of the start of the text that the preview shows. */
   head?: number;
   /**
@@ -59,6 +71,7 @@ export function cappedOutput(details: unknown): CappedOutput | undefined {
     typeof capped.chars === 'number' &&
     typeof capped.block === 'number' &&
     ['undefined', 'number'].includes(typeof capped.preview) &&
+    ['undefined', 'number'].includes(typeof capped.arrived) &&
     ['undefined', 'number'].includes(typeof capped.head) &&
     (capped.top === undefined || capped.top === true) &&
     (capped.parts === undefined ||
@@ -239,6 +252,83 @@ function scriptPreview(text: string, path: string, shown: readonly Range[]): str
 }
 
 /**
+ * The result of a script as codemode would have given it had it not cut the output to its own
+ * budget (10,000 tokens unless the script asks for another): codemode then keeps the start and
+ * the end around a line with the count, and writes all of it to a temporary file that the
+ * result's details name. Cut again here, such a result had a preview whose file held only what
+ * codemode passed on, with the middle in neither, so the text is taken from codemode's file
+ * instead. Only when the result is exactly what codemode writes and the file is the text it was
+ * cut from: the counts in its first line, and the start and the end shown. Undefined otherwise,
+ * also for a file over `limit` bytes, and the result is then cut as it arrived. `arrived` is
+ * the length of the text that did arrive.
+ */
+export async function scriptOutput(
+  content: readonly Block[],
+  details: unknown,
+  limit = CODEMODE_FULL_BYTES,
+  least = 0
+): Promise<{ content: Block[]; arrived: number } | undefined> {
+  const path =
+    typeof details === 'object' && details !== null
+      ? (details as Record<string, unknown>).fullOutputPath
+      : undefined;
+  const [header, output] = content;
+  if (typeof path !== 'string' || content.length !== 2) return undefined;
+  if (header?.type !== 'text' || !SCRIPT_HEADER.test(header.text) || output?.type !== 'text') {
+    return undefined;
+  }
+  const opening = CODEMODE_CUT.exec(output.text);
+  const trailer = `\n\n[Full output: ${path} (read with offset/limit)]`;
+  if (!opening || !output.text.endsWith(trailer)) return undefined;
+  // No file is read for a result that is left as it arrived.
+  if (output.text.length < least) return undefined;
+  let full: string;
+  try {
+    const found = await stat(path);
+    if (found.size > limit) return undefined;
+    full = await readFile(path, 'utf8');
+  } catch {
+    return undefined;
+  }
+  if (Math.ceil(full.length / 4) !== Number(opening[1])) return undefined;
+  if (full.split('\n').length !== Number(opening[2])) return undefined;
+  const shown = output.text.slice(opening[0].length, output.text.length - trailer.length);
+  // The output can hold a line that reads as codemode's: the gap is where the start and the
+  // end of the file stand around it. Both are measured once: many such lines cost no more.
+  const starts = shared(shown, full, false);
+  const ends = shared(shown, full, true);
+  for (const gap of shown.matchAll(CODEMODE_GAP)) {
+    if (gap.index > starts || shown.length - gap.index - gap[0].length > ends) continue;
+    return { content: [header, { type: 'text', text: full }], arrived: output.text.length };
+  }
+  return undefined;
+}
+
+/**
+ * How many characters what is shown and the file have in common, from the start or from the
+ * end. The file is UTF-8, so it holds U+FFFD where the script printed half a character.
+ */
+function shared(shown: string, full: string, fromEnd: boolean): number {
+  const most = Math.min(shown.length, full.length);
+  let count = 0;
+  for (; count < most; count++) {
+    const at = fromEnd ? shown.length - 1 - count : count;
+    const there = full.charCodeAt(fromEnd ? full.length - 1 - count : count);
+    if (shown.charCodeAt(at) !== there && !(there === 0xfffd && halved(shown, at))) break;
+  }
+  return count;
+}
+
+/** Whether the text has half a character there, with no other half next to it. */
+function halved(text: string, at: number): boolean {
+  const high = (unit: number) => unit >= 0xd800 && unit <= 0xdbff;
+  const low = (unit: number) => unit >= 0xdc00 && unit <= 0xdfff;
+  const unit = text.charCodeAt(at);
+  if (high(unit)) return !low(text.charCodeAt(at + 1));
+  return low(unit) && !high(text.charCodeAt(at - 1));
+}
+
+/**
  * Cuts a tool result of `limit` characters or more down to about `keep`: the start and the
  * end, two to one, around a line naming the file that holds all of it, under a line that says
  * it is a part (see partLine). A script's output is cut thing by thing that it printed, under
@@ -251,7 +341,32 @@ export async function capOutput(
   content: readonly Block[],
   dir: string,
   limit: number,
-  keep: number
+  keep: number,
+  details?: unknown
+): Promise<{ content: Block[]; capped: CappedOutput } | undefined> {
+  // A preview at least half the size of the original would save little and can outgrow it.
+  const least = Math.max(limit, 2 * keep);
+  // What codemode cut to its own budget first is cut from all of it (see scriptOutput), when
+  // what arrived is over the limit and that preview is shorter than what arrived: a result is
+  // never made longer here, and one that a script asked to be small is left as it is.
+  const whole =
+    details === undefined
+      ? undefined
+      : await scriptOutput(content, details, CODEMODE_FULL_BYTES, least);
+  if (whole) {
+    const cut = await cutOutput(whole.content, dir, 0, keep, whole.arrived);
+    if (cut) return { content: cut.content, capped: { ...cut.capped, arrived: whole.arrived } };
+  }
+  return cutOutput(content, dir, least, keep, Number.POSITIVE_INFINITY);
+}
+
+/** Cuts a text of `least` characters or more to a preview shorter than it and than `under`. */
+async function cutOutput(
+  content: readonly Block[],
+  dir: string,
+  least: number,
+  keep: number,
+  under: number
 ): Promise<{ content: Block[]; capped: CappedOutput } | undefined> {
   const first = content[0];
   // That block stays where the renderer looks for it; it is not part of the output.
@@ -266,8 +381,7 @@ export async function capOutput(
     .slice(from, to + 1)
     .flatMap((block) => (block.type === 'text' ? [block.text] : []));
   const text = joined.join('\n').toWellFormed();
-  // A preview at least half the size of the original would save little and can outgrow it.
-  if (text.length < Math.max(limit, 2 * keep)) return undefined;
+  if (text.length < least) return undefined;
 
   const hash = createHash('sha256').update(text).digest('hex').slice(0, 16);
   const path = join(dir, `output-${hash}.txt`);
@@ -278,7 +392,7 @@ export async function capOutput(
   const omitted = text.length - start.length - end.length;
   const preview = `${partLine(start.length + end.length, text.length, path)}${start}\n\n[episodes] ${omitted} of ${text.length} characters left out here. ${named(path)} grep it or read a slice, not the whole file. recall searches it once it is folded.\n\n${end}`;
   // The line that says it is cut is long next to a small `keep`.
-  if ((script ?? preview).length >= text.length) return undefined;
+  if ((script ?? preview).length >= Math.min(text.length, under)) return undefined;
   await mkdir(dir, { recursive: true });
   // Parallel results with the same text must not share a temporary file.
   const temporary = `${path}.${randomUUID()}.tmp`;
