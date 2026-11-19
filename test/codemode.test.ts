@@ -3237,6 +3237,14 @@ for (const mode of ['off', 'only'] as const) {
     for (const sizes of [[2200], [1800, 800], [300, 100]]) {
       const prints = sizes.map((size, index) => 'xy'[index]!.repeat(size));
       const pressed = sizes[0]! < 1000;
+      // The answer that ended the run stays after the line, so that the request before it is not
+      // shown answered by the line alone; the answers before it are folded.
+      const assertOnlyLastAnswer = (shown: string) => {
+        assert.match(shown, new RegExp(`answer ${sizes.length}`));
+        for (let index = 1; index < sizes.length; index++) {
+          assert.doesNotMatch(shown, new RegExp(`answer ${index}\\b`));
+        }
+      };
       const harness = await createSession(
         mode,
         [
@@ -3250,12 +3258,14 @@ for (const mode of ['off', 'only'] as const) {
             return call('fold', { since: 't1', note: 'Printed long lines.' });
           },
           ...reply((shown) => {
-            assert.doesNotMatch(shown, /xxxx|yyyy|answer \d/);
+            assert.doesNotMatch(shown, /xxxx|yyyy/);
+            assertOnlyLastAnswer(shown);
             assert.match(shown, /The request above is answered/);
           }),
           (context) => {
             const all = conversation(context).map(text).join('\n');
-            assert.doesNotMatch(all, /xxxx|yyyy|answer \d/);
+            assert.doesNotMatch(all, /xxxx|yyyy/);
+            assertOnlyLastAnswer(all);
             // What asked for the fold is still there, and so is every request of the user.
             assert.match(all, /The request above is answered/);
             for (const index of sizes.keys()) assert.match(all, new RegExp(`request ${index + 1}`));

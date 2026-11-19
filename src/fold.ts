@@ -541,6 +541,20 @@ function* stampedStarts(
 }
 
 /**
+ * Whether the entry at `index` is the answer that ended a run, with the request for a fold at
+ * that end after it. A fold that answers the request leaves it in view, so that the request
+ * before it is not shown answered by nothing but a line, and nothing asks a fold to take it.
+ */
+function keptAnswer(entries: readonly ProjectedSessionEntry[], index: number): boolean {
+  const message = entryMessage(entries[index]!);
+  if (message?.role !== 'assistant' || message.content.some((block) => block.type === 'toolCall')) {
+    return false;
+  }
+  const next = entries.find((entry, at) => at > index && entry.messages.length > 0)?.sourceEntry;
+  return next?.type === 'custom_message' && next.customType === RUN_END_FOLD_TYPE;
+}
+
+/**
  * Where a fold that covers the notes in context starts: at the earliest thing behind the
  * latest note that a fold removes or cuts, which is the earliest note unless work was left
  * before it. A fold from an earlier stamp removes no more, since user messages stay; and one
@@ -564,7 +578,7 @@ export function mergeStart(
       (shown?.role === 'assistant' ||
         shown?.role === 'toolResult' ||
         (shown?.role === 'user' && capUserContent(shown.content, '') !== undefined));
-    if (!folds) continue;
+    if (!folds || keptAnswer(entries, index)) continue;
     // The latest span start that holds this entry; of the results of one response, the first.
     // No start holds what stands before the first stamp, such as the end of a turn that a
     // compaction kept without its beginning.
@@ -624,7 +638,7 @@ export function unfoldedBehindNote(
       (message?.role === 'assistant' &&
         !message.content.some((block) => block.type === 'toolCall' && calls.has(block.id))) ||
       (shown?.role === 'user' && capUserContent(shown.content, '') !== undefined);
-    if (!counts) continue;
+    if (!counts || keptAnswer(entries, index)) continue;
     if (!start) {
       // The latest span start that holds this first entry: an earlier one adds nothing. Of the
       // results of one response, which all start there, the first names it.
@@ -1012,6 +1026,19 @@ export function runEndRequest(
   return -1;
 }
 
+/**
+ * The answer that ended the run before the entry at `before`, the request for a fold at its
+ * end: the last response shown before it, when that called no tool. Otherwise -1.
+ */
+export function finalAnswer(entries: readonly ProjectedSessionEntry[], before: number): number {
+  const index = entries.findLastIndex((entry, at) => at < before && entry.messages.length > 0);
+  const message = index >= 0 ? entryMessage(entries[index]!) : undefined;
+  return message?.role === 'assistant' &&
+    !message.content.some((block) => block.type === 'toolCall')
+    ? index
+    : -1;
+}
+
 /** The handle of a fold or unfold that started and has no completion marker; the next turn end completes it. */
 export function cutShortFold(branch: readonly SessionEntry[]): string | undefined {
   return unfinishedBatches(branch)[0]?.handle;
@@ -1147,7 +1174,10 @@ export function planFold(
   // folds, the reply after it answers it. So nothing from the request on is a turn of the span
   // or a turn that the span leaves.
   const asking = runEndRequest(entries, foldIndex);
-  const limit = asking > startIndex ? asking : foldIndex;
+  // The answer that ended the run stays in view too: a request shown answered by nothing but
+  // the line of a fold was answered with a copy of that line, and no call, by one model.
+  const answer = asking > startIndex ? finalAnswer(entries, asking) : -1;
+  const limit = answer > startIndex ? answer : asking > startIndex ? asking : foldIndex;
   let endIndex = limit;
   let keptFrom: number | undefined;
   if (options.until !== undefined) {

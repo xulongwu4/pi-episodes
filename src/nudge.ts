@@ -12,6 +12,7 @@ import {
   codemodeOnly,
   coveredNotes,
   coveredTokens,
+  finalAnswer,
   foldBoundary,
   foldInstruction,
   foldLines,
@@ -380,7 +381,19 @@ export function registerNudge(pi: ExtensionAPI): void {
     if (!asked) return undefined;
     const { earliest, threshold } = asked;
     const tail = keptTail(entries, earliest, threshold);
-    const span = entries.slice(earliest.index, tail?.index);
+    // Without a request kept, the fold stops before the answer that ended the run all the same.
+    const answer = finalAnswer(entries, entries.length);
+    const span = entries.slice(
+      earliest.index,
+      tail?.index ?? (answer > earliest.index ? answer : undefined)
+    );
+    const lines = foldLines(entries, appliedFolds(entries.map((entry) => entry.sourceEntry)));
+    const responds = span.some(
+      (entry) =>
+        !lines.has(entry.sourceEntry.id) &&
+        entry.messages.some((message) => message.role === 'assistant')
+    );
+    if (!responds) return undefined;
     const notes = coveredNotes(entries, span);
     const frees = Math.max(0, foldableTokens(span) - coveredTokens(notes));
     const since = `since "${stampLabel(earliest.stamp)}"${noteAt(entries, earliest.stamp)}`;

@@ -694,6 +694,7 @@ test('the request at the end of a run is found from the fold that answers it, an
           message.content.some((block) => block.type === 'toolCall' && block.id === id)
       )
     );
+  const output = manager.getBranch().at(-2)!.id;
   const answer = manager.getBranch().at(-1)!.id;
   const request = manager.appendCustomMessageEntry(RUN_END_FOLD_TYPE, 'Fold that work now.', true);
   // A shell command the user ran since is something new as well.
@@ -720,9 +721,10 @@ test('the request at the end of a run is found from the fold that answers it, an
   manager.appendMessage(assistant(call('f2', 'fold')));
   assert.equal(runEndRequest(entries(), calling('f1')), asking);
   assert.equal(runEndRequest(entries(), calling('f2')), asking);
-  // The span ends before the request, which stays in view.
+  // The span ends before the answer that ended the run, which stays in view with the request.
   const plan = planFold(entries(), 'f2', 1);
-  assert.equal(plan.lastEntryId, answer);
+  assert.equal(plan.lastEntryId, output);
+  assert.ok(!plan.edits.some((edit) => edit.targetId === answer));
   assert.ok(!plan.edits.some((edit) => edit.targetId === request));
   // A fold that starts behind the request, at the try that failed, is not cut at it, and
   // leaves the request it answers.
@@ -732,16 +734,16 @@ test('the request at the end of a run is found from the fold that answers it, an
   // refused is none.
   const bounded = planFold(entries(), 'f2', 1, { until: 2 });
   assert.equal(bounded.keptFrom, undefined);
-  assert.equal(bounded.lastEntryId, answer);
+  assert.equal(bounded.lastEntryId, output);
   // With until at the stamp of a try that was refused, behind the request, the span ends at
-  // the request all the same: the request stays, and so do the tries.
+  // the request all the same: the answer and the request stay, and so do the tries.
   const tries = session([
     user('one', 1),
     assistant(call('a', 'bash')),
     result('a', 'bash', 'out', 2),
     assistant('answer')
   ]).manager;
-  const answered = tries.getLeafId();
+  const triedOutput = tries.getBranch().at(-2)!.id;
   const wanted = tries.appendCustomMessageEntry(RUN_END_FOLD_TYPE, 'Fold that work now.', true);
   for (const [id, stamp] of [
     ['r1', 3],
@@ -753,7 +755,7 @@ test('the request at the end of a run is found from the fold that answers it, an
   tries.appendMessage(assistant(call('r3', 'fold')));
   const behind = planFold(tries.buildSessionProjection().entries, 'r3', 1, { until: 3 });
   assert.equal(behind.keptFrom, undefined);
-  assert.equal(behind.lastEntryId, answered);
+  assert.equal(behind.lastEntryId, triedOutput);
   assert.ok(!behind.edits.some((edit) => edit.targetId === wanted));
 
   // With a message of the user in between, the fold answers that message, not the request.
@@ -809,7 +811,7 @@ test('what is new to a run is told from what is its own and from what is neither
   }
 });
 
-test('a fold that covers one made at the end of a run takes its request with its line, and leaves its own', () => {
+test('a fold that covers one made at the end of a run takes its request, leaves its line with the answer it kept, and leaves its own', () => {
   for (const refused of [false, true]) {
     const { manager } = session([
       user('one', 1),
@@ -818,6 +820,7 @@ test('a fold that covers one made at the end of a run takes its request with its
       assistant('answer')
     ]);
     const entries = () => manager.buildSessionProjection().entries;
+    const answer = manager.getLeafId();
     const first = manager.appendCustomMessageEntry(RUN_END_FOLD_TYPE, 'Fold that work now.', true);
     // The fold may come after a try that was refused, whose stamp the next fold then starts at.
     if (refused) {
@@ -825,7 +828,7 @@ test('a fold that covers one made at the end of a run takes its request with its
       manager.appendMessage({ ...result('r', 'fold', 'refused', 3), isError: true } as Message);
     }
     manager.appendMessage(assistant(call('f1', 'fold')));
-    // Nothing is kept, so the request stands between the line and the call.
+    // Only the answer is kept, so it and the request stand between the line and the call.
     const plan = planFold(entries(), 'f1', 1);
     manager.appendCustomEntry(FOLD_STARTED_TYPE, {
       handle: plan.handle,
@@ -843,11 +846,16 @@ test('a fold that covers one made at the end of a run takes its request with its
     const second = manager.appendCustomMessageEntry(RUN_END_FOLD_TYPE, 'Fold again.', true);
     manager.appendMessage(assistant(call('f2', 'fold')));
 
+    // Nor is the answer work left behind the note.
+    const work = unfoldedBehindNote(entries())?.work ?? [];
+    assert.ok(!work.some((entry) => entry.sourceEntry.id === answer), String(refused));
     const start = mergeStart(entries())!;
     assert.equal(start.stamp, refused ? 3 : 4);
     const next = planFold(entries(), 'f2', start.stamp);
     const removed = new Set(next.edits.map((edit) => edit.targetId));
-    assert.deepEqual(next.linesRemoved, plan.lines, String(refused));
+    // The line of the first fold stands before the answer that fold kept, which the merge
+    // does not reach: both stay.
+    assert.deepEqual(next.linesRemoved, [], String(refused));
     assert.ok(removed.has(first), String(refused));
     assert.ok(!removed.has(second), String(refused));
   }
